@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# local state (never commit)
+~/.local/state/castellan/
+blobs/
+sessions/
+trust.db
+trust.db-*
+
+# CVEfixes DB (never ship, never commit)
+*.db
+cvefixes*.db
+ideation-data/
+
+# editor
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/

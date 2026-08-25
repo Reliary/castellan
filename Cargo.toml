@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+# Members are stubbed until each phase's build begins.
+# See docs/CRATES.md for the proposed layout and docs/ROADMAP.md for build order.
+members = [
+  # "crates/castellan-core",
+  # "crates/castellan-envelope",
+  # "crates/castellan-freezer",
+  # "crates/castellan-ledger",
+  # "crates/castellan-undo",
+  # "crates/castellan-trust",
+  # "crates/castellan-proof",
+  # "crates/castellan-replay",
+  # "crates/castellan-egress",
+  # "crates/castellan-canary",
+  # "crates/castellan-radar",
+  # "crates/castellan-bless",
+  # "crates/castellan-watch",
+  # "crates/castellan-daemon",
+  # "crates/castellan-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["castellan contributors"]
+repository = "https://github.com/Reliary/castellan"
+description = "The OS is the trust boundary for AI agents."
+publish = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[profile.release.package."*"]
+opt-level = 3

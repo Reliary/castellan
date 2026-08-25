@@ -5,7 +5,7 @@ The kernel-witnessed record of what a session wrote. Primary substrate: overlayf
 ## Two sources of truth, clearly separated
 
 - **Kernel truth** (`source: kernel`): inotify events on allowed paths, overlayfs upper-layer enumeration, seccomp-audit denials. These are what actually happened. Cannot be faked by the agent.
-- **Agent advisory** (`source: agent`): events the agent declares via agent-audit-trail. These are what the agent claims happened. Cross-checked against kernel truth; mismatches decrement trust and weaken ProofCertificates.
+- **Agent advisory** (`source: agent`): events the agent declares via the audit hash chain (was agent-audit-trail, rewritten as Rust in castellan-ledger). These are what the agent claims happened. Cross-checked against kernel truth; mismatches decrement trust and weaken ProofCertificates.
 
 This split is the core honesty move: the agent is the prover, the kernel is the verifier, the daemon is the recorder. No trust decision rests on agent-reported data alone.
 
@@ -54,8 +54,8 @@ When overlayfs / user namespaces are unavailable:
 - `castellan-undo` (blob store shared)
 - `nix` crate (inotify)
 - `blake3` (hashing)
-- Owned primitive: `agent-audit-trail` (BUILT, PASS) for the advisory layer.
+- Owned primitive: audit hash chain (was agent-audit-trail, BUILT in Python — rewritten as Rust in castellan-ledger).
 
 ## Status
 
-Greenfield (inotify watcher, overlayfs enumeration, blob store). The advisory layer (agent-audit-trail) is owned. Phase 1 (inotify) → Phase 2 (overlayfs).
+Greenfield (inotify watcher, overlayfs enumeration, blob store). The advisory hash chain is rewritten from the Python agent-audit-trail into Rust. Phase 1 (inotify) → Phase 2 (overlayfs).

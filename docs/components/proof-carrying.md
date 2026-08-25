@@ -83,7 +83,7 @@ Two-factor, both required:
 The agent does NOT generate the certificate. The daemon does, from:
 - kernel-witnessed event spine (bounds, audit chain)
 - daemon-re-run test results (placebo factor A)
-- relay-vuln scan of post-edit state (validation-path — daemon invokes relay-vuln as a subprocess; relay-vuln reads state directly, not agent-reported)
+- relay-vuln scan of post-edit state (validation-path — daemon calls relay-vuln as a Rust crate; relay-vuln reads state directly, not agent-reported)
 - config-radar / seq-engine scans of post-edit state (completeness — same)
 - proof-fixes placebo computation (daemon invokes proof-fixes; the danger_signal comparison is done by proof-fixes reading state, not by the agent)
 
@@ -123,16 +123,15 @@ HV fingerprints of verified sessions sync across machines via Omarchy's usage-sy
 - `castellan-core` (ProofCertificate type)
 - `castellan-ledger` (kernel-witnessed events)
 - `castellan-trust` (certificate feeds positive signal)
-- Owned primitives (all subprocesses, all built):
-  - `relay-vuln` (validation-path, EvidenceTuple, ProofCertificate origin pattern)
-  - `evidence-pack` (export format, quality labels)
-  - `proof-fixes` (placebo methodology)
-  - `cert-evals` (benchmark methodology, SHA-256 cert)
-  - `seq-engine` (completeness)
-  - `config-radar` (completeness)
-  - `agent-audit-trail` (tamper-evident chain)
-  - `engfield` (Phase 5 priors)
-  - `cortex-rs` (Phase 5 consolidation)
+- Owned primitives (all Rust crates, linked into the daemon — no Python in the trusted path):
+  - `relay-vuln` (validation-path, EvidenceTuple, ProofCertificate origin pattern — already pure Rust, 52K LOC)
+  - `castellan-proof` export module (was evidence-pack — rewritten as Rust, quality labels via serde)
+  - `castellan-proof` placebo module (was proof-fixes — rewritten as Rust, placebo orchestration over relay-vuln)
+  - `cert-evals` (benchmark methodology, SHA-256 cert — stays Python, dev/CI only, NOT in daemon)
+  - `castellan-completeness` (was seq-engine + config-radar — rewritten as Rust)
+  - `castellan-ledger` audit chain (was agent-audit-trail — rewritten as Rust hash chain)
+  - `engfield` (Phase 5 priors — already has 2183 LOC Rust, link as crate)
+  - `cortex-rs` (Phase 5 consolidation — already pure Rust, link as crate)
 - CVEfixes DB: local at `/home/john/data/`, never shipped.
 
 ## Status

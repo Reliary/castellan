@@ -40,7 +40,7 @@ Omarchy symlinks its default skill into all the harness skill dirs. The watcher 
 - **skein:** vocabulary fingerprint of the skill file. Fast, grammar-free. Detects "this file's content changed semantically" even if line-by-line edits are sneaky.
 - **carrion:** identifier inventory. Detects "this file references new symbols" (e.g., a skill that suddenly imports `requests` and `subprocess` is suspicious).
 
-Both are built, both Rust, both invoked as subprocesses from the watcher.
+Both are built, both Rust, both linked as workspace crates (skein, carrion) — no subprocess spawn.
 
 ## Antagonism survivors
 

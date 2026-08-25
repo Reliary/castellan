@@ -19,13 +19,13 @@ This mirrors the reliary-agent daemon pattern (TCP line protocol, lock-protected
 | Run inotify watchers on allowed paths (fallback) | ledger | enforcement |
 | Run the egress proxy (keyring, allowlist, injection) | egress-proxy | enforcement |
 | Run the honeypot listener | canary-credentials | enforcement |
-| Ingest agent-audit-trail events, tag advisory vs kernel | ledger | enforcement |
+| Ingest audit-chain events, tag advisory vs kernel | ledger | enforcement |
 | Compute trust scores (single writer to trust.db) | trust | analysis |
 | Compute HV fingerprints, sign with ed25519 | hv-radar | analysis |
 | Run the bless broker (nonce, dbus, rate limit, biometric) | bless-broker | enforcement |
 | Re-run tests independently in a side-scope (commitment #3) | proof-carrying | analysis |
 | Generate ProofCertificates from kernel-witnessed state | proof-carrying | analysis |
-| Run the harness-state watcher (skein + carrion subprocess) | harness-state-watcher | observation |
+| Run the harness-state watcher (skein + carrion crates) | harness-state-watcher | observation |
 | Watchdog: heartbeat loss → restart + auto-freeze (commitment #7) | self | enforcement |
 
 ## Unix socket protocol

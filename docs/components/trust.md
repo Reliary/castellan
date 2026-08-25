@@ -78,7 +78,7 @@ Monotonic relationship between trust tier and user-revert outcomes on a labelled
 - `castellan-ledger` (event spine)
 - `castellan-proof` (positive signal — placebo-controlled proof)
 - `castellan-freezer` (revert signal — `castellan undo` invokes freeze)
-- Owned primitives: `cortex-rs` (BUILT, tier-promotion if decay needed), `proof-fixes` (BUILT, placebo methodology), `cert-evals` (BUILT, benchmark methodology).
+- Owned primitives (all Rust, linked as crates): `cortex-rs` (BUILT, tier-promotion if decay needed), `castellan-proof` placebo module (was proof-fixes, rewritten as Rust), `cert-evals` (BUILT, stays Python for dev/CI benchmarking only — NOT in daemon).
 - NOT used: `refactor-proof` (KILL), `half-life` (KILL).
 
 ## Status

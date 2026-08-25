@@ -7,10 +7,11 @@ castellan/
 │   ├── castellan-core/             shared types: SessionId, Event, EnvelopeProfile, TrustTier, ProofCertificate
 │   ├── castellan-envelope/         Landlock ruleset minting, seccomp BPF generation, degrade-tier detection
 │   ├── castellan-freezer/          cgroup.freeze ownership, systemd scope delegation, time-bounded kill
-│   ├── castellan-ledger/           overlayfs upper enumeration, inotify fallback, blake3 blob store, event spine
+│   ├── castellan-ledger/           overlayfs upper enumeration, inotify fallback, blake3 blob store, event spine, audit hash chain (was agent-audit-trail)
 │   ├── castellan-undo/             3-way merge, freeze-before-undo, pinned GC
 │   ├── castellan-trust/            EWMA, tier mapping, placebo-proof ingest, single-writer trust.db (rusqlite bundled)
-│   ├── castellan-proof/            ProofCertificate assembly, relay-vuln + seq-engine + config-radar wiring
+│   ├── castellan-proof/            ProofCertificate assembly + export (was evidence-pack), placebo pipeline (was proof-fixes), relay-vuln + config-radar wiring
+│   ├── castellan-completeness/     expected-pair + drift/R0 completeness (was seq-engine), config key audit (was config-radar)
 │   ├── castellan-replay/           action-stream extraction, overlayfs shadow execution, permissive-case diff
 │   ├── castellan-egress/           HTTP proxy, real-cred injection, canary honeypot listener
 │   ├── castellan-canary/           credential planting, honeypot trigger → freeze wiring
@@ -52,29 +53,36 @@ castellan-cli → castellan-daemon → {castellan-envelope, castellan-freezer, c
                                      castellan-radar, castellan-bless, castellan-watch}
                                   → castellan-core
 castellan-trust → castellan-proof (positive signal), castellan-ledger (events), castellan-core
-castellan-proof → relay-vuln (subprocess, opt-in), seq-engine (subprocess), config-radar (subprocess), castellan-ledger
-castellan-radar → sensor-hdc (vendored or subprocess), castellan-core
-castellan-watch → skein (subprocess), carrion (subprocess)
+castellan-proof → relay-vuln (Rust crate, opt-in), seq-engine (Rust crate), config-radar (Rust crate), castellan-ledger
+castellan-radar → sensor-hdc (Rust crate, vendored), castellan-core
+castellan-watch → skein (Rust crate), carrion (Rust crate)
 ```
 
-Existing Python primitives (relay-vuln, seq-engine, config-radar, skein, carrion, agent-audit-trail, evidence-pack, proof-fixes, cert-evals, llm-replay, engfield) stay as Python and are invoked as subprocesses from the Rust daemon. Rewriting them in Rust is out of scope for the first build; they're built, tested, and have real-data verdicts — no reason to rewrite. The Rust daemon owns the kernel surface and the single-writer boundaries; Python owns the analysis it already does well.
+## Pure Rust — no Python in the daemon
 
-## What gets rewritten in Rust vs kept as Python subprocess
+The daemon is the trusted core. It must be one static binary with no Python runtime, no subprocess spawns in the hot path, no version drift, no missing-dependency failures. Every primitive that runs inside the daemon's proof-generation, trust-scoring, or observation flow is Rust — either already Rust (linked as a workspace member or vendored) or rewritten as a Rust crate.
 
-| Component | Language | Reason |
-|---|---|---|
-| envelope, freezer, ledger, undo, daemon, bless, canary, egress, watch, radar encoding, cli | Rust | kernel surface, single-writer, hot path, must be one binary |
-| trust scoring | Rust | single-writer to trust.db, in daemon |
-| ProofCertificate assembly | Rust | in daemon |
-| relay-vuln scan | Python (subprocess) | 136 modules, 49GB DB, already built; rewrite is huge for no gain |
-| seq-engine completeness | Python (subprocess) | built; Rust main is a stub |
-| config-radar | Rust (subprocess) | already Rust; invoked as subprocess for isolation |
-| skein, carrion | Rust (subprocess) | already Rust |
-| agent-audit-trail | Python (subprocess) | built; small |
-| evidence-pack | Python (subprocess) | built; export only |
-| proof-fixes | Python (subprocess) | built; placebo methodology |
-| cert-evals | Python (subprocess) | built; benchmark harness |
-| llm-replay | Python (subprocess) | built; PASS verdict |
-| engfield | Rust (subprocess) | already Rust |
-| sensor-hdc | Rust (vendored or subprocess) | tiny (286 LOC), could vendor |
-| cortex-rs | Rust (subprocess) | built; tier-promotion memory |
+This mirrors the project directive: "relay must be pure Rust (no Python runtime)." The same principle applies to castellan — the daemon is the trusted path.
+
+**What's already pure Rust** (verified by inspecting the repos):
+- relay-vuln: 52,258 lines of Rust in `src/`, zero Python in the scanner. The 20 Python files are `scripts/` (mining/eval tooling), not the scanner. Links as a Rust crate.
+- skein (203 LOC), carrion (227 LOC), sensor-hdc (286 LOC), cortex-rs (1632 LOC): already pure Rust.
+- config-radar (2698 LOC Rust), engfield (2183 LOC Rust), stria (8050 LOC Rust): already have substantial Rust; Python is legacy/tooling only.
+
+**What gets rewritten as Rust** (Python-only, in the daemon's trusted path):
+
+| Primitive | Python LOC | Rust crate | Rewrite cost |
+|---|---|---|---|
+| agent-audit-trail | 109 | castellan-audit (in castellan-ledger) | trivial — hash chain + JSON |
+| evidence-pack | 302 | castellan-proof (export module) | trivial — serde_json + quality labels |
+| proof-fixes | 270 | castellan-proof (placebo module) | small — placebo orchestration over relay-vuln |
+| seq-engine | 1368 | castellan-completeness | medium — completeness logic, algorithmic not Python-specific |
+
+~2050 lines of Python total, all small, all algorithmic, all in the proof pipeline. Rewrite as Rust crates and the daemon is pure Rust.
+
+**What stays Python** (dev/CI tooling, NOT shipped, NOT in the daemon):
+- cert-evals (319 LOC) — benchmark harness run by humans/CI, not user-facing
+- llm-replay (152 LOC) — forensic replay tooling, run by developers
+- relay-vuln `scripts/` — mining/eval, not the scanner
+
+These are developer tools. They don't ship to users, don't run inside the daemon, and aren't in the trusted path. Python is fine for dev tooling.

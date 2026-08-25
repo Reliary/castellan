@@ -75,8 +75,9 @@ The DB is at `/home/john/data/cvefixes/cvefixes.db` (49.3 GB) and `/home/john/sr
 ## What this inventory changes about the architecture
 
 1. The enforcement plane is entirely greenfield. Honest framing: owned primitives cover observation + analysis; enforcement is new Rust.
-2. The trust positive signal is placebo-controlled proof-fixes, NOT refactor-proof (which is KILLed). This is the commitment #3 verifier pattern.
+2. The trust positive signal is placebo-controlled proof (was proof-fixes in Python, rewritten as Rust in castellan-proof), NOT refactor-proof (which is KILLed). This is the commitment #3 verifier pattern.
 3. Trust uses cortex-rs tier-promotion (recall-based), NOT half-life (KILLed). No time-decay unless a future real-data verdict revives it.
 4. Output compression is sift, NOT agent-log-compress (KILLed).
-5. The daemon pattern is reused from reliary-agent (TCP line protocol, lock-protected state), but the daemon code is new.
+5. The daemon pattern is reused from reliary-agent (unix socket, lock-protected state), but the daemon code is new.
 6. The HTTP proxy from reliary-agent is gone — the egress proxy is built fresh, with credential injection (a different threat model than reliary's pass-through).
+7. **The daemon is pure Rust — no Python subprocess in the trusted path.** relay-vuln is already pure Rust (52K LOC, links as a crate). skein, carrion, sensor-hdc, cortex-rs, config-radar, engfield, stria are already Rust. The four Python-only primitives in the daemon's path (agent-audit-trail 109 LOC, evidence-pack 302 LOC, proof-fixes 270 LOC, seq-engine 1368 LOC) are rewritten as Rust crates (~2050 lines total, all algorithmic). cert-evals and llm-replay stay Python — they're dev/CI tooling, not shipped, not in the daemon.

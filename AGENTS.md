@@ -5,6 +5,7 @@ Conventions for AI agents (and humans) working on castellan.
 ## Style
 
 - **Rust, stable toolchain.** Workspace with `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`, mimalloc global allocator (matches reliary-agent).
+- **Pure Rust daemon — no Python in the trusted path.** The daemon is one static binary. Every primitive in the daemon's proof-generation, trust-scoring, or observation flow is Rust (linked as a workspace crate or vendored). Python is allowed only for dev/CI tooling (cert-evals, llm-replay) that is not shipped and not in the daemon. See [docs/CRATES.md](docs/CRATES.md).
 - **Grammar-free, no exceptions.** No parsers, no ASTs, no tree-sitter, no per-language code. Function boundaries use indentation-anchored scanning. JSON parsing is allowed (it is structured data, not source code). Configuration formats are parsed by their existing libraries, not hand-rolled.
 - **Deterministic, predictable results.** Tool output format must match what the LLM expects from native tools. No stochastic gates in the enforcement path.
 - **Two spaces for indentation in Rust and Markdown.** No tabs. No trailing whitespace. No emojis unless explicitly requested.

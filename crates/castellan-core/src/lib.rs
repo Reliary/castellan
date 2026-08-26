@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type SessionId = String;
 
@@ -9,10 +10,6 @@ pub struct Session {
   pub id: SessionId,
   pub harness: String,
   pub project: PathBuf,
-  pub scope_path: PathBuf,
-  #[serde(default)]
-  pub frozen: bool,
-  pub started_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +95,43 @@ impl Response {
 }
 
 #[derive(Default)]
-pub struct Registry(pub FxHashMap<SessionId, Session>);
+pub struct Registry {
+  sessions: FxHashMap<SessionId, Session>,
+}
+
+impl Registry {
+  pub fn get(&self, id: &SessionId) -> Option<&Session> {
+    self.sessions.get(id)
+  }
+
+  pub fn contains(&self, id: &SessionId) -> bool {
+    self.sessions.contains_key(id)
+  }
+
+  pub fn insert(&mut self, session: Session) {
+    self.sessions.insert(session.id.clone(), session);
+  }
+
+  pub fn remove(&mut self, id: &SessionId) -> Option<Session> {
+    self.sessions.remove(id)
+  }
+
+  pub fn ids(&self) -> Vec<SessionId> {
+    self.sessions.keys().cloned().collect()
+  }
+
+  pub fn values(&self) -> impl Iterator<Item = &Session> {
+    self.sessions.values()
+  }
+
+  pub fn len(&self) -> usize {
+    self.sessions.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.sessions.is_empty()
+  }
+}
 
 pub fn now_unix() -> u64 {
   std::time::SystemTime::now()
@@ -108,10 +141,11 @@ pub fn now_unix() -> u64 {
 }
 
 pub fn new_session_id() -> SessionId {
+  static SEQ: AtomicU64 = AtomicU64::new(0);
+  let seq = SEQ.fetch_add(1, Ordering::Relaxed);
   let nanos = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.subsec_nanos() as u64 + d.as_secs())
+    .map(|d| d.as_nanos() as u64)
     .unwrap_or(0);
-  let pid = std::process::id();
-  format!("s{:x}{:04x}", nanos, (pid & 0xffff) as u16)
+  format!("s{nanos:x}{seq:04x}")
 }

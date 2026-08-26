@@ -4,7 +4,7 @@ fn main() {
   let path = match std::env::var("XDG_RUNTIME_DIR") {
     Ok(dir) => format!("{dir}/castellan.sock"),
     Err(_) => {
-      let uid = unsafe { libc::getuid() };
+      let uid = nix::unistd::Uid::current().as_raw();
       format!("/run/user/{uid}/castellan.sock")
     }
   };
@@ -76,8 +76,8 @@ fn spawn_req(args: &[String]) -> serde_json::Value {
         }
       }
       "--pid" => {
-        if i + 1 < args.len() {
-          pid = args[i + 1].parse::<u32>().ok();
+        if let Some(p) = args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+          pid = Some(p);
           i += 1;
         }
       }

@@ -17,7 +17,4 @@ path = "src/main.rs"
 castellan-core = { path = "../castellan-core" }
 castellan-freezer = { path = "../castellan-freezer" }
 serde_json = { workspace = true }
-rustc-hash = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+nix = { workspace = true }

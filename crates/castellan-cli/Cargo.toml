@@ -12,6 +12,4 @@ path = "src/main.rs"
 [dependencies]
 castellan-core = { path = "../castellan-core" }
 serde_json = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+nix = { workspace = true }

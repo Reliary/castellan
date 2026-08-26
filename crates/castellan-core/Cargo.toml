@@ -1,0 +1,11 @@
+[package]
+name = "castellan-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types for castellan: session identity, events, freeze state."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "castellan-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "castellan daemon: unix socket, single-writer session state, freezer orchestration."
+
+[lib]
+name = "castellan_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "castellan-daemon"
+path = "src/main.rs"
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+castellan-freezer = { path = "../castellan-freezer" }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

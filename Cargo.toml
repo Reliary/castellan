@@ -1,27 +1,14 @@
 [workspace]
 resolver = "2"
-# Members are stubbed until each phase's build begins.
-# See docs/CRATES.md for the proposed layout and docs/ROADMAP.md for build order.
 members = [
-  # "crates/castellan-core",
-  # "crates/castellan-envelope",
-  # "crates/castellan-freezer",
-  # "crates/castellan-ledger",
-  # "crates/castellan-undo",
-  # "crates/castellan-trust",
-  # "crates/castellan-proof",
-  # "crates/castellan-replay",
-  # "crates/castellan-egress",
-  # "crates/castellan-canary",
-  # "crates/castellan-radar",
-  # "crates/castellan-bless",
-  # "crates/castellan-watch",
-  # "crates/castellan-daemon",
-  # "crates/castellan-cli",
+  "crates/castellan-core",
+  "crates/castellan-freezer",
+  "crates/castellan-daemon",
+  "crates/castellan-cli",
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["castellan contributors"]
@@ -38,3 +25,8 @@ opt-level = 3
 
 [profile.release.package."*"]
 opt-level = 3
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustc-hash = "2"

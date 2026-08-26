@@ -1,0 +1,13 @@
+[package]
+name = "castellan-freezer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cgroup v2 freezer ownership: freeze/thaw/kill session process trees."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+rustc-hash = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main, quattro]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# test/shell.d/*.sh acceptance suites require a real user cgroup slice
+# (user@UID.service under systemd) and run on dev machines only, not CI.
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace

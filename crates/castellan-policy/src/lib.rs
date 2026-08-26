@@ -28,16 +28,56 @@ fn home() -> PathBuf {
 }
 
 pub fn harness_state_dirs(harness: &str) -> Vec<PathBuf> {
+  harness_state_dirs_with_config(harness, None)
+}
+
+const KNOWN_HARNESSES: &[(&str, &[&str])] = &[
+  ("claude", &[".claude"]),
+  ("codex", &[".codex"]),
+  ("pi", &[".pi"]),
+  ("opencode", &[".config/opencode", ".local/share/opencode"]),
+  ("aider", &[".aider"]),
+  ("cursor-agent", &[".cursor", ".config/Cursor"]),
+  ("gemini", &[".gemini"]),
+  ("crush", &[".config/crush"]),
+];
+
+pub fn detect_harness(argv0: &str) -> Option<&'static str> {
+  let base = Path::new(argv0).file_name()?.to_str()?;
+  KNOWN_HARNESSES.iter().find(|(n, _)| *n == base).map(|(n, _)| *n)
+}
+
+fn custom_harness_config() -> Option<toml::Value> {
+  let path = std::env::var("XDG_CONFIG_HOME")
+    .map(PathBuf::from)
+    .unwrap_or_else(|_| home().join(".config"))
+    .join("castellan/harnesses.toml");
+  let content = std::fs::read_to_string(&path).ok()?;
+  toml::from_str(&content).ok()
+}
+
+fn harness_state_dirs_with_config(harness: &str, config: Option<&toml::Value>) -> Vec<PathBuf> {
   let h = home();
-  let candidates: &[&str] = match harness {
-    "claude" => &[".claude"],
-    "codex" => &[".codex"],
-    "pi" => &[".pi"],
-    "aider" => &[".aider", ".aider.conf.yml"],
-    "cursor" => &[".cursor", ".config/Cursor"],
-    _ => &[],
+  let mut dirs = match KNOWN_HARNESSES.iter().find(|(n, _)| *n == harness) {
+    Some((_, candidates)) => candidates.iter().map(|c| h.join(c)).collect::<Vec<_>>(),
+    None => Vec::new(),
   };
-  candidates.iter().map(|c| h.join(c)).collect()
+  if let Some(cfg) = config {
+    if let Some(entry) = cfg.get(harness) {
+      if let Some(list) = entry.get("state_dirs").and_then(|v| v.as_array()) {
+        for v in list {
+          if let Some(s) = v.as_str() {
+            let p = match s.strip_prefix("~/") {
+              Some(rest) => h.join(rest),
+              None => PathBuf::from(s),
+            };
+            dirs.push(p);
+          }
+        }
+      }
+    }
+  }
+  dirs
 }
 
 pub fn always_deny_write() -> Vec<PathBuf> {
@@ -70,8 +110,9 @@ pub fn always_allow_write() -> Vec<PathBuf> {
 
 impl Policy {
   pub fn new(session: &str, harness: &str, project: PathBuf) -> Self {
+    let config = custom_harness_config();
     let mut write_roots = vec![project.clone()];
-    for dir in harness_state_dirs(harness) {
+    for dir in harness_state_dirs_with_config(harness, config.as_ref()) {
       if dir.is_dir() {
         write_roots.push(dir);
       }
@@ -217,5 +258,29 @@ mod tests {
       p.classify(Path::new("/home/x/.config/autostart/evil.desktop"), Op::Write),
       Verdict::Deny
     );
+  }
+
+  #[test]
+  fn detect_harness_matches_basename() {
+    assert_eq!(detect_harness("/usr/bin/claude"), Some("claude"));
+    assert_eq!(detect_harness("codex"), Some("codex"));
+    assert_eq!(detect_harness("/usr/local/bin/opencode"), Some("opencode"));
+    assert_eq!(detect_harness("/usr/bin/python3"), None);
+  }
+
+  #[test]
+  fn custom_harness_toml_merges_state_dirs() {
+    let cfg: toml::Value = toml::from_str(
+      r#"
+[myagent]
+state_dirs = ["~/myagent-state", "/var/lib/myagent"]
+"#,
+    )
+    .unwrap();
+    let dirs = harness_state_dirs_with_config("myagent", Some(&cfg));
+    assert_eq!(dirs.len(), 2);
+    assert!(dirs[0].ends_with("myagent-state"));
+    assert_eq!(dirs[1], Path::new("/var/lib/myagent"));
+    assert!(harness_state_dirs_with_config("claude", Some(&cfg)).iter().all(|d| d.ends_with(".claude")));
   }
 }

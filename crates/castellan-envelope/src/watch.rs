@@ -77,11 +77,8 @@ fn run_watcher(policy: Policy, sink: EventSink, stop: Arc<AtomicBool>) {
   if let Ok(home) = std::env::var("HOME") {
     let home = PathBuf::from(home);
     if !policy.watch_roots().any(|r| r == home) {
-      match ino.add_watch(&home, watch_mask()) {
-        Ok(wd) => {
-          map.insert(wd, home);
-        }
-        Err(_) => {}
+      if let Ok(wd) = ino.add_watch(&home, watch_mask()) {
+        map.insert(wd, home);
       }
     }
   }

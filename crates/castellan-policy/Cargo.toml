@@ -8,3 +8,4 @@ description = "Envelope policy: what an agent session may write, and where it is
 [dependencies]
 castellan-core = { path = "../castellan-core" }
 rustc-hash = { workspace = true }
+toml = "0.8"

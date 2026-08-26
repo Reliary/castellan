@@ -62,7 +62,7 @@ fn freeze_req(args: &[String], op: &str) -> serde_json::Value {
 }
 
 fn launch(args: &[String], sock: &str) -> ! {
-  let mut harness = "unknown".to_string();
+  let mut harness: Option<String> = None;
   let mut project = std::env::current_dir().unwrap_or_default();
   let mut enforce = false;
   let mut cmd: Option<Vec<String>> = None;
@@ -70,7 +70,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   while i < args.len() {
     match args[i].as_str() {
       "--harness" | "-H" if i + 1 < args.len() => {
-        harness = args[i + 1].clone();
+        harness = Some(args[i + 1].clone());
         i += 1;
       }
       "--project" | "-p" if i + 1 < args.len() => {
@@ -96,6 +96,9 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::process::exit(2);
     }
   };
+  let harness = harness.unwrap_or_else(|| {
+    castellan_policy::detect_harness(&cmd[0]).unwrap_or("unknown").to_string()
+  });
   let resp = rpc(sock, &serde_json::json!({
     "op": "spawn",
     "harness": harness,

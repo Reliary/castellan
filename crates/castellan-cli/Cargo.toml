@@ -11,5 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 castellan-core = { path = "../castellan-core" }
+castellan-policy = { path = "../castellan-policy" }
+castellan-envelope = { path = "../castellan-envelope" }
+castellan-freezer = { path = "../castellan-freezer" }
 serde_json = { workspace = true }
 nix = { workspace = true }

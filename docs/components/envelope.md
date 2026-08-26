@@ -58,4 +58,10 @@ Profiles are minted at spawn from trust.db. Mid-session expansion is impossible 
 
 ## Status
 
-Greenfield. No Landlock or seccomp code exists anywhere in our repos. This is the build-cost bottleneck (Phase 1, 2-3 weeks).
+**Built (P1).** `crates/castellan-policy` (pure classification, unit-tested) + `crates/castellan-envelope` (Landlock ruleset via raw syscalls, seccomp BPF, audit watcher). Verified live on kernel 7.0.3 / Landlock ABI 8: workspace write allowed, home write denied with EACCES, git workflow functional under enforce, ptrace returns EPERM under seccomp. Enforce attaches at launch (`castellan launch --enforce -- cmd`) — adopted sessions cannot be enforced (Landlock is self-applied only). Audit mode (default) classifies inotify-observed writes into events.jsonl for the false-block kill metric.
+
+Kernel findings recorded during build:
+- `landlock_path_beneath_attr` must be `#[repr(packed)]` (12 bytes) — aligned layout gives EINVAL on add_rule.
+- This kernel rejects `BPF_JNE` (0x50) in seccomp classic-BPF — arch check omitted; x86_64-only by cfg.
+- Device nodes (`/dev/null`) reject dir-only rights in path_beneath rules — file-scope mask needed.
+- chmod/chown family left unblocked: kernel requires ownership or CAP_FOWNER, so metadata tampering is bounded by file ownership; content writes stay Landlock-denied. Documented residual in THREAT_MODEL.

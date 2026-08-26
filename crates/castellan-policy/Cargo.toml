@@ -1,0 +1,10 @@
+[package]
+name = "castellan-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Envelope policy: what an agent session may write, and where it is always denied."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+rustc-hash = { workspace = true }

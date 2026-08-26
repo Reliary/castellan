@@ -1,16 +1,26 @@
 use castellan_core::{
-  new_session_id, FreezeState, Registry, Request, Response, Session, SessionId, SessionReport,
+  new_session_id, EventSink, FreezeState, Registry, Request, Response, Session, SessionId,
+  SessionReport,
 };
+use castellan_envelope::{AuditWatcher, Snapshot};
 use castellan_freezer::CgroupRoot;
+use castellan_policy::Policy;
+use rustc_hash::FxHashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+struct SessionAudit {
+  _watcher: AuditWatcher,
+  baseline: Vec<(PathBuf, Snapshot)>,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
   root: Arc<CgroupRoot>,
   registry: Arc<Mutex<Registry>>,
+  audits: Arc<Mutex<FxHashMap<SessionId, SessionAudit>>>,
 }
 
 impl Daemon {
@@ -18,7 +28,16 @@ impl Daemon {
     Ok(Self {
       root: Arc::new(CgroupRoot::detect()?),
       registry: Arc::new(Mutex::new(Registry::default())),
+      audits: Arc::new(Mutex::new(FxHashMap::default())),
     })
+  }
+
+  fn state_dir() -> PathBuf {
+    std::env::var("XDG_STATE_HOME")
+      .map(PathBuf::from)
+      .unwrap_or_else(|_| {
+        PathBuf::from(format!("/home/{}/.local/state", nix::unistd::User::from_uid(nix::unistd::Uid::current()).ok().and_then(|u| u.map(|u| u.name)).unwrap_or_default()))
+      })
   }
 
   pub fn socket_path() -> PathBuf {
@@ -92,8 +111,44 @@ impl Daemon {
         return Response::err(format!("failed to move pid into scope: {e}"));
       }
     }
-    self.registry.lock().unwrap().insert(Session { id: id.clone(), harness, project });
+    self.registry.lock().unwrap().insert(Session { id: id.clone(), harness: harness.clone(), project: project.clone() });
+    self.start_audit(&id, &harness, &project);
     Response::ok().with_message(format!("spawned session {id}"))
+  }
+
+  fn start_audit(&self, id: &SessionId, harness: &str, project: &Path) {
+    let policy = Policy::new(id, harness, project.to_path_buf());
+    let mut baseline = Vec::new();
+    for dir in castellan_policy::harness_state_dirs(harness) {
+      if dir.is_dir() {
+        let snap = Snapshot::take(dir.clone());
+        baseline.push((dir, snap));
+      }
+    }
+    if let Ok(sink) = EventSink::for_session(&Self::state_dir(), id) {
+      let watcher = AuditWatcher::start(policy, sink);
+      self.audits.lock().unwrap().insert(id.clone(), SessionAudit { _watcher: watcher, baseline });
+    }
+  }
+
+  fn end_audit(&self, id: &SessionId, harness: &str) -> Option<usize> {
+    let audit = self.audits.lock().unwrap().remove(id)?;
+    audit._watcher.stop();
+    let mut drift = Vec::new();
+    for (dir, base) in &audit.baseline {
+      drift.extend(Snapshot::take(dir.clone()).diff_since(base));
+    }
+    if drift.is_empty() {
+      return Some(0);
+    }
+    if let Ok(sink) = EventSink::for_session(&Self::state_dir(), id) {
+      for d in &drift {
+        let path = d.split_once(' ').map(|(_, p)| p).unwrap_or(d);
+        let _ = sink.emit("harness_drift", path, "quarantine");
+      }
+    }
+    eprintln!("castellan-daemon: session {id} ({harness}) harness-state drift: {} file(s)", drift.len());
+    Some(drift.len())
   }
 
   fn adopt(&self, session: &SessionId, pids: Vec<u32>) -> Response {
@@ -129,6 +184,10 @@ impl Daemon {
     let targets = self.resolve_targets(session);
     let mut msgs = Vec::new();
     for id in targets {
+      let harness = self.registry.lock().unwrap().get(&id).map(|s| s.harness.clone());
+      if let Some(h) = harness {
+        self.end_audit(&id, &h);
+      }
       let _ = self.root.set_freeze(&id, false);
       msgs.push(match self.root.kill_all(&id) {
         Ok(n) => format!("{id}: killed {n}"),

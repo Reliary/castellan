@@ -1,6 +1,8 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type SessionId = String;
@@ -138,6 +140,50 @@ pub fn now_unix() -> u64 {
     .duration_since(std::time::UNIX_EPOCH)
     .map(|d| d.as_secs())
     .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+  pub ts: u64,
+  pub session: SessionId,
+  pub kind: String,
+  pub path: String,
+  pub verdict: String,
+}
+
+pub struct EventSink {
+  path: PathBuf,
+  session: SessionId,
+}
+
+impl EventSink {
+  pub fn for_session(state_dir: &Path, session: &str) -> io::Result<Self> {
+    let dir = state_dir.join("castellan/events");
+    fs::create_dir_all(&dir)?;
+    Ok(Self { path: dir.join(format!("{session}.jsonl")), session: session.to_owned() })
+  }
+
+  pub fn emit(&self, kind: &str, path: &str, verdict: &str) -> io::Result<()> {
+    let ev = Event {
+      ts: now_unix(),
+      session: self.session.clone(),
+      kind: kind.to_owned(),
+      path: path.to_owned(),
+      verdict: verdict.to_owned(),
+    };
+    let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+    serde_json::to_writer(&mut f, &ev)?;
+    f.write_all(b"\n")
+  }
+
+  pub fn read_all(&self) -> io::Result<Vec<Event>> {
+    let content = match fs::read_to_string(&self.path) {
+      Ok(c) => c,
+      Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+      Err(e) => return Err(e),
+    };
+    Ok(content.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+  }
 }
 
 pub fn new_session_id() -> SessionId {

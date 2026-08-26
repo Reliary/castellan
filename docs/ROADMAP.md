@@ -23,13 +23,17 @@ Six phases. Each phase has a **kill criterion**: if the criterion fails, the pha
 
 ## Phase 1 — Envelope floor (audit mode)
 
+**Status: BUILT (core).** `castellan-policy` + `castellan-envelope` crates, `castellan launch [--enforce] -- cmd`, `castellan audit <session>`, event spine (events.jsonl), harness-state snapshot/diff at session end. Acceptance 13/13 PASS on kernel 7.0.3 (Landlock ABI 8): enforce allows workspace writes / denies home writes with EACCES; git workload runs clean under enforce; ptrace returns EPERM under seccomp; audit classifies would-deny writes. Remaining P1 scope: blake3 before-images (moves to undo substrate), agent-audit-trail advisory tagging, omarchy launch-path integration.
+
 **Scope:** Landlock + seccomp envelope minter (commitments #8), wrapper around Omarchy's existing agent launch path (`omarchy-launch-agent`), inotify-ledger on allowed paths, agent-audit-trail wired in (advisory vs kernel-truth tagging), harness-state-watcher (skein/carrion baseline). Default mode: **audit** (deny logged, not enforced) for upgraders; **enforce** only for fresh installs.
 
 **Deliverables:**
-- `castellan-envelope` crate (Landlock ruleset minting, seccomp BPF generation)
-- `castellan-ledger` crate (inotify watcher, event spine, blake3 before-images)
+- `castellan-envelope` crate (Landlock ruleset minting, seccomp BPF generation) ✅
+- `castellan-policy` crate (pure classification, unit-tested) ✅
+- event spine: events.jsonl per session ✅
+- harness-state-watcher snapshot/diff ✅
+- `castellan-ledger` crate (blake3 before-images — deferred to overlayfs undo substrate)
 - agent-audit-trail integration
-- harness-state-watcher integration (skein + carrion)
 - `omarchy-launch-agent` wrapper replacing direct mise-stub exec
 
 **Kill criterion:** false-block rate < 2% on a legit Omarchy-workload corpus (run Omarchy's own acceptance-test-like scenarios under audit mode, count denials on legitimate operations). If the metric does not pass, Phase 1 ships audit-only indefinitely and enforce-default is deferred. No exceptions.

@@ -1,0 +1,10 @@
+[package]
+name = "castellan-ledger"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+nix = { workspace = true, features = ["mount", "sched", "user"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

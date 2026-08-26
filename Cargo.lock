@@ -24,6 +24,7 @@ dependencies = [
  "castellan-core",
  "castellan-envelope",
  "castellan-freezer",
+ "castellan-ledger",
  "castellan-policy",
  "nix",
  "serde_json",
@@ -45,6 +46,7 @@ dependencies = [
  "castellan-core",
  "castellan-envelope",
  "castellan-freezer",
+ "castellan-ledger",
  "castellan-policy",
  "nix",
  "rustc-hash",
@@ -69,6 +71,16 @@ version = "0.1.0"
 dependencies = [
  "castellan-core",
  "nix",
+]
+
+[[package]]
+name = "castellan-ledger"
+version = "0.1.0"
+dependencies = [
+ "castellan-core",
+ "nix",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

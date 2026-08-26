@@ -16,11 +16,17 @@ struct SessionAudit {
   baseline: Vec<(PathBuf, Snapshot)>,
 }
 
+#[derive(Default)]
+struct SessionNotes {
+  undo_upper: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
   root: Arc<CgroupRoot>,
   registry: Arc<Mutex<Registry>>,
   audits: Arc<Mutex<FxHashMap<SessionId, SessionAudit>>>,
+  notes: Arc<Mutex<FxHashMap<SessionId, SessionNotes>>>,
 }
 
 impl Daemon {
@@ -29,6 +35,7 @@ impl Daemon {
       root: Arc::new(CgroupRoot::detect()?),
       registry: Arc::new(Mutex::new(Registry::default())),
       audits: Arc::new(Mutex::new(FxHashMap::default())),
+      notes: Arc::new(Mutex::new(FxHashMap::default())),
     })
   }
 
@@ -97,6 +104,106 @@ impl Daemon {
       Request::Thaw { session } => self.freeze(session.as_ref(), false),
       Request::Kill { session } => self.kill(session.as_ref()),
       Request::Status => self.status(),
+      Request::Note { session, kind, detail } => self.note(&session, &kind, &detail),
+      Request::UndoDiff { session } => self.undo_diff(&session),
+      Request::UndoDiscard { session } => self.undo_discard(&session),
+      Request::UndoCommit { session } => self.undo_commit(&session),
+    }
+  }
+
+  fn note(&self, session: &str, kind: &str, detail: &str) -> Response {
+    let mut notes = self.notes.lock().unwrap();
+    let entry = notes.entry(session.to_string()).or_default();
+    match kind {
+      "undo" => entry.undo_upper = Some(PathBuf::from(detail)),
+      _ => return Response::err(format!("unknown note kind: {kind}")),
+    }
+    Response::ok().with_message(format!("noted {kind}"))
+  }
+
+  fn undo_diff(&self, session: &str) -> Response {
+    let upper = {
+      let notes = self.notes.lock().unwrap();
+      match notes.get(session).and_then(|n| n.undo_upper.clone()) {
+        Some(u) => u,
+        None => return Response::err("no undo layer recorded for this session"),
+      }
+    };
+    match castellan_ledger::diff_upper(&upper) {
+      Ok(changes) => {
+        let files: Vec<serde_json::Value> = changes
+          .iter()
+          .map(|c| serde_json::json!({ "path": c.path, "kind": c.kind, "size": c.size }))
+          .collect();
+        Response::ok()
+          .with_message(format!("{} change(s)", files.len()))
+          .with_extra("changes", serde_json::Value::Array(files))
+      }
+      Err(e) => Response::err(format!("diff failed: {e}")),
+    }
+  }
+
+  fn undo_discard(&self, session: &str) -> Response {
+    let (upper, work) = {
+      let mut notes = self.notes.lock().unwrap();
+      let Some(n) = notes.get_mut(session) else {
+        return Response::err("no undo layer recorded for this session");
+      };
+      match n.undo_upper.take() {
+        Some(upper) => {
+          let work = upper.with_file_name("work");
+          (upper, work)
+        }
+        None => return Response::err("no undo layer recorded for this session"),
+      }
+    };
+    // freeze first so nothing writes while we wipe
+    if !self.freeze(Some(&session.to_string()), true).ok {
+      eprintln!("freeze-before-undo failed");
+    }
+    let _ = self.kill(Some(&session.to_string()));
+    match castellan_ledger::discard(&upper, &work) {
+      Ok(()) => Response::ok().with_message("discarded"),
+      Err(e) => Response::err(format!("discard failed: {e}")),
+    }
+  }
+
+  fn undo_commit(&self, session: &str) -> Response {
+    let (upper, work) = {
+      let mut notes = self.notes.lock().unwrap();
+      let Some(n) = notes.get_mut(session) else {
+        return Response::err("no undo layer recorded for this session");
+      };
+      match n.undo_upper.take() {
+        Some(upper) => {
+          let work = upper.with_file_name("work");
+          (upper, work)
+        }
+        None => return Response::err("no undo layer recorded for this session"),
+      }
+    };
+    // commit needs the real project root — read it from the registry
+    let project = {
+      let reg = self.registry.lock().unwrap();
+      match reg.get(&session.to_string()) {
+        Some(s) => s.project.clone(),
+        None => return Response::err("unknown session"),
+      }
+    };
+    if !self.freeze(Some(&session.to_string()), true).ok {
+      eprintln!("freeze-before-commit failed");
+    }
+    let _ = self.kill(Some(&session.to_string()));
+    match castellan_ledger::commit(&project, &upper) {
+      Ok(applied) => {
+        let _ = castellan_ledger::discard(&upper, &work);
+        let lines: Vec<serde_json::Value> =
+          applied.iter().map(|l| serde_json::Value::String(l.clone())).collect();
+        Response::ok()
+          .with_message(format!("committed {} change(s)", applied.len()))
+          .with_extra("applied", serde_json::Value::Array(lines))
+      }
+      Err(e) => Response::err(format!("commit failed: {e}")),
     }
   }
 

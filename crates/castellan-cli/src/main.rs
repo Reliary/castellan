@@ -24,6 +24,7 @@ fn main() {
     "kill" => freeze_req(&args[1..], "kill"),
     "spawn" => spawn_req(&args[1..]),
     "adopt" => adopt_req(&args[1..]),
+    "diff" | "undo" | "keep" => undo_req(&args[1..], args[0].as_str()),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -61,10 +62,23 @@ fn freeze_req(args: &[String], op: &str) -> serde_json::Value {
   }
 }
 
+fn undo_req(args: &[String], verb: &str) -> serde_json::Value {
+  let Some(id) = args.first() else {
+    eprintln!("usage: castellan {verb} <session>");
+    std::process::exit(2);
+  };
+  match verb {
+    "diff" => serde_json::json!({"op": "undo_diff", "session": id}),
+    "undo" => serde_json::json!({"op": "undo_discard", "session": id}),
+    _ => serde_json::json!({"op": "undo_commit", "session": id}),
+  }
+}
+
 fn launch(args: &[String], sock: &str) -> ! {
   let mut harness: Option<String> = None;
   let mut project = std::env::current_dir().unwrap_or_default();
   let mut enforce = false;
+  let mut undo = false;
   let mut cmd: Option<Vec<String>> = None;
   let mut i = 0;
   while i < args.len() {
@@ -78,6 +92,7 @@ fn launch(args: &[String], sock: &str) -> ! {
         i += 1;
       }
       "--enforce" => enforce = true,
+      "--undo" => undo = true,
       "--" => {
         cmd = Some(args[i + 1..].to_vec());
         break;
@@ -124,7 +139,37 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::process::exit(1);
     }
   }
-  eprintln!("castellan session {session}{} launched", if enforce { ", enforced" } else { "" });
+  if undo {
+    // overlay setup enters a user+mount namespace; every write the agent
+    // makes lands in the session upper layer. undo/diff/commit operate
+    // on that layer from outside after exit.
+    let scratch = std::env::var("XDG_STATE_HOME")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+      })
+      .join("castellan/sessions")
+      .join(&session);
+    match castellan_ledger::setup(&project, &scratch) {
+      Ok(o) => {
+        project = o.merged.clone();
+        if let Err(e) = std::env::set_current_dir(&o.merged) {
+          eprintln!("failed to chdir into merged view: {e}");
+          std::process::exit(1);
+        }
+        rpc(sock, &serde_json::json!({ "op": "note", "session": session, "kind": "undo", "detail": o.upper.display().to_string() }));
+      }
+      Err(e) => {
+        eprintln!("failed to set up undo overlay (continuing WITHOUT undo): {e}");
+        undo = false;
+      }
+    }
+  }
+  eprintln!(
+    "castellan session {session}{}{} launched",
+    if enforce { ", enforced" } else { "" },
+    if undo { ", undoable" } else { "" }
+  );
   let err = execvp(&cmd);
   eprintln!("exec failed: {err}");
   std::process::exit(127);
@@ -300,6 +345,28 @@ fn render(line: &str) -> String {
           let pids = s.get("pids").and_then(|x| x.as_u64()).unwrap_or(0);
           let project = s.get("project").and_then(|x| x.as_str()).unwrap_or("-");
           out.push_str(&format!("{id:<24} {harness:<10} {state:<8} {pids:>3} pids  {project}\n"));
+        }
+      }
+      if let Some(changes) =
+        v.get("extra").and_then(|e| e.get("changes")).and_then(|c| c.as_array())
+      {
+        for c in changes {
+          let kind = c.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+          let path = c.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+          let size = c.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+          let marker = match kind {
+            "deleted" => "-",
+            "dir" => "d",
+            _ => "+",
+          };
+          out.push_str(&format!("{marker} {path:<50} {size:>8}B\n"));
+        }
+      }
+      if let Some(applied) =
+        v.get("extra").and_then(|e| e.get("applied")).and_then(|a| a.as_array())
+      {
+        for a in applied {
+          out.push_str(&format!("{}\n", a.as_str().unwrap_or("?")));
         }
       }
       out

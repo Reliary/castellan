@@ -46,10 +46,17 @@ Six phases. Each phase has a **kill criterion**: if the criterion fails, the pha
 
 ## Phase 2 — Surgical undo + canary credentials
 
+**Status: BUILT (undo core).** `castellan-ledger` crate: unprivileged overlayfs over the project in a user+mount namespace, upper-layer diff (creations/modifications/whiteout-deletions), discard (undo), and commit (keep). `castellan launch --undo -- cmd`; CLI verbs `diff|undo|keep <session>`. Acceptance 17/17 PASS: session writes fully invisible to the real project; diff names every change incl. deletions; discard restores exactly; commit materializes changes + deletions. P0/P1 regressions still 15/15 and 13/13. Remaining P2 scope: canary credentials + honeypot + egress proxy v0.
+
+Kernel findings recorded during build:
+- Kernel 7.0.x DENIES self-written uid_map from inside a fresh userns (EPERM) — older kernels allowed it. Fix: a forked map-helper stays outside the ns and writes /proc/<pid>/uid_map for the session process.
+- Mounting overlay before the helper's map-write is visible fails EACCES intermittently — fixed with an ack round-trip before mount.
+- Overlay upper dirs from crashed sessions are owned by dead namespaces and cannot always be removed by later cleanup runs (documented wart; needs GC).
+
 **Scope:** overlayfs undo substrate (commitment #2), `castellan undo <session>` with 3-way merge UX (session-start, session-end, current-user-edited), freeze-before-undo sequencing, pinned GC, canary-credential planting (commitments #4, #5), localhost honeypot listener, auto-freeze on canary hit.
 
 **Deliverables:**
-- `castellan-undo` crate (overlayfs mount in user namespace, upper enumeration, blob store, 3-way merge)
+- `castellan-ledger` crate (overlayfs mount in user namespace, upper enumeration, discard, commit) ✅
 - `castellan-canary` crate (credential planting, honeypot listener, trigger → freeze wiring)
 - egress proxy v0 (local-only: blocks all real egress, only canary honeypot reachable)
 

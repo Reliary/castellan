@@ -3,6 +3,9 @@ resolver = "2"
 members = [
   "crates/castellan-core",
   "crates/castellan-freezer",
+  "crates/castellan-policy",
+  "crates/castellan-envelope",
+  "crates/castellan-ledger",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

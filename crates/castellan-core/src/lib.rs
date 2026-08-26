@@ -63,6 +63,20 @@ pub enum Request {
     session: Option<SessionId>,
   },
   Status,
+  Note {
+    session: SessionId,
+    kind: String,
+    detail: String,
+  },
+  UndoDiff {
+    session: SessionId,
+  },
+  UndoDiscard {
+    session: SessionId,
+  },
+  UndoCommit {
+    session: SessionId,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,15 +88,17 @@ pub struct Response {
   pub sessions: Option<Vec<SessionReport>>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub message: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub extra: Option<serde_json::Value>,
 }
 
 impl Response {
   pub fn ok() -> Self {
-    Self { ok: true, error: None, sessions: None, message: None }
+    Self { ok: true, error: None, sessions: None, message: None, extra: None }
   }
 
   pub fn err(msg: impl Into<String>) -> Self {
-    Self { ok: false, error: Some(msg.into()), sessions: None, message: None }
+    Self { ok: false, error: Some(msg.into()), sessions: None, message: None, extra: None }
   }
 
   pub fn with_sessions(mut self, sessions: Vec<SessionReport>) -> Self {
@@ -92,6 +108,21 @@ impl Response {
 
   pub fn with_message(mut self, msg: impl Into<String>) -> Self {
     self.message = Some(msg.into());
+    self
+  }
+
+  pub fn with_extra(mut self, key: &str, value: serde_json::Value) -> Self {
+    use serde_json::Value;
+    match &mut self.extra {
+      Some(Value::Object(map)) => {
+        map.insert(key.to_string(), value);
+      }
+      _ => {
+        let mut map = serde_json::Map::new();
+        map.insert(key.to_string(), value);
+        self.extra = Some(Value::Object(map));
+      }
+    }
     self
   }
 }

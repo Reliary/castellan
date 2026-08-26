@@ -1,12 +1,12 @@
-# Proof-carrying sessions (the novel core)
+# Proof-carrying sessions (designed core)
 
-Every session ends with a cryptographic ProofCertificate: stayed in bounds, didn't remove validation paths, preserved config completeness, passed placebo-controlled tests. Tamper-evident, exportable, transferable. **The agent is the prover; the daemon is the verifier.** This is the contribution that no other agent-safety system has, built from primitives we already own.
+Every session ends with a cryptographic ProofCertificate: stayed in bounds, didn't remove validation paths, preserved config completeness, passed placebo-controlled tests. Tamper-evident, exportable, transferable. **The agent is the prover; the daemon is the verifier.** Not built yet — this doc is the design.
 
-## Why this is the novel core
+## Why we think this is worth building
 
-Proof-carrying code (Necula, 1990s) externalized verification from the runtime to a certificate. Castellan generalizes relay-vuln's ProofCertificate from "this code is vuln-free" to "this session was safe." The un-gameable positive trust signal (placebo control) is what makes this work where refactor-proof failed — see D1.
+Proof-carrying code (Necula, 1990s) externalized verification from the runtime to a certificate. Castellan generalizes relay-vuln's ProofCertificate from "this code is vuln-free" to "this session was safe." The placebo control is the candidate answer to the gaming problem: self-reported "tests passed" is worthless, but a neutral-placeholder comparison plus a daemon-side re-run is harder to fake. Whether it survives contact with real agents is exactly what the P4 kill criteria test.
 
-Anyone can plumb Landlock + cgroup (enforcement is greenfield, no moat). The proof + observation layer is built from primitives nobody else in agent-safety has: relay-vuln (proof-carrying vuln detection), proof-fixes (placebo-controlled fix application), cert-evals (interleaved + placebo + SHA-256 cert), evidence-pack (export format with quality labels), seq-engine + config-radar (completeness), agent-audit-trail (tamper-evident chain). This composition is the moat.
+Nothing here is unbuildable by others: Landlock/cgroup plumbing is documented syscall work, and the proof composition is just engineering. Our advantage is inventory and momentum — internal primitives (relay-vuln, proof-fixes, cert-evals, evidence-pack, seq-engine, config-radar, agent-audit-trail) already exist and were benchmarked for other purposes, so the composition cost for us is lower than for a cold start. See docs/PRIMITIVES.md for honest verdicts, including primitives that died in real-data testing (refactor-proof: KILL).
 
 ## ProofCertificate schema
 

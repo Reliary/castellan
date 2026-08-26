@@ -4,7 +4,7 @@
 
 Castellan is a Linux-native agent safety system that confines, observes, and proves what AI coding agents do on your machine — at the kernel level, where prompt injection cannot reach. It is being designed as a contribution to [Omarchy](https://github.com/basecamp/omarchy) (DHH's Arch + Hyprland distro), but the core is reusable on any systemd + Landlock Linux.
 
-> **Status: planning.** This repository contains the design and plan. No code is shipped yet. Every claim below is either grounded in an owned, built primitive (see [docs/PRIMITIVES.md](docs/PRIMITIVES.md)) or marked as greenfield. No savings, no percentages, no security guarantees until benchmarks pass — see [docs/benchmark-methodology.md](docs/benchmark-methodology.md).
+> **Status: early, working.** Two phases are implemented and acceptance-tested on Linux 7.x / Landlock ABI 8: session substrate + freeze (P0) and the envelope floor with audit + enforce launch (P1). Undo, earned autonomy, and proof-carrying sessions are designed but not built. Every claim below is scoped accordingly; see [docs/ROADMAP.md](docs/ROADMAP.md) for phase status and [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for how claims get earned.
 
 ## The problem in one sentence
 
@@ -12,46 +12,56 @@ AI agents now run unattended on personal machines with broad filesystem and netw
 
 ## The pitch in plain English
 
-Omarchy (and any modern Linux distro with agents) owns the one layer a single safety policy can use to lock every brand of agent identically: the OS itself. No harness vendor can do this (they only control their own agent); no agent-safety SaaS can (they're not the distro). Castellan makes the kernel the trust boundary so the agent cannot argue with it, bypass it, or be tricked out of it.
+A distro owns the one layer where a single policy applies to every brand of agent identically: the OS itself. Harness vendors can only confine their own agent; agent-safety tools can't confine anyone else's either. Castellan makes the kernel the trust boundary so the agent cannot argue with it, bypass it, or be tricked out of it.
 
 ## The five pieces
 
-1. **Kernel walls** — when any agent launches, Landlock + seccomp confine its writes to the project + harness state. It physically cannot touch `~/.ssh`, systemd units, `.desktop` files, shell rc — even if a webpage tricks it into trying. Zero harness configuration; the OS does it.
-2. **Panic button** — Super+Escape freezes every running agent instantly via cgroup v2 freezer (kernel-level; frozen processes can't even handle signals until thaw). Biometric thaw via the fingerprint reader.
-3. **Surgical undo** — every file the agent touched is kernel-witnessed (not agent-reported) via an overlayfs upper layer. `castellan undo <session>` reverses exactly that session — no reboot, no whole-disk snapshot, no nuking your unrelated edits.
-4. **Earned autonomy** — agents start confined to the workspace (full-auto within it). To unlock network or config-dir writes they *earn* it via placebo-controlled proofs: an agent writing `assert True` fails the gate; only a real guard that drops danger passes. Sloppy or compromised agents get a narrower cage automatically.
-5. **Proof-carrying sessions** — every session ends with a cryptographic certificate: stayed in bounds, didn't remove validation paths, preserved config completeness, passed placebo tests. Tamper-evident, exportable, transferable — verified sessions raise a project's trust tier fleet-wide.
+Shipped:
 
-## Unique value
+1. **Kernel walls** — `castellan launch --enforce -- claude ...` confines the session via Landlock + seccomp before any agent code runs: writes limited to project + harness state + scratch, hard-deny for `~/.ssh`, systemd units, autostart, shell rcs, `/etc` `/usr` `/boot`; ptrace/process_vm/io_uring/module syscalls return EPERM. Verified: workspace work (git included) runs clean under enforce; home-dir escapes get EACCES.
+2. **Panic button** — every launched or adopted session lives in its own cgroup scope. `castellan freeze` stops all sessions at once: zero CPU, no userspace execution until thaw. (Kernel 7.x note: SIGKILL still kills frozen processes — freeze stops computation, it does not shield against external kill.)
+3. **Security camera** — default mode is audit: sessions run unrestricted while every file write is classified into `events.jsonl` as allowed or would-deny (`castellan audit <session>`). Harness-state folders are fingerprinted at spawn and diffed at exit, so a poisoned skill or hook gets flagged. This produces the false-block-rate data that decides whether enforce becomes the default.
 
-**To Omarchy:** Omarchy already treats agents as first-class (launchers, agents panel, crash diagnosis) but has no safety story — its manual literally says "be ready to rollback if the agent makes a mess." Castellan slots onto existing Omarchy motifs: channels ↔ trust tiers, migrations ↔ session migrations, snapshots ↔ surgical undo, agents panel ↔ freeze toggle + trust badge.
+Designed, not built yet:
 
-**To general Linux:** The pattern is "one OS-owned agent-safety policy across all harnesses" — reusable on any systemd + Landlock Linux. Proof-carrying sessions are novel to agent safety: they convert "trust the agent" into "verify the agent's proof." Placebo-controlled positive trust solves the gaming problem every reputation system has.
+4. **Surgical undo** — per-session rollback via overlayfs upper layer, so one bad agent doesn't force a whole-disk rollback.
+5. **Earned autonomy + proof-carrying sessions** — expansion beyond the workspace gated by placebo-controlled evidence rather than self-reported test results.
 
-## Why us
+## Why this fits Omarchy
 
-Anyone can plumb Landlock + cgroup (the enforcement layer is greenfield Rust, no moat there). The moat is the proof + observation layer, built from primitives we already own that nobody else in agent safety has: HDC tier-promotion memory (cortex-rs), placebo-controlled proof (proof-fixes, cert-evals), proof-carrying vuln detection (relay-vuln, evidence-pack), grammar-free fingerprinting (stria, skein, agent-profile), completeness auditors (seq-engine, config-radar), deterministic replay (llm-replay). See [docs/PRIMITIVES.md](docs/PRIMITIVES.md) for the full inventory with honest verdicts.
+Omarchy already treats agents as first-class (launchers, agents panel, crash diagnosis) but ships no safety story — its manual says "be ready to rollback if the agent makes a mess." Castellan slots onto existing motifs: channels ↔ trust tiers, migrations ↔ session migrations, snapshots ↔ surgical undo, agents panel ↔ freeze toggle. The core is reusable on any systemd + Landlock Linux regardless of whether Omarchy takes it.
+
+## What we bring
+
+No moat, no secrecy: everything here is buildable by anyone willing to write the kernel plumbing — Landlock and cgroups are documented Linux features, and nothing in this repo is protected. What we have is momentum and inventory: the observation/proof layers are accelerated by internal primitives already built and benchmarked elsewhere in our repos (grammar-free fingerprinting, deterministic replay, placebo-controlled eval methodology, HDC memory) — see [docs/PRIMITIVES.md](docs/PRIMITIVES.md) for the full list with honest verdicts, including which ones died in testing. The kernel-enforcement layer contains zero borrowed magic; it is plain documented syscall work that anyone can replicate.
 
 ## Repo layout
 
 ```
 README.md                      this
 AGENTS.md                      conventions for AI agents working on castellan
-Cargo.toml                     workspace (members stubbed until build)
+Cargo.toml                     workspace: castellan-core, -policy, -freezer,
+                               -envelope, -daemon, -cli
+crates/
+  castellan-core               session types, protocol, event spine
+  castellan-policy             envelope classification (pure, unit-tested)
+  castellan-freezer            cgroup v2 freeze/thaw/kill
+  castellan-envelope           Landlock ruleset, seccomp BPF, audit watcher
+  castellan-daemon             unix-socket server, session registry
+  castellan-cli                castellan status|launch|audit|freeze|thaw|kill|...
+test/shell.d/                  acceptance suites (run on a real desktop Linux;
+                               need user cgroup slices — not CI-runnable)
 docs/
   ARCHITECTURE.md              4 planes, substrate, event spine, 10 commitments
   THREAT_MODEL.md              Threat A/B/C, mitigations, residual risks
-  ROADMAP.md                   P0-P5 with kill criteria
-  PRIMITIVES.md                owned primitive inventory with real-data verdicts
+  ROADMAP.md                   P0-P5 with kill criteria and phase status
+  PRIMITIVES.md                internal primitive inventory with real-data verdicts
   DESIGN_DECISIONS.md          antagonism record: what died, what hardened, why
-  CRATES.md                    proposed Rust workspace layout
+  CRATES.md                    Rust workspace layout
   upstream-strategy.md         Omarchy integration path and PR sequence
   benchmark-methodology.md     cert-evals interleaved + placebo + SHA-256 cert
   glossary.md                  terms
-  components/                  per-component design docs
-    envelope.md  freezer.md  undo.md  trust.md  proof-carrying.md
-    egress-proxy.md  canary-credentials.md  harness-state-watcher.md
-    ledger.md  hv-radar.md  sentinel.md  bless-broker.md  daemon.md
+  components/                  per-component design docs with status
 ```
 
 ## License

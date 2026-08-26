@@ -8,7 +8,7 @@ The antagonism rounds surfaced heavy architectural commitments (overlayfs undo s
 
 - ship P0 (freeze) as a real upstream PR immediately — it's small, delightful, zero threat-model stakes
 - dogfood P1-P4 on our own machines without forcing omarchy users onto an unstable enforcement core
-- keep the proof-carrying + radar work (the novel core) in our repo where it can mature without omarchy's merge-burden
+- keep the proof-carrying + radar work in our repo where it can mature without omarchy's merge-burden
 - propose adoption once each phase has passed its kill criterion with benchmark evidence
 
 ## PR sequence to omarchy

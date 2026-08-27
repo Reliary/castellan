@@ -8,6 +8,17 @@ pub enum Op {
   Read,
 }
 
+/// Network policy for an enforced session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetMode {
+  /// Kernel-deny all TCP connect except the listed ports (the canary
+  /// honeypot). Residual: the same port number on OTHER hosts is also
+  /// reachable — Landlock net rules are port-scoped, not address-scoped.
+  Loopback(Vec<u16>),
+  /// No net restriction in v0 (Landlock handles nothing net-related).
+  Open,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
   Allow,
@@ -21,6 +32,17 @@ pub struct Policy {
   write_roots: Vec<PathBuf>,
   deny_write: Vec<PathBuf>,
   allow_write: Vec<PathBuf>,
+  net: NetMode,
+}
+
+impl Policy {
+  pub fn net(&self) -> &NetMode {
+    &self.net
+  }
+
+  pub fn set_net(&mut self, net: NetMode) {
+    self.net = net;
+  }
 }
 
 fn home() -> PathBuf {
@@ -127,6 +149,7 @@ impl Policy {
       write_roots,
       deny_write: always_deny_write(),
       allow_write: always_allow_write(),
+      net: NetMode::Open,
     }
   }
 

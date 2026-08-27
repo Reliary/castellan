@@ -77,6 +77,15 @@ pub enum Request {
   UndoCommit {
     session: SessionId,
   },
+  /// Generate canary secrets for a session, register them with the
+  /// honeypot, and return them (plus the honeypot port) to the launcher.
+  CanaryRegister {
+    session: SessionId,
+    project: PathBuf,
+    harness: String,
+  },
+  /// Return the daemon's honeypot port (0 if detached).
+  HoneypotPort,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

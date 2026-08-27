@@ -6,6 +6,7 @@ members = [
   "crates/castellan-policy",
   "crates/castellan-envelope",
   "crates/castellan-ledger",
+  "crates/castellan-canary",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

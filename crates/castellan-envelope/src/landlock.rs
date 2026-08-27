@@ -6,11 +6,24 @@ use std::path::{Path, PathBuf};
 
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_PATH_BENEATH: u8 = 1;
+const LANDLOCK_RULE_NET_PORT: u8 = 2;
 
 #[repr(C)]
 struct LandlockRulesetAttr {
   handled_access_fs: u64,
+  handled_access_net: u64,
 }
+
+// kernel struct is two u64s, naturally aligned (NOT packed)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LandlockNetPortAttr {
+  allowed_access: u64,
+  port: u64,
+}
+
+const NET_BIND_TCP: u64 = 1 << 0;
+const NET_CONNECT_TCP: u64 = 1 << 1;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -39,7 +52,7 @@ const READ_ACCESS: u64 = ACCESS_READ_FILE | ACCESS_READ_DIR;
 
 const FILE_WRITE_ACCESS: u64 = ACCESS_WRITE_FILE;
 
-fn syscall4(nr: libc::c_long, a: i32, b: usize, c: usize, d: u32) -> io::Result<i64> {
+fn syscall4(nr: libc::c_long, a: usize, b: usize, c: usize, d: u32) -> io::Result<i64> {
   let r = unsafe { libc::syscall(nr, a, b, c, d) };
   if r < 0 {
     Err(io::Error::last_os_error())
@@ -100,17 +113,23 @@ pub struct Ruleset {
 }
 
 impl Ruleset {
+  /// `net_connect_allow`: TCP ports the session may CONNECT to. When
+  /// `handle_net` is true, ALL other connect/bind is kernel-denied.
   pub fn create(
     write_roots: &[PathBuf],
     file_write_roots: &[PathBuf],
     read_roots: &[PathBuf],
     abi: u32,
+    handle_net: bool,
+    net_connect_allow: &[u16],
   ) -> io::Result<Self> {
     let handled = handled_access(abi);
-    let attr = LandlockRulesetAttr { handled_access_fs: handled };
+    let handled_net =
+      if handle_net && abi >= 4 { NET_BIND_TCP | NET_CONNECT_TCP } else { 0 };
+    let attr = LandlockRulesetAttr { handled_access_fs: handled, handled_access_net: handled_net };
     let fd = syscall4(
       libc::SYS_landlock_create_ruleset,
-      &attr as *const _ as *const i32 as i32,
+      &attr as *const _ as usize,
       std::mem::size_of::<LandlockRulesetAttr>(),
       0,
       0,
@@ -125,6 +144,12 @@ impl Ruleset {
     for root in file_write_roots {
       ruleset.add_rule(root, FILE_WRITE_ACCESS | (if abi >= 3 { ACCESS_TRUNCATE } else { 0 }))?;
     }
+    if handled_net != 0 {
+      // BIND stays fully denied (no bind rules at all)
+      for port in net_connect_allow {
+        ruleset.add_net_rule(NET_CONNECT_TCP, *port as u64)?;
+      }
+    }
     Ok(ruleset)
   }
 
@@ -137,7 +162,7 @@ impl Ruleset {
     let beneath = LandlockPathBeneathAttr { allowed_access: access, parent_fd: pfd };
     let r = syscall4(
       libc::SYS_landlock_add_rule,
-      self.fd,
+      self.fd as usize,
       LANDLOCK_RULE_PATH_BENEATH as usize,
       &beneath as *const _ as usize,
       0,
@@ -146,9 +171,21 @@ impl Ruleset {
     r.map(|_| ())
   }
 
+  fn add_net_rule(&self, access: u64, port: u64) -> io::Result<()> {
+    let attr = LandlockNetPortAttr { allowed_access: access, port };
+    let r = syscall4(
+      libc::SYS_landlock_add_rule,
+      self.fd as usize,
+      LANDLOCK_RULE_NET_PORT as usize,
+      &attr as *const _ as usize,
+      0,
+    );
+    r.map(|_| ())
+  }
+
   pub fn restrict_self(self) -> io::Result<()> {
     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    let r = syscall4(libc::SYS_landlock_restrict_self, self.fd, 0, 0, 0);
+    let r = syscall4(libc::SYS_landlock_restrict_self, self.fd as usize, 0, 0, 0);
     unsafe { libc::close(self.fd) };
     r.map(|_| ())
   }
@@ -169,7 +206,12 @@ pub fn apply_envelope(policy: &Policy) -> io::Result<()> {
     .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "landlock not available"))?;
   let dir_roots: Vec<PathBuf> = policy.write_roots().to_vec();
   let file_roots: Vec<PathBuf> = policy.allow_write_roots().to_vec();
-  let ruleset = Ruleset::create(&dir_roots, &file_roots, &read_roots_for_envelope(), abi)?;
+  let (handle_net, net_allow): (bool, Vec<u16>) = match policy.net() {
+    castellan_policy::NetMode::Loopback(ports) => (true, ports.clone()),
+    castellan_policy::NetMode::Open => (false, vec![]),
+  };
+  let ruleset =
+    Ruleset::create(&dir_roots, &file_roots, &read_roots_for_envelope(), abi, handle_net, &net_allow)?;
   seccomp_apply()?;
   ruleset.restrict_self()
 }

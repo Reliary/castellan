@@ -25,6 +25,7 @@ fn main() {
     "spawn" => spawn_req(&args[1..]),
     "adopt" => adopt_req(&args[1..]),
     "diff" | "undo" | "keep" => undo_req(&args[1..], args[0].as_str()),
+    "canary" => canary_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -61,7 +62,6 @@ fn freeze_req(args: &[String], op: &str) -> serde_json::Value {
     None => serde_json::json!({"op": op}),
   }
 }
-
 fn undo_req(args: &[String], verb: &str) -> serde_json::Value {
   let Some(id) = args.first() else {
     eprintln!("usage: castellan {verb} <session>");
@@ -74,11 +74,20 @@ fn undo_req(args: &[String], verb: &str) -> serde_json::Value {
   }
 }
 
+fn canary_req(args: &[String]) -> serde_json::Value {
+  let Some(id) = args.first() else {
+    eprintln!("usage: castellan canary <session>");
+    std::process::exit(2);
+  };
+  serde_json::json!({"op": "canary_register", "session": id, "project": "", "harness": ""})
+}
+
 fn launch(args: &[String], sock: &str) -> ! {
   let mut harness: Option<String> = None;
   let mut project = std::env::current_dir().unwrap_or_default();
   let mut enforce = false;
   let mut undo = false;
+  let mut net = false;
   let mut cmd: Option<Vec<String>> = None;
   let mut i = 0;
   while i < args.len() {
@@ -93,6 +102,7 @@ fn launch(args: &[String], sock: &str) -> ! {
       }
       "--enforce" => enforce = true,
       "--undo" => undo = true,
+      "--net" => net = true,
       "--" => {
         cmd = Some(args[i + 1..].to_vec());
         break;
@@ -107,7 +117,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   let cmd = match cmd {
     Some(c) if !c.is_empty() => c,
     _ => {
-      eprintln!("usage: castellan launch [--harness H] [--project P] [--enforce] -- <command> [args...]");
+      eprintln!("usage: castellan launch [--harness H] [--project P] [--enforce] [--undo] [--net] -- <command> [args...]");
       std::process::exit(2);
     }
   };
@@ -133,7 +143,19 @@ fn launch(args: &[String], sock: &str) -> ! {
     std::process::exit(1);
   }
   if enforce {
-    let policy = castellan_policy::Policy::new(&session, &harness, project.clone());
+    let mut policy = castellan_policy::Policy::new(&session, &harness, project.clone());
+    if net {
+      let port = rpc(sock, &serde_json::json!({ "op": "honeypot_port" }));
+      let port: u16 = serde_json::from_str(&port)
+        .ok()
+        .and_then(|v: serde_json::Value| v["port"].as_u64().map(|p| p as u16))
+        .unwrap_or(0);
+      if port == 0 {
+        eprintln!("--net requested but daemon honeypot is detached; continuing WITHOUT net lockdown");
+      } else {
+        policy.set_net(castellan_policy::NetMode::Loopback(vec![port]));
+      }
+    }
     if let Err(e) = castellan_envelope::apply_envelope(&policy) {
       eprintln!("failed to apply envelope (fail-closed): {e}");
       std::process::exit(1);
@@ -152,7 +174,6 @@ fn launch(args: &[String], sock: &str) -> ! {
       .join(&session);
     match castellan_ledger::setup(&project, &scratch) {
       Ok(o) => {
-        project = o.merged.clone();
         if let Err(e) = std::env::set_current_dir(&o.merged) {
           eprintln!("failed to chdir into merged view: {e}");
           std::process::exit(1);

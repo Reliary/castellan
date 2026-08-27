@@ -27,15 +27,29 @@ pub struct Daemon {
   registry: Arc<Mutex<Registry>>,
   audits: Arc<Mutex<FxHashMap<SessionId, SessionAudit>>>,
   notes: Arc<Mutex<FxHashMap<SessionId, SessionNotes>>>,
+  honeypot: Arc<castellan_canary::Honeypot>,
 }
 
 impl Daemon {
   pub fn new() -> std::io::Result<Self> {
+    let state = Self::state_dir();
+    let honeypot = match castellan_canary::Honeypot::start(&state) {
+      Ok(h) => {
+        eprintln!("castellan-daemon canary honeypot on 127.0.0.1:{}", h.port);
+        Arc::new(h)
+      }
+      Err(e) => {
+        // honeypot is optional infrastructure: sessions still run without it
+        eprintln!("castellan-daemon: honeypot unavailable ({e}) — canaries disabled");
+        Arc::new(castellan_canary::Honeypot::detached())
+      }
+    };
     Ok(Self {
       root: Arc::new(CgroupRoot::detect()?),
       registry: Arc::new(Mutex::new(Registry::default())),
       audits: Arc::new(Mutex::new(FxHashMap::default())),
       notes: Arc::new(Mutex::new(FxHashMap::default())),
+      honeypot,
     })
   }
 
@@ -108,7 +122,40 @@ impl Daemon {
       Request::UndoDiff { session } => self.undo_diff(&session),
       Request::UndoDiscard { session } => self.undo_discard(&session),
       Request::UndoCommit { session } => self.undo_commit(&session),
+      Request::CanaryRegister { session, project, harness } => {
+        self.canary_register(&session, &project, &harness)
+      }
+      Request::HoneypotPort => {
+        Response::ok().with_extra("port", serde_json::json!(self.honeypot.port))
+      }
     }
+  }
+
+  fn canary_register(&self, session: &str, _project: &Path, _harness: &str) -> Response {
+    // the session must exist (spawned before launch continues)
+    if !self.registry.lock().unwrap().contains(&session.to_string()) {
+      return Response::err("unknown session");
+    }
+    let scratch = Self::state_dir().join("castellan/sessions").join(session);
+    let planted = match castellan_canary::plant(session, &scratch) {
+      Ok(p) => p,
+      Err(e) => return Response::err(format!("canary plant failed: {e}")),
+    };
+    for s in &planted.secrets {
+      self.honeypot.register(s);
+    }
+    let secrets: Vec<serde_json::Value> =
+      planted.secrets.iter().map(|s| serde_json::Value::String(s.value.clone())).collect();
+    Response::ok()
+      .with_message("canaries planted")
+      .with_extra(
+        "canary",
+        serde_json::json!({
+          "dir": planted.dir.display().to_string(),
+          "port": self.honeypot.port,
+          "secrets": secrets,
+        }),
+      )
   }
 
   fn note(&self, session: &str, kind: &str, detail: &str) -> Response {

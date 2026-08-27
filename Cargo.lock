@@ -131,6 +131,7 @@ dependencies = [
  "castellan-ledger",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha2",
 ]
 

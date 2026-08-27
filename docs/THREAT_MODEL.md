@@ -108,6 +108,30 @@ An external attacker targets the agent, the harness, or the safety system.
 ### C9. Kernel compromise
 **out of scope.** A kernel break breaks everything, including us. Documented.
 
+### C10. Cgroup-hop escape (T4, live-verified 2026-08-27, kernel 7.0.3)
+**Vector 1 (self-migration) is kernel-closed:** writing own pid to a parent `cgroup.procs` returns EBUSY — the kernel refuses a process moving itself out of its own subtree. **Vector 2 is OPEN:** the agent asks the user manager (`systemd-run --user --unit=...`) to spawn a sibling unit under `app.slice/`. No cgroup write, no unit-file write (the private socket is not covered by Landlock ABI4 net rules — port-scoped — nor by classic-BPF seccomp, which cannot dereference the sockaddr). The escaped process is outside the session cgroup: freeze does not touch it, `kill_all` does not reach it — **the kill switch is defeated for escaped processes.** Mitigation: session-end orphan census (N6) — at kill, enumerate processes started during the session window whose parent is the user manager and whose cgroup is outside the session scope; report and kill them. Enforce mode does not close this vector (the socket is not a file write). Documented as residual: a determined agent can always escape the session scope via the user manager; the census bounds the blast radius to the session window.
+
+### C11. Slow-drip campaigns (T1)
+**residual, detected post-hoc.** An attack split across sessions/days defeats per-session spines and per-session detection. Mitigation (designed, not built): longitudinal project-level correlation (N1) — project HV fold over time + seq-engine over the cross-session trust-event stream.
+
+### C12. Detection-oracle probing (T2)
+**mitigated by design (N2, designed not built).** Every observable response (freeze, deny) is a side channel for mapping detection rules. Two-tier response: low-confidence signals log silently; only high-confidence (canary trip, hard-deny write, membership drift) freeze.
+
+### C13. Mimicry + prototype poisoning (T3)
+**mitigated by design (N3, designed not built).** Radar prototypes update only on `keep`/`clean_session` (human-validated sessions); poisoning then requires also fooling the human review.
+
+### C14. The unprotected sibling (T5)
+**residual.** Any process not launched via castellan (plain harness run, cron, another agent) can read trust.db, the spine, and the signing key. All castellan claims are conditional on launch-path exclusivity. Mitigation: sibling detector (N5, designed not built) — pgrep known harness binaries lacking the castellan env tag → warn. Real value under Omarchy-default integration.
+
+### C15. Post-session persistence (T6)
+**mitigated by N6 (built).** Processes surviving past kill act after cert issuance (TOCTOU on certificates). Session-end orphan census + kill closes the window; cert carries a "no surviving processes" attestation.
+
+### C16. Prose-encoded persistence (T7)
+**residual.** Approved, benign-looking diffs can encode malicious semantics (prompt-store integrity detects change, not intent). Accepted limit of OS-level defense; documented, not hidden.
+
+### C17. Dilution attacks (T8)
+**residual.** Event floods against count-based signals (danger ratios, seq windows). Mitigation (designed): rate-normalized patterns in N1.
+
 ## Residual risks summary
 
 | Risk | Status | Mitigation |
@@ -118,3 +142,11 @@ An external attacker targets the agent, the harness, or the safety system.
 | Persistence via workspace files | residual | post-session scan + skein diff detect, can't prevent |
 | Pre-existing compromise | residual | clean-install prerequisite documented |
 | Indirect prompt injection (semantic) | mitigated | blast radius bounded by envelope + proxy, confusion not prevented |
+| Cgroup-hop escape (C10) | residual | orphan census bounds blast radius; kernel closes self-migration |
+| Slow-drip campaigns (C11) | residual | longitudinal correlation designed, not built |
+| Detection-oracle probing (C12) | mitigated by design | two-tier response designed, not built |
+| Mimicry + prototype poisoning (C13) | mitigated by design | kept-only folding designed, not built |
+| Unprotected sibling (C14) | residual | sibling detector designed, not built |
+| Post-session persistence (C15) | mitigated | orphan census built (N6) |
+| Prose-encoded persistence (C16) | residual | accepted limit, documented |
+| Dilution attacks (C17) | residual | rate-normalized patterns designed, not built |

@@ -19,6 +19,11 @@ pub struct Session {
   /// agent->daemon command-injection path.
   #[serde(default)]
   pub config_sha: Option<String>,
+  /// unix timestamp of spawn; the orphan census (N6) uses it to find
+  /// processes started during the session window that escaped the
+  /// session cgroup via the user manager.
+  #[serde(default)]
+  pub started_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -104,4 +104,82 @@ impl CgroupRoot {
       .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
       .unwrap_or(0)
   }
+
+  /// Orphan census (N6): processes started during the session window
+  /// whose direct parent is the user manager and whose cgroup is
+  /// outside the session scope. These escaped the session cgroup via
+  /// the user manager (systemd-run) and are invisible to freeze/kill.
+  /// Bounds the blast radius to the session window; not a guarantee.
+  pub fn orphan_census(&self, session: &SessionId, session_start_unix: u64) -> Vec<u32> {
+    let scope = self.session_dir(session);
+    let scope_str = scope.to_string_lossy().to_string();
+    let user_mgr = nix::unistd::getppid().as_raw();
+    let btime = proc_btime();
+    let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+      .ok()
+      .flatten()
+      .map(|h| h as u64)
+      .unwrap_or(100);
+    let mut orphans = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+      for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid: u32 = match name.to_string_lossy().parse() {
+          Ok(p) => p,
+          Err(_) => continue,
+        };
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+          Ok(s) => s,
+          Err(_) => continue,
+        };
+        // comm may contain spaces/parens; parse from the last ')'
+        let Some(rest) = stat.rsplit_once(')') else { continue };
+        let fields: Vec<&str> = rest.1.split_whitespace().collect();
+        // after comm: state(1) ppid(2) ... starttime(20) -> index 19
+        let (Some(ppid), Some(start_ticks)) = (
+          fields.get(1).and_then(|f| f.parse::<i32>().ok()),
+          fields.get(19).and_then(|f| f.parse::<u64>().ok()),
+        ) else {
+          continue;
+        };
+        if ppid != user_mgr {
+          continue;
+        }
+        let start_unix = btime + start_ticks / hz;
+        if start_unix < session_start_unix {
+          continue;
+        }
+        let cg = match fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+          Ok(c) => c,
+          Err(_) => continue,
+        };
+        if cg.contains(&scope_str) {
+          continue;
+        }
+        orphans.push(pid);
+      }
+    }
+    orphans
+  }
+
+  pub fn kill_pids(&self, pids: &[u32]) -> usize {
+    pids
+      .iter()
+      .filter(|&&pid| {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL)
+          .is_ok()
+      })
+      .count()
+  }
+}
+
+fn proc_btime() -> u64 {
+  fs::read_to_string("/proc/stat")
+    .ok()
+    .and_then(|s| {
+      s.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())
+    })
+    .unwrap_or(0)
 }

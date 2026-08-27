@@ -958,6 +958,7 @@ impl Daemon {
       harness: harness.clone(),
       project: project.clone(),
       config_sha: pinned,
+      started_at: castellan_core::now_unix(),
     });
     self.start_audit(&id, &harness, &project);
     // durable session->project mapping: certificates must work for
@@ -1084,7 +1085,10 @@ impl Daemon {
     let targets = self.resolve_targets(session);
     let mut msgs = Vec::new();
     for id in targets {
-      let harness = self.registry.lock().unwrap().get(&id).map(|s| s.harness.clone());
+      let (harness, started_at) = {
+        let reg = self.registry.lock().unwrap();
+        (reg.get(&id).map(|s| s.harness.clone()), reg.get(&id).map(|s| s.started_at))
+      };
       if let Some(h) = harness {
         self.end_audit(&id, &h);
       }
@@ -1093,6 +1097,17 @@ impl Daemon {
         Ok(n) => format!("{id}: killed {n}"),
         Err(e) => format!("{id}: error {e}"),
       });
+      // N6 orphan census: processes that escaped the session cgroup
+      // via the user manager (systemd-run) are invisible to kill_all.
+      // Bounds the blast radius to the session window.
+      if let Some(start) = started_at {
+        let orphans = self.root.orphan_census(&id, start);
+        if !orphans.is_empty() {
+          let killed = self.root.kill_pids(&orphans);
+          msgs.push(format!("{id}: orphan census {}/{} killed", killed, orphans.len()));
+          self.record_census(&id, orphans.len(), killed);
+        }
+      }
       let _ = self.root.destroy_session(&id);
       self.registry.lock().unwrap().remove(&id);
     }
@@ -1100,6 +1115,21 @@ impl Daemon {
     Response::ok()
       .with_message(if msgs.is_empty() { "nothing to kill" } else { joined.as_str() })
       .with_sessions(self.reports())
+  }
+
+  fn record_census(&self, session: &str, found: usize, killed: usize) {
+    let dir = Self::state_dir().join("castellan/sessions");
+    let path = dir.join(format!("{session}.census"));
+    let _ = std::fs::write(
+      path,
+      serde_json::json!({
+        "session": session,
+        "orphans_found": found,
+        "orphans_killed": killed,
+        "ts": castellan_core::now_unix(),
+      })
+      .to_string(),
+    );
   }
 
   fn status(&self) -> Response {

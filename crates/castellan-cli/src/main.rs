@@ -30,6 +30,7 @@ fn main() {
     "bless" => bless_req(&args[1..]),
     "cert" => cert_req(&args[1..]),
     "replay" => replay_req(&args[1..]),
+    "radar" => radar_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -92,6 +93,18 @@ fn trust_req(args: &[String]) -> serde_json::Value {
     None => std::env::current_dir().unwrap_or_default(),
   };
   serde_json::json!({"op": "trust_score", "project": project})
+}
+
+fn radar_req(args: &[String]) -> serde_json::Value {
+  let Some(session) = args.first() else {
+    eprintln!("usage: castellan radar <session> [project]");
+    std::process::exit(2);
+  };
+  let project = match args.get(1) {
+    Some(p) => std::path::PathBuf::from(p),
+    None => std::env::current_dir().unwrap_or_default(),
+  };
+  serde_json::json!({"op": "radar", "session": session, "project": project})
 }
 
 fn replay_req(args: &[String]) -> serde_json::Value {
@@ -526,6 +539,17 @@ fn render(line: &str) -> String {
           }
         }
       }
+      if let Some(rd) = v.get("extra").and_then(|e| e.get("radar")) {
+        let cosine = rd.get("cosine_to_prototype").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let anomaly = rd.get("anomaly").and_then(|x| x.as_bool()).unwrap_or(false);
+        let events = rd.get("events_encoded").and_then(|x| x.as_u64()).unwrap_or(0);
+        out.push_str(&format!(
+          "radar: cosine {:.3} to prototype ({} events) — {}\n",
+          cosine,
+          events,
+          if anomaly { "ANOMALY (advisory)" } else { "normal" }
+        ));
+      }
       out
     }
     Err(_) => format!("raw: {line}\n"),
@@ -549,6 +573,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan bless reject <nonce>    reject an expansion");
   eprintln!("  castellan cert <session>          assemble a ProofCertificate");
   eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
+  eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

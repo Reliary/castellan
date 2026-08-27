@@ -1,0 +1,11 @@
+[package]
+name = "castellan-radar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HV radar: hypervector fingerprints of session event streams, local outlier detection (Phase 5, opt-in)."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

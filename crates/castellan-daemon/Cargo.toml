@@ -22,6 +22,7 @@ castellan-canary = { path = "../castellan-canary" }
 castellan-trust = { path = "../castellan-trust" }
 castellan-proof = { path = "../castellan-proof" }
 castellan-replay = { path = "../castellan-replay" }
+castellan-radar = { path = "../castellan-radar" }
 castellan-ledger = { path = "../castellan-ledger" }
 toml = "0.8"
 serde_json = { workspace = true }

@@ -186,7 +186,36 @@ impl Daemon {
       Request::BlessReject { nonce } => self.bless_reject(&nonce),
       Request::Cert { session } => self.cert(&session),
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
+      Request::Radar { session, project } => self.radar(&session, &project),
     }
+  }
+
+  fn radar(&self, session: &str, project: &Path) -> Response {
+    let state = Self::state_dir();
+    let hv = match castellan_radar::encode_session_from_spine(session, &state) {
+      Ok(hv) => hv,
+      Err(e) => return Response::err(format!("radar encode failed: {e}")),
+    };
+    let events_encoded = castellan_core::EventSink::for_session(&state, session)
+      .and_then(|s| s.read_all())
+      .map(|e| e.len())
+      .unwrap_or(0);
+    // per-project prototype, persisted under castellan/radar/
+    let proto_path = state
+      .join("castellan/radar")
+      .join(format!("{}.bin", castellan_radar::project_hash(project)));
+    let mut prototype = match std::fs::read(&proto_path) {
+      Ok(bytes) => castellan_radar::Prototype::from_bytes(&bytes),
+      Err(_) => castellan_radar::Prototype::empty(),
+    };
+    let report = castellan_radar::radar_report(session, &hv, &prototype, events_encoded);
+    prototype.fold(&hv);
+    if let Some(dir) = proto_path.parent() {
+      let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&proto_path, prototype.to_bytes());
+    let json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    Response::ok().with_extra("radar", json)
   }
 
   fn replay(&self, session: &str, narrower_project: &Path) -> Response {

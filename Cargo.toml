@@ -10,6 +10,7 @@ members = [
   "crates/castellan-trust",
   "crates/castellan-proof",
   "crates/castellan-replay",
+  "crates/castellan-radar",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

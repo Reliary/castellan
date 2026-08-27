@@ -121,6 +121,12 @@ pub enum Request {
     session: SessionId,
     narrower_project: PathBuf,
   },
+  /// HV radar (opt-in): encode a session's events, fold into the
+  /// project prototype, report the cosine + anomaly flag.
+  Radar {
+    session: SessionId,
+    project: PathBuf,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

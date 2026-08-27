@@ -11,6 +11,7 @@
 pub mod certificate;
 
 use castellan_ledger::diff_upper;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 // ---------------- danger signal (grammar-free byte-scan) ----------------
@@ -299,7 +300,18 @@ pub fn prove_fix_pair(orig: &[u8], new: &[u8], cwe: &str) -> ProofResult {
 /// session's upper layer, comparing against the original in the project.
 /// Returns proofs that passed (danger-reducing, placebo-controlled).
 /// New files (no original) and deletions are skipped: no proof possible.
-pub fn run_session_placebo(project: &Path, upper: &Path) -> Vec<ProofResult> {
+///
+/// Baseline integrity: proof runs pre-commit, so the project tree is the
+/// launch-time state unless someone edited it externally during the
+/// session. When a `manifest` (path -> size+mtime captured at launch) is
+/// supplied, a changed file whose project-side stat no longer matches is
+/// SKIPPED — its "before" is no longer trustworthy as this session's
+/// baseline (S1 audit fix: concurrent external edits corrupted pairs).
+pub fn run_session_placebo(
+  project: &Path,
+  upper: &Path,
+  manifest: Option<&BaselineManifest>,
+) -> Vec<ProofResult> {
   let mut passed = Vec::new();
   let Ok(changed) = diff_upper(upper) else { return passed };
   for c in changed {
@@ -308,6 +320,11 @@ pub fn run_session_placebo(project: &Path, upper: &Path) -> Vec<ProofResult> {
     }
     // original body from the real project (lower layer)
     let Ok(orig) = std::fs::read(project.join(&c.path)) else { continue };
+    if let Some(m) = manifest {
+      if !m.matches(project, &c.path) {
+        continue;
+      }
+    }
     // new body from the session's upper layer
     let Ok(new) = std::fs::read(upper.join(&c.path)) else { continue };
     // one proof per file: the first passing template is enough
@@ -322,9 +339,98 @@ pub fn run_session_placebo(project: &Path, upper: &Path) -> Vec<ProofResult> {
   passed
 }
 
+/// Launch-time stat manifest of the project tree: (relative path ->
+/// (size, mtime_nanos)). Captured when the undo layer is noted; used at
+/// keep-time to detect external edits that would corrupt the placebo
+/// pair baseline.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BaselineManifest {
+  pub files: std::collections::HashMap<String, (u64, u64)>,
+}
+
+impl BaselineManifest {
+  pub fn capture(project: &Path) -> std::io::Result<Self> {
+    let mut files = std::collections::HashMap::new();
+    fn walk(dir: &Path, base: &Path, files: &mut std::collections::HashMap<String, (u64, u64)>) {
+      let Ok(entries) = std::fs::read_dir(dir) else { return };
+      for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+          // skip heavy/irrelevant trees: they carry no proof pairs
+          let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+          if matches!(name, ".git" | "target" | "node_modules") {
+            continue;
+          }
+          walk(&path, base, files);
+        } else if meta.is_file() {
+          let rel = path.strip_prefix(base).unwrap_or(&path).display().to_string();
+          let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+          files.insert(rel, (meta.len(), mtime));
+        }
+      }
+    }
+    walk(project, project, &mut files);
+    Ok(Self { files })
+  }
+
+  /// True if the project-side file still matches the launch-time stat.
+  pub fn matches(&self, project: &Path, rel: &str) -> bool {
+    match self.files.get(rel) {
+      None => false,
+      Some((size, mtime)) => {
+        let Ok(meta) = std::fs::metadata(project.join(rel)) else { return false };
+        let cur_mtime = meta
+          .modified()
+          .ok()
+          .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+          .map(|d| d.as_nanos() as u64)
+          .unwrap_or(0);
+        meta.len() == *size && cur_mtime == *mtime
+      }
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn baseline_manifest_detects_external_edit() {
+    let dir = std::env::temp_dir().join("castellan-manifest-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.c"), "int x;\n").unwrap();
+    let m = BaselineManifest::capture(&dir).unwrap();
+    assert!(m.matches(&dir, "a.c"));
+    // external edit during the session: stat changes -> pair voided
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(dir.join("a.c"), "int x; int y;\n").unwrap();
+    assert!(!m.matches(&dir, "a.c"));
+    // unknown file -> no baseline -> skipped
+    assert!(!m.matches(&dir, "never_existed.c"));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn baseline_manifest_skips_heavy_dirs() {
+    let dir = std::env::temp_dir().join("castellan-manifest-skip-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("target/debug/huge.bin"), "x").unwrap();
+    std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let m = BaselineManifest::capture(&dir).unwrap();
+    assert!(!m.files.contains_key("target/debug/huge.bin"));
+    assert!(m.files.contains_key("src/main.rs"));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 
   #[test]
   fn danger_signal_counts_derefs() {

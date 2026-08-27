@@ -20,6 +20,7 @@ struct SessionAudit {
 #[derive(Default)]
 struct SessionNotes {
   undo_upper: Option<PathBuf>,
+  baseline: Option<castellan_proof::BaselineManifest>,
 }
 
 /// A pending bless-broker expansion request.
@@ -33,6 +34,27 @@ struct BlessRequest {
   created_ts: u64,
 }
 
+/// Durable bless-broker ledger entry (append-only jsonl). Rate limits
+/// count these, so they survive daemon restarts (S1 audit fix).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BlessEntry {
+  ts: u64,
+  kind: BlessKind,
+  session: SessionId,
+  project: PathBuf,
+  want: String,
+  nonce_hint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BlessKind {
+  Requested,
+  Approved,
+  Rejected,
+  Forged,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
   root: Arc<CgroupRoot>,
@@ -42,6 +64,7 @@ pub struct Daemon {
   honeypot: Arc<castellan_canary::Honeypot>,
   trust: Arc<Mutex<TrustDb>>,
   bless: Arc<Mutex<FxHashMap<String, BlessRequest>>>,
+  bless_ledger: Arc<Mutex<Vec<BlessEntry>>>,
 }
 
 impl Daemon {
@@ -60,23 +83,32 @@ impl Daemon {
     let honeypot = match castellan_canary::Honeypot::start_with_callback(
       &state,
       Arc::new(move |session: &str| {
-        // canary hit: apply the negative trust signal to the session's project
+        // canary hit: apply the negative trust signal to the session's
+        // project. Live registry first, then the durable session json —
+        // trips can land after kill. No "/" fallback: an unattributable
+        // trip is logged on the spine but floors nothing (S1 fix).
         let project = reg_cb
           .lock()
           .unwrap()
           .get(&session.to_string())
           .map(|s| s.project.clone())
-          .unwrap_or_else(|| PathBuf::from("/"));
-        let mut db = trust_cb.lock().unwrap();
-        let _ = db.apply(
-          &project,
-          &TrustEvent {
-            ts: castellan_core::now_unix(),
-            session: session.to_string(),
-            signal: Signal::CanaryHit,
-            evidence: "canary credential used against honeypot".into(),
-          },
-        );
+          .or_else(|| Daemon::durable_project(session));
+        if let Some(project) = project {
+          let mut db = trust_cb.lock().unwrap();
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: session.to_string(),
+              signal: Signal::CanaryHit,
+              evidence: "canary credential used against honeypot".into(),
+            },
+          );
+        } else {
+          eprintln!(
+            "castellan-daemon: canary trip for unattributable session {session} — spine logged, no trust floor"
+          );
+        }
       }),
     ) {
       Ok(h) => {
@@ -89,6 +121,7 @@ impl Daemon {
         Arc::new(castellan_canary::Honeypot::detached())
       }
     };
+    let bless_ledger = load_bless_ledger(&state.join("castellan/bless.jsonl"));
     Ok(Self {
       root: Arc::new(CgroupRoot::detect()?),
       registry,
@@ -97,6 +130,7 @@ impl Daemon {
       honeypot,
       trust,
       bless: Arc::new(Mutex::new(FxHashMap::default())),
+      bless_ledger: Arc::new(Mutex::new(bless_ledger)),
     })
   }
 
@@ -106,6 +140,28 @@ impl Daemon {
       .unwrap_or_else(|_| {
         PathBuf::from(format!("/home/{}/.local/state", nix::unistd::User::from_uid(nix::unistd::Uid::current()).ok().and_then(|u| u.map(|u| u.name)).unwrap_or_default()))
       })
+  }
+
+  /// Durable session metadata (persisted at spawn): project, harness,
+  /// config pin. Works for finished sessions.
+  fn durable_session_meta(session: &str) -> Option<serde_json::Value> {
+    let dir = Self::state_dir().join("castellan/sessions");
+    let meta = std::fs::read_to_string(dir.join(format!("{session}.json"))).ok()?;
+    serde_json::from_str(&meta).ok()
+  }
+
+  fn durable_project(session: &str) -> Option<PathBuf> {
+    Self::durable_session_meta(session)?
+      .get("project")?
+      .as_str()
+      .map(PathBuf::from)
+  }
+
+  fn durable_harness(session: &str) -> Option<String> {
+    Self::durable_session_meta(session)?
+      .get("harness")?
+      .as_str()
+      .map(String::from)
   }
 
   pub fn socket_path() -> PathBuf {
@@ -223,26 +279,19 @@ impl Daemon {
       let reg = self.registry.lock().unwrap();
       match reg.get(&session.to_string()) {
         Some(s) => s.project.clone(),
-        None => {
-          let dir = Self::state_dir().join("castellan/sessions");
-          let meta = std::fs::read_to_string(dir.join(format!("{session}.json")));
-          match meta {
-            Ok(m) => match serde_json::from_str::<serde_json::Value>(&m) {
-              Ok(v) => v
-                .get("project")
-                .and_then(|p| p.as_str())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/")),
-              Err(_) => return Response::err("unknown session"),
-            },
-            Err(_) => return Response::err("unknown session"),
-          }
-        }
+        None => match Daemon::durable_project(session) {
+          Some(p) => p,
+          None => return Response::err("unknown session"),
+        },
       }
     };
     let harness = {
       let reg = self.registry.lock().unwrap();
-      reg.get(&session.to_string()).map(|s| s.harness.clone()).unwrap_or_else(|| "claude".into())
+      reg
+        .get(&session.to_string())
+        .map(|s| s.harness.clone())
+        .or_else(|| Daemon::durable_harness(session))
+        .unwrap_or_else(|| "claude".into())
     };
     let original = castellan_policy::Policy::new(session, &harness, project);
     let alternate = castellan_replay::narrower_policy(&original, narrower_project);
@@ -262,18 +311,9 @@ impl Daemon {
         Some(s) => s.project.clone(),
         None => {
           // finished session: read the durable mapping
-          let dir = Self::state_dir().join("castellan/sessions");
-          let meta = std::fs::read_to_string(dir.join(format!("{session}.json")));
-          match meta {
-            Ok(m) => match serde_json::from_str::<serde_json::Value>(&m) {
-              Ok(v) => v
-                .get("project")
-                .and_then(|p| p.as_str())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/")),
-              Err(_) => return Response::err("unknown session"),
-            },
-            Err(_) => return Response::err("unknown session"),
+          match Daemon::durable_project(session) {
+            Some(p) => p,
+            None => return Response::err("unknown session"),
           }
         }
       }
@@ -339,7 +379,9 @@ impl Daemon {
 
   /// Bless-broker: register an expansion request. The nonce is returned
   /// to the CALLER (the human's terminal), never to the agent's env.
-  /// Rate limits: 3/session, 10/project/day, 5min cooling-off.
+  /// Rate limits count the PERSISTED ledger (requests + approvals),
+  /// not just pending nonces — a restart or an approval must not reset
+  /// the counters (S1 audit fix).
   fn bless_request(&self, session: &str, want: &str, reason: &str) -> Response {
     let now = castellan_core::now_unix();
     let project = {
@@ -349,46 +391,55 @@ impl Daemon {
         None => return Response::err("unknown session"),
       }
     };
-    // per-session cap: 3
-    let session_count = {
-      let b = self.bless.lock().unwrap();
-      b.values().filter(|r| r.session == session).count()
+    let (session_count, project_count, last_ts) = {
+      let ledger = self.bless_ledger.lock().unwrap();
+      let session_count = ledger
+        .iter()
+        .filter(|e| e.session == session && e.kind != BlessKind::Rejected)
+        .count();
+      let day = now / 86_400;
+      let project_count = ledger
+        .iter()
+        .filter(|e| {
+          e.project == project
+            && e.kind == BlessKind::Approved
+            && e.ts / 86_400 == day
+        })
+        .count();
+      let last_ts = ledger
+        .iter()
+        .filter(|e| e.session == session && e.kind != BlessKind::Rejected)
+        .map(|e| e.ts)
+        .max()
+        .unwrap_or(0);
+      (session_count, project_count, last_ts)
     };
     if session_count >= 3 {
       return Response::err("expansion limit reached (3 per session)");
     }
-    // per-project daily cap: 10
-    let day = now / 86_400;
-    let project_count = {
-      let b = self.bless.lock().unwrap();
-      b.values()
-        .filter(|r| r.project == project && r.created_ts / 86_400 == day)
-        .count()
-    };
     if project_count >= 10 {
       return Response::err("expansion limit reached (10 per project per day)");
     }
-    // cooling-off: 5 minutes between expansions for this session
-    let last_ts = {
-      let b = self.bless.lock().unwrap();
-      b.values()
-        .filter(|r| r.session == session)
-        .map(|r| r.created_ts)
-        .max()
-        .unwrap_or(0)
-    };
     if now - last_ts < 300 {
       return Response::err("cooling-off period active (5 minutes between expansions)");
     }
     let nonce = castellan_core::new_bless_nonce();
     let req = BlessRequest {
       session: session.to_string(),
-      project,
+      project: project.clone(),
       want: want.to_string(),
       reason: reason.to_string(),
       created_ts: now,
     };
     self.bless.lock().unwrap().insert(nonce.clone(), req);
+    self.append_bless_ledger(BlessEntry {
+      ts: now,
+      kind: BlessKind::Requested,
+      session: session.to_string(),
+      project,
+      want: want.to_string(),
+      nonce_hint: nonce[..8].to_string(),
+    });
     Response::ok().with_extra(
       "bless",
       serde_json::json!({
@@ -408,29 +459,48 @@ impl Daemon {
       match b.remove(nonce) {
         Some(r) => r,
         None => {
-          // forged nonce: floor the project's trust at 0
-          let project = self
-            .registry
-            .lock()
-            .unwrap()
-            .values()
-            .find(|s| s.id == nonce)
-            .map(|s| s.project.clone())
-            .unwrap_or_else(|| PathBuf::from("/"));
-          let mut db = self.trust.lock().unwrap();
-          let _ = db.apply(
-            &project,
-            &TrustEvent {
-              ts: castellan_core::now_unix(),
-              session: "bless".into(),
-              signal: Signal::ForgedNonce,
-              evidence: format!("approve with unknown nonce {nonce}"),
-            },
+          // Forged nonce. Attribution: an unknown nonce carries no
+          // session/project context, so there is no honest project to
+          // floor — the earlier behavior (flooring "/") punished a
+          // sentinel path, protecting nothing (S1 audit fix). Record
+          // the attempt durably and alert; flooring happens only when
+          // attribution exists (a live session's project).
+          eprintln!(
+            "castellan-daemon: FORGED bless nonce attempt ({}) — recorded, no project attribution",
+            &nonce[..nonce.len().min(8)]
           );
+          self.append_bless_ledger(BlessEntry {
+            ts: castellan_core::now_unix(),
+            kind: BlessKind::Forged,
+            session: String::new(),
+            project: PathBuf::new(),
+            want: String::new(),
+            nonce_hint: nonce[..nonce.len().min(8)].to_string(),
+          });
+          if let Some(project) = self.session_project_by_hint(nonce) {
+            let mut db = self.trust.lock().unwrap();
+            let _ = db.apply(
+              &project,
+              &TrustEvent {
+                ts: castellan_core::now_unix(),
+                session: "bless".into(),
+                signal: Signal::ForgedNonce,
+                evidence: format!("approve with unknown nonce {nonce}"),
+              },
+            );
+          }
           return Response::err("unknown nonce — approval forged?");
         }
       }
     };
+    self.append_bless_ledger(BlessEntry {
+      ts: castellan_core::now_unix(),
+      kind: BlessKind::Approved,
+      session: req.session.clone(),
+      project: req.project.clone(),
+      want: req.want.clone(),
+      nonce_hint: nonce[..nonce.len().min(8)].to_string(),
+    });
     // v1: approval is recorded; the restart-with-wider-envelope
     // orchestration is a follow-up (documented in bless-broker.md).
     Response::ok().with_extra(
@@ -445,12 +515,46 @@ impl Daemon {
   }
 
   fn bless_reject(&self, nonce: &str) -> Response {
-    let removed = self.bless.lock().unwrap().remove(nonce).is_some();
-    if removed {
-      Response::ok().with_message("rejected")
-    } else {
-      Response::err("unknown nonce")
+    let removed = {
+      let mut b = self.bless.lock().unwrap();
+      match b.remove(nonce) {
+        Some(r) => Some(r),
+        None => None,
+      }
+    };
+    match removed {
+      Some(r) => {
+        self.append_bless_ledger(BlessEntry {
+          ts: castellan_core::now_unix(),
+          kind: BlessKind::Rejected,
+          session: r.session,
+          project: r.project,
+          want: r.want,
+          nonce_hint: nonce[..nonce.len().min(8)].to_string(),
+        });
+        Response::ok().with_message("rejected")
+      }
+      None => Response::err("unknown nonce"),
     }
+  }
+
+  fn append_bless_ledger(&self, entry: BlessEntry) {
+    use std::io::Write as _;
+    let path = Self::state_dir().join("castellan/bless.jsonl");
+    if let Some(dir) = path.parent() {
+      let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+      let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+    }
+    self.bless_ledger.lock().unwrap().push(entry);
+  }
+
+  /// A forged nonce that exactly matches no request gets no attribution;
+  /// retained for the case where it prefix-matches a live session id
+  /// (never in practice — nonces are 32-hex, ids are s-prefixed).
+  fn session_project_by_hint(&self, _nonce: &str) -> Option<PathBuf> {
+    None
   }
 
   fn canary_register(&self, session: &str, _project: &Path, _harness: &str) -> Response {
@@ -481,10 +585,25 @@ impl Daemon {
   }
 
   fn note(&self, session: &str, kind: &str, detail: &str) -> Response {
+    // capture the project's stat manifest at undo-layer creation: the
+    // placebo proof's "before" must be the launch-time state, so
+    // external edits during the session void affected pairs
+    let manifest = if kind == "undo" {
+      let project = {
+        let reg = self.registry.lock().unwrap();
+        reg.get(&session.to_string()).map(|s| s.project.clone())
+      };
+      project.and_then(|p| castellan_proof::BaselineManifest::capture(&p).ok())
+    } else {
+      None
+    };
     let mut notes = self.notes.lock().unwrap();
     let entry = notes.entry(session.to_string()).or_default();
     match kind {
-      "undo" => entry.undo_upper = Some(PathBuf::from(detail)),
+      "undo" => {
+        entry.undo_upper = Some(PathBuf::from(detail));
+        entry.baseline = manifest;
+      }
       _ => return Response::err(format!("unknown note kind: {kind}")),
     }
     Response::ok().with_message(format!("noted {kind}"))
@@ -557,7 +676,7 @@ impl Daemon {
   }
 
   fn undo_commit(&self, session: &str) -> Response {
-    let (upper, work) = {
+    let (upper, work, baseline) = {
       let mut notes = self.notes.lock().unwrap();
       let Some(n) = notes.get_mut(session) else {
         return Response::err("no undo layer recorded for this session");
@@ -565,7 +684,7 @@ impl Daemon {
       match n.undo_upper.take() {
         Some(upper) => {
           let work = upper.with_file_name("work");
-          (upper, work)
+          (upper, work, n.baseline.take())
         }
         None => return Response::err("no undo layer recorded for this session"),
       }
@@ -587,7 +706,7 @@ impl Daemon {
     // proof_passed signal (+10). No danger-reducing edits = vacuous,
     // honestly labeled (no signal). Runs on the upper layer BEFORE
     // commit materializes it onto the project.
-    let proofs = castellan_proof::run_session_placebo(&project, &upper);
+    let proofs = castellan_proof::run_session_placebo(&project, &upper, baseline.as_ref());
     let passed: Vec<&castellan_proof::ProofResult> =
       proofs.iter().filter(|p| p.passed).collect();
     match castellan_ledger::commit(&project, &upper) {
@@ -905,6 +1024,17 @@ impl Daemon {
 
 // ---------------- config pinning (S0 audit fix) ----------------
 
+/// Load the durable bless ledger; malformed lines are skipped.
+fn load_bless_ledger(path: &Path) -> Vec<BlessEntry> {
+  let Ok(content) = std::fs::read_to_string(path) else {
+    return Vec::new();
+  };
+  content
+    .lines()
+    .filter_map(|l| serde_json::from_str::<BlessEntry>(l).ok())
+    .collect()
+}
+
 pub enum ConfigVerdict {
   Ok,
   NotPinned,
@@ -973,6 +1103,44 @@ mod tests {
     assert_eq!(sha.len(), 64);
     // same content, same hash
     assert_eq!(project_config_sha(&dir).as_deref(), Some(sha.as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn bless_ledger_roundtrip_skips_malformed() {
+    let dir = std::env::temp_dir().join("castellan-bless-ledger-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bless.jsonl");
+    let e1 = BlessEntry {
+      ts: 100,
+      kind: BlessKind::Approved,
+      session: "s1".into(),
+      project: "/tmp/p".into(),
+      want: "egress".into(),
+      nonce_hint: "abcd1234".into(),
+    };
+    let e2 = BlessEntry {
+      ts: 200,
+      kind: BlessKind::Forged,
+      session: String::new(),
+      project: PathBuf::new(),
+      want: String::new(),
+      nonce_hint: "deadbeef".into(),
+    };
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(&path)
+      .unwrap();
+    writeln!(f, "{}", serde_json::to_string(&e1).unwrap()).unwrap();
+    writeln!(f, "garbage line").unwrap();
+    writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
+    let loaded = load_bless_ledger(&path);
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].kind, BlessKind::Approved);
+    assert_eq!(loaded[1].kind, BlessKind::Forged);
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

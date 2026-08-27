@@ -26,6 +26,7 @@ castellan-radar = { path = "../castellan-radar" }
 castellan-ledger = { path = "../castellan-ledger" }
 sha2 = "0.10"
 toml = "0.8"
+serde = { workspace = true }
 serde_json = { workspace = true }
 nix = { workspace = true }
 rustc-hash = { workspace = true }

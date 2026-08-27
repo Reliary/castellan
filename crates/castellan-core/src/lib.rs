@@ -12,6 +12,13 @@ pub struct Session {
   pub id: SessionId,
   pub harness: String,
   pub project: PathBuf,
+  /// sha256 of the project's .reliary/castellan.toml at spawn time.
+  /// None = no config at launch. The daemon refuses to execute a
+  /// test_cmd whose config hash differs from this pin: the config
+  /// lives inside the agent's write roots, so an unpinned read is an
+  /// agent->daemon command-injection path.
+  #[serde(default)]
+  pub config_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

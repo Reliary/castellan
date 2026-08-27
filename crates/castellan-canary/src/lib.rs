@@ -86,6 +86,7 @@ type Registry = Arc<Mutex<HashMap<String, String>>>;
 pub struct Honeypot {
   pub port: u16,
   secrets: Registry,
+  ledger: Option<PathBuf>,
   #[allow(dead_code)]
   on_trip: TripCallback,
 }
@@ -93,6 +94,9 @@ pub struct Honeypot {
 impl Honeypot {
   /// Bind on a kernel-assigned port and start the accept thread.
   /// Returns immediately; the thread runs for the daemon's lifetime.
+  /// Previously-registered secrets are reloaded from
+  /// `<state_home>/castellan/canary.jsonl` — a daemon restart must not
+  /// silently disarm planted canaries (S0 audit fix).
   pub fn start(state_home: &Path) -> io::Result<Self> {
     Self::start_with_callback(state_home, Arc::new(|_| {}))
   }
@@ -102,21 +106,42 @@ impl Honeypot {
     let port = listener.local_addr()?.port();
     let secrets: Registry = Arc::new(Mutex::new(HashMap::new()));
     let sink_dir = state_home.to_path_buf();
-    std::fs::create_dir_all(&sink_dir)?;
+    std::fs::create_dir_all(sink_dir.join("castellan"))?;
+    let ledger = sink_dir.join("castellan/canary.jsonl");
+
+    for (secret, session) in load_canary_ledger(&ledger) {
+      secrets.lock().unwrap().insert(secret, session);
+    }
 
     let reg = Arc::clone(&secrets);
     let sink_dir_thread = sink_dir.clone();
     let cb = Arc::clone(&on_trip);
+    // connection cap: bounds thread count against a connect-flooding agent
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active_thread = Arc::clone(&active);
     std::thread::Builder::new().name("honeypot".into()).spawn(move || {
       for stream in listener.incoming() {
         match stream {
-          Ok(s) => handle_conn(s, &reg, &sink_dir_thread, &cb),
+          Ok(s) => {
+            if active_thread.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONNS {
+              continue; // drop: the stream closes when it leaves this scope
+            }
+            active_thread.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let reg = Arc::clone(&reg);
+            let sink = sink_dir_thread.clone();
+            let cb = Arc::clone(&cb);
+            let active = Arc::clone(&active_thread);
+            let _ = std::thread::Builder::new().name("honeypot-conn".into()).spawn(move || {
+              handle_conn(s, &reg, &sink, &cb);
+              active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            });
+          }
           Err(_) => continue,
         }
       }
     })?;
 
-    Ok(Self { port, secrets, on_trip })
+    Ok(Self { port, secrets, ledger: Some(ledger), on_trip })
   }
 
   /// Fallback when binding fails: no port, registrations accepted but
@@ -125,11 +150,24 @@ impl Honeypot {
     Self {
       port: 0,
       secrets: Arc::new(Mutex::new(HashMap::new())),
+      ledger: None,
       on_trip: Arc::new(|_| {}),
     }
   }
 
   pub fn register(&self, secret: &CanarySecret) {
+    // durable registration: survives daemon restarts. Append-only;
+    // duplicates are harmless (reload is last-wins into a HashMap).
+    if let Some(ledger) = &self.ledger {
+      use std::io::Write as _;
+      if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
+        let _ = writeln!(
+          f,
+          "{}",
+          serde_json::json!({"secret": secret.value, "session": secret.session})
+        );
+      }
+    }
     self.secrets.lock().unwrap().insert(secret.value.clone(), secret.session.clone());
   }
 
@@ -139,11 +177,39 @@ impl Honeypot {
   }
 }
 
+/// Max concurrent honeypot connections. With the 5s total deadline per
+/// connection this bounds both thread count and trickle-DoS hold time.
+const MAX_CONNS: usize = 16;
+
+fn load_canary_ledger(ledger: &Path) -> Vec<(String, String)> {
+  let Ok(content) = std::fs::read_to_string(ledger) else {
+    return Vec::new();
+  };
+  let mut out = Vec::new();
+  for line in content.lines() {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+      if let (Some(s), Some(sess)) = (
+        v.get("secret").and_then(|x| x.as_str()),
+        v.get("session").and_then(|x| x.as_str()),
+      ) {
+        out.push((s.to_string(), sess.to_string()));
+      }
+    }
+  }
+  out
+}
+
 fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path, on_trip: &TripCallback) {
   let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+  // hard total deadline: a trickle-feeding client cannot hold this
+  // connection (and its thread) beyond 5s regardless of read timing
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
   let mut buf = vec![0u8; 8192];
   let mut total = Vec::new();
   loop {
+    if std::time::Instant::now() > deadline {
+      break;
+    }
     match stream.read(&mut buf) {
       Ok(0) | Err(_) => break,
       Ok(n) => {
@@ -189,5 +255,51 @@ fn freeze_session(session: &str) {
       }
     }
     Err(e) => eprintln!("castellan-canary: no cgroup root, cannot freeze: {e}"),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn temp_state(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("castellan-canary-test-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+  }
+
+  #[test]
+  fn secrets_survive_restart() {
+    let state = temp_state("persist");
+    let hp = Honeypot::start(&state).unwrap();
+    hp.register(&CanarySecret { value: "AKIATESTSECRET".into(), session: "s1".into() });
+    assert_eq!(hp.secret_count(), 1);
+    drop(hp);
+    // simulate a daemon restart: new honeypot on the same state dir
+    let hp2 = Honeypot::start(&state).unwrap();
+    assert_eq!(hp2.secret_count(), 1, "canary registration must survive restart");
+    let _ = std::fs::remove_dir_all(&state);
+  }
+
+  #[test]
+  fn ledger_reload_skips_malformed_lines() {
+    let state = temp_state("malformed");
+    std::fs::create_dir_all(state.join("castellan")).unwrap();
+    let ledger = state.join("castellan/canary.jsonl");
+    std::fs::write(
+      &ledger,
+      "{\"secret\":\"ghp_good\",\"session\":\"s1\"}\nnot json at all\n{\"secret\":\"npm_also_good\",\"session\":\"s2\"}\n",
+    )
+    .unwrap();
+    let loaded = load_canary_ledger(&ledger);
+    assert_eq!(loaded.len(), 2);
+    let _ = std::fs::remove_dir_all(&state);
+  }
+
+  #[test]
+  fn detached_registers_without_ledger() {
+    let hp = Honeypot::detached();
+    hp.register(&CanarySecret { value: "x".into(), session: "s".into() });
+    assert_eq!(hp.secret_count(), 1);
   }
 }

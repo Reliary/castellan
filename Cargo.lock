@@ -78,6 +78,7 @@ dependencies = [
  "nix",
  "rustc-hash",
  "serde_json",
+ "sha2",
  "toml",
 ]
 

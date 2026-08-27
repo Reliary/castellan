@@ -627,7 +627,7 @@ impl Daemon {
         // side-scope reading post-edit state. Configured per project via
         // .reliary/castellan.toml [proof] test_cmd. Skipped + honestly
         // labeled when unconfigured.
-        let test_ok = self.run_project_tests(&project);
+        let test_ok = self.run_project_tests(session, &project);
         if test_ok {
           let _ = db.apply(
             &project,
@@ -649,10 +649,34 @@ impl Daemon {
     }
   }
 
-  /// Factor A: daemon-side test re-run. Reads the project's
-  /// `.reliary/castellan.toml` `[proof] test_cmd`; runs it with the
-  /// project as cwd and a 300s timeout. Returns true only on exit 0.
-  fn run_project_tests(&self, project: &Path) -> bool {
+  /// Factor A: daemon-side test re-run. The config is read from the
+  /// project — inside the agent's write roots — so the sha256 pinned
+  /// at spawn is the authority: if the config changed since launch,
+  /// the command is refused (it may be attacker-written). Runs the
+  /// test_cmd with the project as cwd and a 300s timeout. Returns
+  /// true only on exit 0.
+  fn run_project_tests(&self, session: &str, project: &Path) -> bool {
+    let pinned = {
+      let reg = self.registry.lock().unwrap();
+      reg.get(&session.to_string()).and_then(|s| s.config_sha.clone())
+    };
+    let current = project_config_sha(project);
+    match verify_config_pin(&pinned, &current) {
+      ConfigVerdict::NotPinned => {
+        eprintln!("castellan-daemon: project config not pinned at launch — test re-run refused");
+        return false;
+      }
+      ConfigVerdict::Drifted => {
+        eprintln!(
+          "castellan-daemon: project config changed since launch — test re-run REFUSED (possible agent tampering)"
+        );
+        if let Ok(sink) = EventSink::for_session(&Self::state_dir(), session) {
+          let _ = sink.emit("config_drift", ".reliary/castellan.toml", "deny");
+        }
+        return false;
+      }
+      ConfigVerdict::Ok => {}
+    }
     let cfg_path = project.join(".reliary/castellan.toml");
     let Ok(cfg) = std::fs::read_to_string(&cfg_path) else {
       eprintln!("castellan-daemon: no .reliary/castellan.toml — test re-run skipped");
@@ -717,21 +741,40 @@ impl Daemon {
         return Response::err(format!("failed to move pid into scope: {e}"));
       }
     }
-    self.registry.lock().unwrap().insert(Session { id: id.clone(), harness: harness.clone(), project: project.clone() });
+    let config_sha = project_config_sha(&project);
+    let pinned = config_sha.clone();
+    self.registry.lock().unwrap().insert(Session {
+      id: id.clone(),
+      harness: harness.clone(),
+      project: project.clone(),
+      config_sha: pinned,
+    });
     self.start_audit(&id, &harness, &project);
     // durable session->project mapping: certificates must work for
     // finished sessions (transferable proof), so persist at spawn
-    let _ = self.persist_session(&id, &project);
+    let _ = self.persist_session(&id, &project, &harness, &config_sha);
     Response::ok().with_message(format!("spawned session {id}"))
   }
 
-  fn persist_session(&self, id: &str, project: &Path) -> std::io::Result<()> {
+  fn persist_session(
+    &self,
+    id: &str,
+    project: &Path,
+    harness: &str,
+    config_sha: &Option<String>,
+  ) -> std::io::Result<()> {
     let dir = Self::state_dir().join("castellan/sessions");
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(format!("{id}.json")), serde_json::json!({
-      "session": id,
-      "project": project.display().to_string(),
-    }).to_string())
+    std::fs::write(
+      dir.join(format!("{id}.json")),
+      serde_json::json!({
+        "session": id,
+        "project": project.display().to_string(),
+        "harness": harness,
+        "config_sha": config_sha,
+      })
+      .to_string(),
+    )
   }
 
   fn start_audit(&self, id: &SessionId, harness: &str, project: &Path) {
@@ -857,5 +900,79 @@ impl Daemon {
         pids: self.root.populate_count(&s.id),
       })
       .collect()
+  }
+}
+
+// ---------------- config pinning (S0 audit fix) ----------------
+
+pub enum ConfigVerdict {
+  Ok,
+  NotPinned,
+  Drifted,
+}
+
+/// Pin check: the project config lives inside the agent's write roots,
+/// so a test_cmd may only run if the config is byte-identical to the
+/// launch-time pin. No pin (config absent at launch) = never run.
+pub fn verify_config_pin(pinned: &Option<String>, current: &Option<String>) -> ConfigVerdict {
+  match (pinned, current) {
+    (Some(p), Some(c)) if p == c => ConfigVerdict::Ok,
+    (Some(_), _) => ConfigVerdict::Drifted,
+    (None, _) => ConfigVerdict::NotPinned,
+  }
+}
+
+/// sha256 of the project's .reliary/castellan.toml, or None if absent.
+pub fn project_config_sha(project: &Path) -> Option<String> {
+  use sha2::{Digest, Sha256};
+  let bytes = std::fs::read(project.join(".reliary/castellan.toml")).ok()?;
+  let digest = Sha256::digest(&bytes);
+  Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn config_pin_ok_when_identical() {
+    let pin = Some("a".into());
+    assert!(matches!(
+      verify_config_pin(&pin, &Some("a".into())),
+      ConfigVerdict::Ok
+    ));
+  }
+
+  #[test]
+  fn config_pin_drifted_when_changed_or_removed() {
+    let pin = Some("a".into());
+    assert!(matches!(
+      verify_config_pin(&pin, &Some("b".into())),
+      ConfigVerdict::Drifted
+    ));
+    assert!(matches!(verify_config_pin(&pin, &None), ConfigVerdict::Drifted));
+  }
+
+  #[test]
+  fn config_pin_not_pinned_when_absent_at_launch() {
+    assert!(matches!(
+      verify_config_pin(&None, &Some("b".into())),
+      ConfigVerdict::NotPinned
+    ));
+    assert!(matches!(verify_config_pin(&None, &None), ConfigVerdict::NotPinned));
+  }
+
+  #[test]
+  fn project_config_sha_roundtrip() {
+    let dir = std::env::temp_dir().join("castellan-cfg-pin-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".reliary")).unwrap();
+    assert_eq!(project_config_sha(&dir), None);
+    std::fs::write(dir.join(".reliary/castellan.toml"), "[proof]\ntest_cmd = \"true\"\n").unwrap();
+    let sha = project_config_sha(&dir).unwrap();
+    assert_eq!(sha.len(), 64);
+    // same content, same hash
+    assert_eq!(project_config_sha(&dir).as_deref(), Some(sha.as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

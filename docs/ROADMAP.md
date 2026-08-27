@@ -114,6 +114,21 @@ Kernel findings recorded during build:
 
 **Estimated effort:** 2 weeks. sensor-hdc + cortex-rs + engfield are all owned.
 
+## Phase 8 — The Immune Daemon v2: Adaptive (built 2026-08-27)
+
+**Scope:** science transfers from owned primitives — every component rides machinery we already built in another project, is deterministic (no LLM in any loop), and carries a Koch-style kill criterion that ran before dependents were built.
+
+**Deliverables (all built):**
+- `castellan-drill` (P8.0): live-fire drill suite — the daemon attacks itself on a schedule (census escape, honeypot probe, forged nonce, envelope deny, freeze roundtrip). Nonce registry discriminates drills; names never trusted. Koch criterion verified live: 5/5 injected regressions caught, 20 clean cycles zero false alarms. `test/shell.d/p8-drills.sh`.
+- `castellan-memory` (P8.1): Kanerva-immune memory — SDM (vendored from engfield) with fragment→whole recall. Shapes are HDC bundles; measured geometry (full 1.0, 50% fragment 0.32, unrelated 0.07; gate 0.15). Drills are the antigen training set; human keep writes self (tolerance) shapes. Advisory-only; agent has no write path.
+- `castellan-campaign::signature` (P8.2): scale-invariant campaign signatures — per-kind time-histograms over normalized time (discrete Mellin-domain sampling). Probe-validated before build: cross-dilation cosine 0.87-0.99, cross-family 0.29-0.35. Three formulations killed by the day-one probe (log-binned, CDF, cumulative-share).
+- `castellan-voice` (P8.3): acoustic channel — kernel-enforced human exclusivity. Live-verified: the envelope denies audio WRITES (agent cannot speak) but not reads (agent can hear) — the one-way channel. Nonce challenge-response under constrained grammar; panic phrase triggers freeze-all, never a grant. STT/TTS feature-gated (not yet built); typed fallback works today.
+- `castellan-pharmaco` (P8.4): pharmacovigilance for agent fleets — PRR/ROR/EBGM with published worked examples as unit tests. FLEET HONESTY: methodology + estimator correctness only; "evidence pending fleet". No daemon wiring.
+
+**Kill criteria (all met):** drills 5/5 regression catches + 20 clean cycles; memory 50% fragment recalls + unrelated rejected + self suppresses; signatures cross-dilation > 0.8 + cross-family < 0.5; voice device-denial live-verified + grammar false-accept = 0; pharmaco published-example exactness.
+
+**Not built (honest):** STT/TTS backends (feature-gated, need audio hardware); pharmaco daemon wiring (fleet-blocked); immune-memory auto-enforcement (advisory by design).
+
 ## Total
 
 ~12-14 weeks of build at honest pace, sequenced. P0 ships first as a standalone demoable wedge and the first upstream PR. Each phase gates on its kill criterion; failure → reduced scope, not hand-waving.

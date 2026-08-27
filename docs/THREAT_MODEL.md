@@ -112,13 +112,13 @@ An external attacker targets the agent, the harness, or the safety system.
 **Vector 1 (self-migration) is kernel-closed:** writing own pid to a parent `cgroup.procs` returns EBUSY — the kernel refuses a process moving itself out of its own subtree. **Vector 2 is OPEN:** the agent asks the user manager (`systemd-run --user --unit=...`) to spawn a sibling unit under `app.slice/`. No cgroup write, no unit-file write (the private socket is not covered by Landlock ABI4 net rules — port-scoped — nor by classic-BPF seccomp, which cannot dereference the sockaddr). The escaped process is outside the session cgroup: freeze does not touch it, `kill_all` does not reach it — **the kill switch is defeated for escaped processes.** Mitigation: session-end orphan census (N6) — at kill, enumerate processes started during the session window whose parent is the user manager and whose cgroup is outside the session scope; report and kill them. Enforce mode does not close this vector (the socket is not a file write). Documented as residual: a determined agent can always escape the session scope via the user manager; the census bounds the blast radius to the session window.
 
 ### C11. Slow-drip campaigns (T1)
-**residual, detected post-hoc.** An attack split across sessions/days defeats per-session spines and per-session detection. Mitigation (built 2026-08-27): longitudinal project-level correlation (N1) — maximal-run campaign detector over the cross-session trust-event stream (castellan-campaign). The planned seq-engine structural layer was KILLed by probe (tautological expectations on event-derived tokens, zero expectations on composite-only encoding, no fingerprint separation on real spines) — see PRIMITIVES.md.
+**residual, detected post-hoc.** An attack split across sessions/days defeats per-session spines and per-session detection. Mitigation (built 2026-08-27): longitudinal project-level correlation (N1) — maximal-run campaign detector over the cross-session trust-event stream (castellan-campaign). The planned seq-engine structural layer was KILLed by probe (tautological expectations on event-derived tokens, zero expectations on composite-only encoding, no fingerprint separation on real spines) — see PRIMITIVES.md. P8.2 (built 2026-08-27) adds scale-invariant campaign signatures: per-kind time-histograms over normalized time (discrete Mellin-domain sampling) — dilation-invariant (a 3-hour attack and its 3-week dilation produce the same signature) and discriminative (probe-validated: cross-dilation cosine 0.87-0.99, cross-family 0.29-0.35). Advisory-only: signatures annotate, never auto-enforce.
 
 ### C12. Detection-oracle probing (T2)
 **mitigated by design (N2, designed not built).** Every observable response (freeze, deny) is a side channel for mapping detection rules. Two-tier response: low-confidence signals log silently; only high-confidence (canary trip, hard-deny write, membership drift) freeze.
 
 ### C13. Mimicry + prototype poisoning (T3)
-**mitigated by design (N3, designed not built).** Radar prototypes update only on `keep`/`clean_session` (human-validated sessions); poisoning then requires also fooling the human review.
+**mitigated by design (N3, designed not built).** Radar prototypes update only on `keep`/`clean_session` (human-validated sessions); poisoning then requires also fooling the human review. P8.1 (built 2026-08-27) extends the same principle to the immune memory: incident writes are daemon-only (drills + kernel-witnessed incidents), self (tolerance) shapes are written only on human keep — the agent has no write path to the memory.
 
 ### C14. The unprotected sibling (T5)
 **residual.** Any process not launched via castellan (plain harness run, cron, another agent) can read trust.db, the spine, and the signing key. All castellan claims are conditional on launch-path exclusivity. Mitigation: sibling detector (N5, designed not built) — pgrep known harness binaries lacking the castellan env tag → warn. Real value under Omarchy-default integration.
@@ -132,6 +132,15 @@ An external attacker targets the agent, the harness, or the safety system.
 ### C17. Dilution attacks (T8)
 **residual.** Event floods against count-based signals (danger ratios, seq windows). Mitigation (designed): rate-normalized patterns in N1.
 
+### C18. Drill mimicry (P8.0)
+**mitigated by design (built 2026-08-27).** A real escape naming its unit `castellan-drill-*` to be ignored. Drills are discriminated by a daemon-held nonce registry + sacrificial scopes; names are NEVER trusted — nothing in the system skips or exempts drill-named units (the census is name-agnostic: time-window + ppid + cgroup). The registry exists only to label results. Unit test: a unit named like a drill with a nonce never issued is NOT a drill.
+
+### C19. Acoustic channel residuals (P8.3)
+**residual, documented (built 2026-08-27).** (a) Human social engineering: the agent persuades the human to repeat the daemon's spoken code — mitigated by spoken context + surprise-warning phrasing, never eliminated (C-human class). (b) Mic-read exposure: the envelope denies audio WRITES (the agent cannot speak — kernel-verified) but NOT audio reads (read roots are "/") — the agent can hear; a colluding human recording is the same as social engineering. (c) Always-on mic privacy: capture opens only during an active bless window; audio processed in-memory, never persisted. (d) Whisper false accepts: nonce grammar is 4 digits from a closed set, Levenshtein <= 1, two attempts — measured, not assumed.
+
+### C20. Immune-memory tolerance erosion (P8.1)
+**residual.** A patient attacker that survives many kept sessions slowly enters self (tolerance shapes are written on every keep). Mitigation: canary/census/kernel-witnessed detectors (innate immunity) are NOT tolerance-gated — the memory is a second opinion, never an override. Documented as the biological trade-off (autoimmune vs tolerance).
+
 ## Residual risks summary
 
 | Risk | Status | Mitigation |
@@ -143,10 +152,13 @@ An external attacker targets the agent, the harness, or the safety system.
 | Pre-existing compromise | residual | clean-install prerequisite documented |
 | Indirect prompt injection (semantic) | mitigated | blast radius bounded by envelope + proxy, confusion not prevented |
 | Cgroup-hop escape (C10) | residual | orphan census bounds blast radius; kernel closes self-migration |
-| Slow-drip campaigns (C11) | residual | longitudinal correlation designed, not built |
+| Slow-drip campaigns (C11) | residual | campaign detector + scale-invariant signatures built (P8.2) |
 | Detection-oracle probing (C12) | mitigated by design | two-tier response designed, not built |
-| Mimicry + prototype poisoning (C13) | mitigated by design | kept-only folding designed, not built |
+| Mimicry + prototype poisoning (C13) | mitigated by design | kept-only folding designed, not built; immune memory daemon-only writes built (P8.1) |
 | Unprotected sibling (C14) | residual | sibling detector designed, not built |
 | Post-session persistence (C15) | mitigated | orphan census built (N6) |
 | Prose-encoded persistence (C16) | residual | accepted limit, documented |
 | Dilution attacks (C17) | residual | rate-normalized patterns designed, not built |
+| Drill mimicry (C18) | mitigated by design | nonce registry built (P8.0) |
+| Acoustic residuals (C19) | residual | documented (P8.3) |
+| Tolerance erosion (C20) | residual | innate immunity not tolerance-gated (P8.1) |

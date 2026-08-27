@@ -16,6 +16,10 @@ castellan/
 │   ├── castellan-egress/           HTTP proxy, real-cred injection, canary honeypot listener
 │   ├── castellan-canary/           credential planting, honeypot trigger → freeze wiring
 │   ├── castellan-radar/            sensor-hdc encoding, ed25519 signing, local outlier, fleet sync
+│   ├── castellan-drill/            P8.0 live-fire drills: nonce registry, scheduler, 5-drill suite
+│   ├── castellan-memory/           P8.1 Kanerva-immune memory: SDM (vendored from engfield), fragment recall, self/tolerance shapes
+│   ├── castellan-voice/            P8.3 acoustic channel: nonce grammar, panic phrase, protocol state machine (STT/TTS feature-gated)
+│   ├── castellan-pharmaco/         P8.4 pharmacovigilance: PRR/ROR/EBGM estimators (methodology only, fleet-pending)
 │   ├── castellan-bless/            dbus nonce-gated approval, rate limit, fp-toggle biometric integration
 │   ├── castellan-watch/            harness-state-watcher: skein + carrion baseline, skill quarantine
 │   ├── castellan-daemon/           unix socket, single-writer-per-session, watchdog, all-component orchestration
@@ -50,12 +54,16 @@ castellan/
 castellan-cli → castellan-daemon → {castellan-envelope, castellan-freezer, castellan-ledger,
                                      castellan-undo, castellan-trust, castellan-proof,
                                      castellan-replay, castellan-egress, castellan-canary,
-                                     castellan-radar, castellan-bless, castellan-watch}
+                                     castellan-radar, castellan-bless, castellan-watch,
+                                     castellan-drill, castellan-memory, castellan-voice}
                                   → castellan-core
 castellan-trust → castellan-proof (positive signal), castellan-ledger (events), castellan-core
 castellan-proof → relay-vuln (Rust crate, opt-in), config-radar (Rust crate), castellan-ledger
 castellan-radar → sensor-hdc (Rust crate, vendored), castellan-core
 castellan-watch → skein (Rust crate), carrion (Rust crate)
+castellan-memory → blake3 (SDM vendored from engfield, MIT)
+castellan-campaign → castellan-core, castellan-trust (signature module: P8.2)
+castellan-pharmaco → standalone estimators (P8.4, no daemon wiring yet)
 ```
 
 ## Pure Rust — no Python in the daemon

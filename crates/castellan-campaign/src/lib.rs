@@ -16,6 +16,8 @@
 //! Grammar-free: works on the signal stream only, no per-language code.
 //! Advisory: it never freezes (N2 routing — low confidence).
 
+pub mod signature;
+
 use castellan_core::ResponseTier;
 use castellan_trust::{Signal, TrustDb, signal_from_str};
 use serde::{Deserialize, Serialize};

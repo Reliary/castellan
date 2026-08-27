@@ -65,6 +65,7 @@ pub struct Daemon {
   trust: Arc<Mutex<TrustDb>>,
   bless: Arc<Mutex<FxHashMap<String, BlessRequest>>>,
   bless_ledger: Arc<Mutex<Vec<BlessEntry>>>,
+  radar_lock: Arc<Mutex<()>>,
 }
 
 impl Daemon {
@@ -131,6 +132,7 @@ impl Daemon {
       trust,
       bless: Arc::new(Mutex::new(FxHashMap::default())),
       bless_ledger: Arc::new(Mutex::new(bless_ledger)),
+      radar_lock: Arc::new(Mutex::new(())),
     })
   }
 
@@ -247,6 +249,9 @@ impl Daemon {
   }
 
   fn radar(&self, session: &str, project: &Path) -> Response {
+    // the prototype read-fold-write cycle must be serialized: two
+    // concurrent radar calls would lose an update (S2 audit fix)
+    let _guard = self.radar_lock.lock().unwrap();
     let state = Self::state_dir();
     let hv = match castellan_radar::encode_session_from_spine(session, &state) {
       Ok(hv) => hv,

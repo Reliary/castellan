@@ -17,6 +17,10 @@ pub const HV_BITS: usize = 10_000;
 pub const HV_WORDS: usize = (HV_BITS + 63) / 64;
 pub const HV_BYTES: usize = HV_WORDS * 8;
 
+/// Serialization header for persisted prototypes (S2 audit fix).
+const PROTOTYPE_MAGIC: [u8; 5] = *b"CSLRD";
+const PROTOTYPE_VERSION: u8 = 1;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hypervector {
   words: Vec<u64>,
@@ -187,8 +191,12 @@ impl Prototype {
     Self { counts: vec![0i16; HV_BITS], sessions: 0 }
   }
 
+  /// Versioned serialization: magic + schema version first, so a format
+  /// change reads back as empty rather than silently corrupting (S2 fix).
   pub fn to_bytes(&self) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HV_BITS * 2 + 2);
+    let mut out = Vec::with_capacity(HV_BITS * 2 + 8);
+    out.extend_from_slice(&PROTOTYPE_MAGIC);
+    out.push(PROTOTYPE_VERSION);
     for &c in &self.counts {
       out.extend_from_slice(&c.to_le_bytes());
     }
@@ -197,6 +205,10 @@ impl Prototype {
   }
 
   pub fn from_bytes(bytes: &[u8]) -> Self {
+    if bytes.len() < 6 || bytes[..5] != PROTOTYPE_MAGIC || bytes[5] != PROTOTYPE_VERSION {
+      return Self::empty();
+    }
+    let bytes = &bytes[6..];
     if bytes.len() < HV_BITS * 2 {
       return Self::empty();
     }
@@ -265,12 +277,10 @@ pub fn radar_report(
   }
 }
 
-/// Stable per-project key (realpath sha256), for prototype storage.
+/// Stable per-project key, delegated to the shared core implementation
+/// (S2 audit fix: drifted-copy risk).
 pub fn project_hash(realpath: &Path) -> String {
-  use sha2::{Digest, Sha256};
-  let canon = realpath.canonicalize().unwrap_or_else(|_| realpath.to_path_buf());
-  let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
-  digest.iter().map(|b| format!("{b:02x}")).collect()
+  castellan_core::project_key(realpath)
 }
 
 #[cfg(test)]

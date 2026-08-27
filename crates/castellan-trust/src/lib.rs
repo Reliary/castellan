@@ -1,5 +1,4 @@
 use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub const COLD_START_SCORE: f64 = 50.0;
@@ -102,12 +101,8 @@ pub struct TrustDb {
 }
 
 fn project_hash(realpath: &Path) -> String {
-  let canon = realpath.canonicalize().unwrap_or_else(|_| realpath.to_path_buf());
-  hex(&Sha256::digest(canon.to_string_lossy().as_bytes()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-  bytes.iter().map(|b| format!("{b:02x}")).collect()
+  // single shared implementation (S2 audit fix: drifted-copy risk)
+  castellan_core::project_key(realpath)
 }
 
 impl TrustDb {

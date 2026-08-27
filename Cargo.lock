@@ -59,6 +59,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -139,7 +140,6 @@ version = "0.1.0"
 dependencies = [
  "castellan-core",
  "serde",
- "sha2",
 ]
 
 [[package]]
@@ -157,7 +157,6 @@ version = "0.1.0"
 dependencies = [
  "castellan-core",
  "rusqlite",
- "sha2",
 ]
 
 [[package]]

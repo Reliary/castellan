@@ -8,4 +8,3 @@ description = "HV radar: hypervector fingerprints of session event streams, loca
 [dependencies]
 castellan-core = { path = "../castellan-core" }
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"

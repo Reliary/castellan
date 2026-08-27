@@ -9,3 +9,4 @@ description = "Shared types for castellan: session identity, events, freeze stat
 serde = { workspace = true }
 serde_json = { workspace = true }
 rustc-hash = { workspace = true }
+sha2 = "0.10"

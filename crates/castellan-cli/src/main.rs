@@ -55,9 +55,25 @@ fn main() {
   let mut line = String::new();
   use std::io::BufRead;
   match reader.read_line(&mut line) {
-    Ok(0) => eprintln!("daemon closed connection"),
-    Ok(_) => print!("{}", render(&line)),
-    Err(e) => eprintln!("read failed: {e}"),
+    Ok(0) => {
+      eprintln!("daemon closed connection");
+      std::process::exit(1);
+    }
+    Ok(_) => {
+      print!("{}", render(&line));
+      // scripts must be able to detect daemon-side failures
+      let ok = serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+      if !ok {
+        std::process::exit(1);
+      }
+    }
+    Err(e) => {
+      eprintln!("read failed: {e}");
+      std::process::exit(1);
+    }
   }
 }
 

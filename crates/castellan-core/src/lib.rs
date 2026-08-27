@@ -115,6 +115,12 @@ pub enum Request {
   Cert {
     session: SessionId,
   },
+  /// Forensic replay: re-classify a session's recorded events against a
+  /// narrower envelope (permissive-case delta).
+  Replay {
+    session: SessionId,
+    narrower_project: PathBuf,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

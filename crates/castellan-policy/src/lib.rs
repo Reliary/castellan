@@ -28,6 +28,7 @@ pub enum Verdict {
 #[derive(Debug, Clone)]
 pub struct Policy {
   pub session: SessionId,
+  pub harness: String,
   pub project: PathBuf,
   write_roots: Vec<PathBuf>,
   deny_write: Vec<PathBuf>,
@@ -145,6 +146,7 @@ impl Policy {
     write_roots.push(scratch.join("castellan/sessions").join(session));
     Self {
       session: session.to_owned(),
+      harness: harness.to_owned(),
       project,
       write_roots,
       deny_write: always_deny_write(),

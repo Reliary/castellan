@@ -29,6 +29,7 @@ fn main() {
     "trust" => trust_req(&args[1..]),
     "bless" => bless_req(&args[1..]),
     "cert" => cert_req(&args[1..]),
+    "replay" => replay_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -91,6 +92,18 @@ fn trust_req(args: &[String]) -> serde_json::Value {
     None => std::env::current_dir().unwrap_or_default(),
   };
   serde_json::json!({"op": "trust_score", "project": project})
+}
+
+fn replay_req(args: &[String]) -> serde_json::Value {
+  let Some(session) = args.first() else {
+    eprintln!("usage: castellan replay <session> [narrower-project]");
+    std::process::exit(2);
+  };
+  let narrower = match args.get(1) {
+    Some(p) => std::path::PathBuf::from(p),
+    None => std::env::current_dir().unwrap_or_default(),
+  };
+  serde_json::json!({"op": "replay", "session": session, "narrower_project": narrower})
 }
 
 fn cert_req(args: &[String]) -> serde_json::Value {
@@ -498,6 +511,21 @@ fn render(line: &str) -> String {
         out.push_str(&format!("bounds: {bounds} ({} out-of-bounds)\n", oob));
         out.push_str(&format!("placebo: {placebo} ({} proofs, tests {})\n", proofs, if tests { "pass" } else { "n/a" }));
       }
+      if let Some(rp) = v.get("extra").and_then(|e| e.get("replay")) {
+        let verdict = rp.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
+        let analyzed = rp.get("events_analyzed").and_then(|x| x.as_u64()).unwrap_or(0);
+        let orig = rp.get("original_denies").and_then(|x| x.as_u64()).unwrap_or(0);
+        let alt = rp.get("alternate_denies").and_then(|x| x.as_u64()).unwrap_or(0);
+        out.push_str(&format!("replay: {verdict} ({analyzed} events, {orig} orig-denies, {alt} alt-denies)\n"));
+        if let Some(nd) = rp.get("newly_denied").and_then(|x| x.as_array()) {
+          for p in nd.iter().take(10) {
+            out.push_str(&format!("  NEWLY-DENIED {}\n", p.as_str().unwrap_or("?")));
+          }
+          if nd.len() > 10 {
+            out.push_str(&format!("  ... and {} more\n", nd.len() - 10));
+          }
+        }
+      }
       out
     }
     Err(_) => format!("raw: {line}\n"),
@@ -520,6 +548,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan bless approve <nonce>   approve an expansion (human only)");
   eprintln!("  castellan bless reject <nonce>    reject an expansion");
   eprintln!("  castellan cert <session>          assemble a ProofCertificate");
+  eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

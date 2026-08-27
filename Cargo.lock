@@ -72,6 +72,7 @@ dependencies = [
  "castellan-ledger",
  "castellan-policy",
  "castellan-proof",
+ "castellan-replay",
  "castellan-trust",
  "nix",
  "rustc-hash",
@@ -127,6 +128,15 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2",
+]
+
+[[package]]
+name = "castellan-replay"
+version = "0.1.0"
+dependencies = [
+ "castellan-core",
+ "castellan-policy",
+ "serde",
 ]
 
 [[package]]

@@ -185,6 +185,44 @@ impl Daemon {
       Request::BlessApprove { nonce } => self.bless_approve(&nonce),
       Request::BlessReject { nonce } => self.bless_reject(&nonce),
       Request::Cert { session } => self.cert(&session),
+      Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
+    }
+  }
+
+  fn replay(&self, session: &str, narrower_project: &Path) -> Response {
+    let project = {
+      let reg = self.registry.lock().unwrap();
+      match reg.get(&session.to_string()) {
+        Some(s) => s.project.clone(),
+        None => {
+          let dir = Self::state_dir().join("castellan/sessions");
+          let meta = std::fs::read_to_string(dir.join(format!("{session}.json")));
+          match meta {
+            Ok(m) => match serde_json::from_str::<serde_json::Value>(&m) {
+              Ok(v) => v
+                .get("project")
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/")),
+              Err(_) => return Response::err("unknown session"),
+            },
+            Err(_) => return Response::err("unknown session"),
+          }
+        }
+      }
+    };
+    let harness = {
+      let reg = self.registry.lock().unwrap();
+      reg.get(&session.to_string()).map(|s| s.harness.clone()).unwrap_or_else(|| "claude".into())
+    };
+    let original = castellan_policy::Policy::new(session, &harness, project);
+    let alternate = castellan_replay::narrower_policy(&original, narrower_project);
+    match castellan_replay::replay_session(session, &Self::state_dir(), &original, &alternate) {
+      Ok(out) => {
+        let json = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
+        Response::ok().with_extra("replay", json)
+      }
+      Err(e) => Response::err(format!("replay failed: {e}")),
     }
   }
 

@@ -1,0 +1,11 @@
+[package]
+name = "castellan-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forensic replay: re-classify recorded session events against alternate envelope rulesets."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+castellan-policy = { path = "../castellan-policy" }
+serde = { version = "1", features = ["derive"] }

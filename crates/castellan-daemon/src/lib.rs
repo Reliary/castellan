@@ -23,6 +23,15 @@ struct SessionNotes {
   baseline: Option<castellan_proof::BaselineManifest>,
 }
 
+/// The persisted launch profile for a session (respawn material).
+#[derive(Default)]
+struct LaunchProfileFields {
+  command: Option<Vec<String>>,
+  enforce: bool,
+  undo: bool,
+  net: bool,
+}
+
 /// A pending bless-broker expansion request.
 #[derive(Debug, Clone)]
 struct BlessRequest {
@@ -55,6 +64,15 @@ enum BlessKind {
   Forged,
 }
 
+/// A granted expansion, held daemon-side in memory (never on disk where
+/// the agent could forge it). Consumed exactly once by grant_check.
+#[derive(Debug, Clone)]
+struct Grant {
+  session: SessionId,
+  want: String,
+  granted_ts: u64,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
   root: Arc<CgroupRoot>,
@@ -65,6 +83,7 @@ pub struct Daemon {
   trust: Arc<Mutex<TrustDb>>,
   bless: Arc<Mutex<FxHashMap<String, BlessRequest>>>,
   bless_ledger: Arc<Mutex<Vec<BlessEntry>>>,
+  grants: Arc<Mutex<FxHashMap<String, Grant>>>,
   radar_lock: Arc<Mutex<()>>,
 }
 
@@ -132,6 +151,7 @@ impl Daemon {
       trust,
       bless: Arc::new(Mutex::new(FxHashMap::default())),
       bless_ledger: Arc::new(Mutex::new(bless_ledger)),
+      grants: Arc::new(Mutex::new(FxHashMap::default())),
       radar_lock: Arc::new(Mutex::new(())),
     })
   }
@@ -164,6 +184,22 @@ impl Daemon {
       .get("harness")?
       .as_str()
       .map(String::from)
+  }
+
+  /// The launch profile persisted at spawn: the exact command plus the
+  /// confinement flags, so a bless-broker respawn reproduces the
+  /// session's confinement minus the expansion.
+  fn durable_launch_profile(session: &str) -> Option<LaunchProfileFields> {
+    let meta = Self::durable_session_meta(session)?;
+    let command = meta.get("command").and_then(|c| {
+      serde_json::from_value::<Vec<String>>(c.clone()).ok()
+    });
+    Some(LaunchProfileFields {
+      command,
+      enforce: meta.get("enforce").and_then(|v| v.as_bool()).unwrap_or(false),
+      undo: meta.get("undo").and_then(|v| v.as_bool()).unwrap_or(false),
+      net: meta.get("net").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
   }
 
   pub fn socket_path() -> PathBuf {
@@ -217,7 +253,9 @@ impl Daemon {
 
   fn dispatch(&self, req: Request) -> Response {
     match req {
-      Request::Spawn { harness, project, pid } => self.spawn(harness, project, pid),
+      Request::Spawn { harness, project, pid, command, enforce, undo, net, grants } => {
+        self.spawn(harness, project, pid, command, enforce, undo, net, grants)
+      }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
       Request::Freeze { session } => self.freeze(session.as_ref(), true),
       Request::Thaw { session } => self.freeze(session.as_ref(), false),
@@ -506,15 +544,26 @@ impl Daemon {
       want: req.want.clone(),
       nonce_hint: nonce[..nonce.len().min(8)].to_string(),
     });
-    // v1: approval is recorded; the restart-with-wider-envelope
-    // orchestration is a follow-up (documented in bless-broker.md).
+    // approval is daemon-side: record the grant (one-shot, in-memory —
+    // the agent cannot forge a grant without the daemon). The session
+    // stays alive in its current envelope; the LAUNCHER asks for the
+    // grant when it next spawns. Grants are project-scoped: the trust
+    // tier is per-project, so the expansion follows the project.
+    self.grants.lock().unwrap().insert(
+      format!("{}:{}", req.project.display(), req.want),
+      Grant {
+        session: req.session.clone(),
+        want: req.want.clone(),
+        granted_ts: castellan_core::now_unix(),
+      },
+    );
     Response::ok().with_extra(
       "bless",
       serde_json::json!({
         "approved": true,
         "session": req.session,
         "want": req.want,
-        "note": "v1 records approval; envelope re-mint + restart is P4",
+        "note": "grant recorded daemon-side; consumed on next launch",
       }),
     )
   }
@@ -854,7 +903,17 @@ impl Daemon {
     }
   }
 
-  fn spawn(&self, harness: String, project: PathBuf, pid: Option<u32>) -> Response {
+  fn spawn(
+    &self,
+    harness: String,
+    project: PathBuf,
+    pid: Option<u32>,
+    command: Option<Vec<String>>,
+    enforce: bool,
+    undo: bool,
+    net: bool,
+    grants: Vec<String>,
+  ) -> Response {
     let id = new_session_id();
     if let Err(e) = self.root.create_session(&id) {
       return Response::err(format!("cgroup create failed: {e}"));
@@ -865,6 +924,33 @@ impl Daemon {
         return Response::err(format!("failed to move pid into scope: {e}"));
       }
     }
+    // trust floor coupling: tiers 0-1 fail-closed regardless of flags.
+    // The daemon consults the trust tier at spawn; the launcher's
+    // flags are a request, not a grant. A consumed grant (human
+    // blessing) overrides the floor for that expansion.
+    let (low_trust, tier_str, granted) = {
+      let db = self.trust.lock().unwrap();
+      let t = db.score(&project).ok();
+      let low = t.as_ref().map(|t| t.tier <= castellan_trust::Tier::One).unwrap_or(false);
+      let tier = t.map(|t| t.tier.as_str().to_string()).unwrap_or("?".into());
+      let granted: Vec<String> = grants
+        .iter()
+        .filter_map(|want| {
+          self
+            .grants
+            .lock()
+            .unwrap()
+            .remove(&format!("{}:{want}", project.display()))
+            .map(|g| g.want)
+        })
+        .collect();
+      (low, tier, granted)
+    };
+    let (enforce, undo, net) = if low_trust && granted.is_empty() {
+      (true, true, true)
+    } else {
+      (enforce, undo, net)
+    };
     let config_sha = project_config_sha(&project);
     let pinned = config_sha.clone();
     self.registry.lock().unwrap().insert(Session {
@@ -876,8 +962,29 @@ impl Daemon {
     self.start_audit(&id, &harness, &project);
     // durable session->project mapping: certificates must work for
     // finished sessions (transferable proof), so persist at spawn
-    let _ = self.persist_session(&id, &project, &harness, &config_sha);
-    Response::ok().with_message(format!("spawned session {id}"))
+    let _ = self.persist_session(
+      &id,
+      &project,
+      &harness,
+      &config_sha,
+      command,
+      enforce,
+      undo,
+      net,
+    );
+    Response::ok()
+      .with_message(format!("spawned session {id}"))
+      .with_extra(
+        "profile",
+        serde_json::json!({
+          "enforce": enforce,
+          "undo": undo,
+          "net": net,
+          "forced": low_trust && granted.is_empty(),
+          "tier": tier_str,
+          "grants": granted,
+        }),
+      )
   }
 
   fn persist_session(
@@ -886,6 +993,10 @@ impl Daemon {
     project: &Path,
     harness: &str,
     config_sha: &Option<String>,
+    command: Option<Vec<String>>,
+    enforce: bool,
+    undo: bool,
+    net: bool,
   ) -> std::io::Result<()> {
     let dir = Self::state_dir().join("castellan/sessions");
     std::fs::create_dir_all(&dir)?;
@@ -896,6 +1007,10 @@ impl Daemon {
         "project": project.display().to_string(),
         "harness": harness,
         "config_sha": config_sha,
+        "command": command,
+        "enforce": enforce,
+        "undo": undo,
+        "net": net,
       })
       .to_string(),
     )

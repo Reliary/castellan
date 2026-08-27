@@ -55,6 +55,23 @@ pub enum Request {
     harness: String,
     project: PathBuf,
     pid: Option<u32>,
+    /// The exact command the launcher will exec (persisted for
+    /// bless-broker relaunch orchestration).
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    /// Confinement flags, persisted so a relaunch reproduces the
+    /// session's confinement.
+    #[serde(default)]
+    enforce: bool,
+    #[serde(default)]
+    undo: bool,
+    #[serde(default)]
+    net: bool,
+    /// Expansion wants this launch wants to consume. The daemon
+    /// consumes daemon-side one-shot grants (keyed project:want);
+    /// a consumed grant overrides the tier floor (human decision).
+    #[serde(default)]
+    grants: Vec<String>,
   },
   Adopt {
     session: SessionId,
@@ -110,7 +127,9 @@ pub enum Request {
     want: String,
     reason: String,
   },
-  /// Bless-broker: approve a pending expansion by nonce.
+  /// Bless-broker: approve a pending expansion by nonce. Killing the
+  /// session's workers and re-forking the agent in a wider envelope is
+  /// daemon-side (trust floor coupling); the caller just reports.
   BlessApprove {
     nonce: String,
   },

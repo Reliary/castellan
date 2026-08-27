@@ -210,6 +210,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   let mut enforce = false;
   let mut undo = false;
   let mut net = false;
+  let mut grants: Vec<String> = Vec::new();
   let mut cmd: Option<Vec<String>> = None;
   let mut i = 0;
   while i < args.len() {
@@ -225,6 +226,10 @@ fn launch(args: &[String], sock: &str) -> ! {
       "--enforce" => enforce = true,
       "--undo" => undo = true,
       "--net" => net = true,
+      "--grant" if i + 1 < args.len() => {
+        grants.push(args[i + 1].clone());
+        i += 1;
+      }
       "--" => {
         cmd = Some(args[i + 1..].to_vec());
         break;
@@ -239,7 +244,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   let cmd = match cmd {
     Some(c) if !c.is_empty() => c,
     _ => {
-      eprintln!("usage: castellan launch [--harness H] [--project P] [--enforce] [--undo] [--net] -- <command> [args...]");
+      eprintln!("usage: castellan launch [--harness H] [--project P] [--enforce] [--undo] [--net] [--grant WANT] -- <command> [args...]");
       std::process::exit(2);
     }
   };
@@ -250,12 +255,41 @@ fn launch(args: &[String], sock: &str) -> ! {
     "op": "spawn",
     "harness": harness,
     "project": project,
-    "pid": null
+    "pid": null,
+    "command": cmd,
+    "enforce": enforce,
+    "undo": undo,
+    "net": net,
+    "grants": grants
   }));
   let session = extract_session(&resp).unwrap_or_else(|| {
     eprintln!("launch failed: {resp}");
     std::process::exit(1);
   });
+  // trust floor coupling: the daemon may have forced flags regardless
+  // of what the launcher requested (tiers 0-1 run fail-closed unless a
+  // human grant was consumed)
+  let profile = serde_json::from_str::<serde_json::Value>(&resp)
+    .ok()
+    .and_then(|v| v.get("extra").and_then(|e| e.get("profile")).cloned());
+  let forced = profile
+    .as_ref()
+    .and_then(|p| p.get("forced").and_then(|f| f.as_bool()))
+    .unwrap_or(false);
+  let consumed: Vec<String> = profile
+    .as_ref()
+    .and_then(|p| p.get("grants").and_then(|g| g.as_array()))
+    .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
+    .unwrap_or_default();
+  if forced {
+    eprintln!("castellan: trust tier <= 1 — forcing enforce+undo+net (fail-closed)");
+    enforce = true;
+    undo = true;
+    net = true;
+  }
+  if !consumed.is_empty() {
+    eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
+  }
   let procs = scope_procs(&session);
   if let Err(e) = std::fs::write(
     &procs,
@@ -528,8 +562,7 @@ fn render(line: &str) -> String {
         if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
           out.push_str(&format!("approved: {approved}\n"));
         }
-      }
-      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
+      }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
         let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
         let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
         let oob = cert.get("bounds").and_then(|b| b.get("out_of_bounds_attempts")).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -564,6 +597,23 @@ fn render(line: &str) -> String {
           cosine,
           events,
           if anomaly { "ANOMALY (advisory)" } else { "normal" }
+        ));
+      }
+      if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {
+        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
+        let undo = pf.get("undo").and_then(|x| x.as_bool()).unwrap_or(false);
+        let net = pf.get("net").and_then(|x| x.as_bool()).unwrap_or(false);
+        let forced = pf.get("forced").and_then(|x| x.as_bool()).unwrap_or(false);
+        let tier = pf.get("tier").and_then(|x| x.as_str()).unwrap_or("?");
+        let grants: Vec<String> = pf
+          .get("grants")
+          .and_then(|g| g.as_array())
+          .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
+          .unwrap_or_default();
+        out.push_str(&format!(
+          "profile: tier {tier}, enforce={enforce} undo={undo} net={net}{}{}\n",
+          if forced { " (FORCED fail-closed)" } else { "" },
+          if grants.is_empty() { String::new() } else { format!(" grants={}", grants.join(",")) }
         ));
       }
       out

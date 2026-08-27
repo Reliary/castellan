@@ -1,6 +1,7 @@
 use castellan_core::{FreezeState, SessionId};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 pub struct CgroupRoot {
@@ -53,6 +54,11 @@ impl CgroupRoot {
   }
 
   pub fn set_freeze(&self, session: &SessionId, freeze: bool) -> io::Result<FreezeState> {
+    // P8 fault injection: the D5 drill must fail loudly when the
+    // freezer is muted. Test-only, env-gated.
+    if std::env::var("CASTELLAN_TEST_DISABLE_FREEZE").is_ok() {
+      return Ok(FreezeState::Thawed);
+    }
     fs::write(
       self.session_dir(session).join("cgroup.freeze"),
       if freeze { b"1\n" as &[u8] } else { b"0\n" },
@@ -111,9 +117,17 @@ impl CgroupRoot {
   /// the user manager (systemd-run) and are invisible to freeze/kill.
   /// Bounds the blast radius to the session window; not a guarantee.
   pub fn orphan_census(&self, session: &SessionId, session_start_unix: u64) -> Vec<u32> {
+    // fault injection (P8 drill suite): the census is disabled, so the
+    // D1 drill must fail loudly. Env-gated, daemon-launcher-only.
+    if std::env::var("CASTELLAN_TEST_DISABLE_CENSUS").is_ok() {
+      return Vec::new();
+    }
     let scope = self.session_dir(session);
     let scope_str = scope.to_string_lossy().to_string();
-    let user_mgr = nix::unistd::getppid().as_raw();
+    // the user manager is the direct parent of escaped processes; scan
+    // /proc for it rather than assuming the daemon's own parent is the
+    // user manager (true only when the daemon runs as a user service)
+    let user_mgr = user_manager_pid().unwrap_or_else(|| nix::unistd::getppid().as_raw() as u32);
     let btime = proc_btime();
     let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
       .ok()
@@ -142,10 +156,10 @@ impl CgroupRoot {
         ) else {
           continue;
         };
-        if ppid != user_mgr {
+        if ppid as u32 != user_mgr {
           continue;
         }
-        let start_unix = btime + start_ticks / hz;
+        let start_unix = btime + start_ticks.div_ceil(hz);
         if start_unix < session_start_unix {
           continue;
         }
@@ -182,4 +196,43 @@ fn proc_btime() -> u64 {
         .and_then(|v| v.trim().parse().ok())
     })
     .unwrap_or(0)
+}
+
+/// Find the user manager (systemd --user) pid: the process whose
+/// parent is pid 1, whose comm is "systemd", and whose uid matches
+/// ours. Escaped processes (systemd-run) are direct children of it.
+fn user_manager_pid() -> Option<u32> {
+  let uid = nix::unistd::Uid::current().as_raw();
+  let entries = fs::read_dir("/proc").ok()?;
+  for entry in entries.flatten() {
+    let name = entry.file_name();
+    let pid: u32 = match name.to_string_lossy().parse() {
+      Ok(p) => p,
+      Err(_) => continue,
+    };
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+      Ok(s) => s,
+      Err(_) => continue,
+    };
+    let Some(rest) = stat.rsplit_once(')') else { continue };
+    let fields: Vec<&str> = rest.1.split_whitespace().collect();
+    let (Some(ppid), Some(state)) = (fields.get(1).and_then(|f| f.parse::<i32>().ok()), fields.get(0)) else {
+      continue;
+    };
+    if ppid != 1 || *state != "S" {
+      continue;
+    }
+    let comm = match fs::read_to_string(format!("/proc/{pid}/comm")) {
+      Ok(c) => c,
+      Err(_) => continue,
+    };
+    if comm.trim() != "systemd" {
+      continue;
+    }
+    let uid_ok = fs::metadata(format!("/proc/{pid}")).map(|m| m.uid() == uid).unwrap_or(false);
+    if uid_ok {
+      return Some(pid);
+    }
+  }
+  None
 }

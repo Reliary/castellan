@@ -24,6 +24,7 @@ castellan-proof = { path = "../castellan-proof" }
 castellan-replay = { path = "../castellan-replay" }
 castellan-radar = { path = "../castellan-radar" }
 castellan-campaign = { path = "../castellan-campaign" }
+castellan-drill = { path = "../castellan-drill" }
 castellan-ledger = { path = "../castellan-ledger" }
 sha2 = "0.10"
 toml = "0.8"

@@ -78,6 +78,7 @@ dependencies = [
  "castellan-campaign",
  "castellan-canary",
  "castellan-core",
+ "castellan-drill",
  "castellan-envelope",
  "castellan-freezer",
  "castellan-ledger",
@@ -92,6 +93,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+]
+
+[[package]]
+name = "castellan-drill"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

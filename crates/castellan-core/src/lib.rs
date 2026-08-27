@@ -190,6 +190,10 @@ pub enum Request {
   Campaign {
     project: PathBuf,
   },
+  /// P8: run the live-fire drill suite now (manual trigger).
+  DrillRun,
+  /// P8: report the last drill results.
+  DrillStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -69,6 +69,11 @@ pub fn seccomp_program() -> Vec<libc::sock_filter> {
 }
 
 pub fn seccomp_apply() -> io::Result<()> {
+  // P8 fault injection: the D4 drill must fail loudly when seccomp is
+  // dropped. Test-only, env-gated — the daemon's env is not agent-set.
+  if std::env::var("CASTELLAN_TEST_DISABLE_SECCOMP").is_ok() {
+    return Ok(());
+  }
   let prog = seccomp_program();
   unsafe {
     if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {

@@ -12,6 +12,7 @@ members = [
   "crates/castellan-replay",
   "crates/castellan-radar",
   "crates/castellan-campaign",
+  "crates/castellan-drill",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

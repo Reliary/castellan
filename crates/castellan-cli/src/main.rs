@@ -33,6 +33,7 @@ fn main() {
     "radar" => radar_req(&args[1..]),
     "campaign" => campaign_req(&args[1..]),
     "siblings" => siblings_req(),
+    "drill" => drill_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -177,6 +178,17 @@ fn siblings_req() -> serde_json::Value {
     }
   }
   serde_json::json!({"op": "siblings", "found": found})
+}
+
+fn drill_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("run") => serde_json::json!({"op": "drill_run"}),
+    Some("status") | None => serde_json::json!({"op": "drill_status"}),
+    Some(other) => {
+      eprintln!("usage: castellan drill [run|status]");
+      std::process::exit(2);
+    }
+  }
 }
 
 fn replay_req(args: &[String]) -> serde_json::Value {
@@ -675,8 +687,21 @@ fn render(line: &str) -> String {
           ));
         }
       }
-      if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {
-        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
+      if let Some(dr) = v.get("extra").and_then(|e| e.get("drill")) {
+        let results = dr.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        for r in results {
+          let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+          let pass = r.get("pass").and_then(|x| x.as_bool()).unwrap_or(false);
+          let expected = r.get("expected").and_then(|x| x.as_str()).unwrap_or("?");
+          let observed = r.get("observed").and_then(|x| x.as_str()).unwrap_or("?");
+          let lat = r.get("latency_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+          out.push_str(&format!(
+            "drill {id:<10} {}  expected: {expected}  observed: {observed}  ({lat}ms)\n",
+            if pass { "PASS" } else { "FAIL" }
+          ));
+        }
+      }
+      if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
         let undo = pf.get("undo").and_then(|x| x.as_bool()).unwrap_or(false);
         let net = pf.get("net").and_then(|x| x.as_bool()).unwrap_or(false);
         let forced = pf.get("forced").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -716,6 +741,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan cert <session>          assemble a ProofCertificate");
   eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
+  eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

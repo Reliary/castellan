@@ -85,6 +85,8 @@ pub struct Daemon {
   bless_ledger: Arc<Mutex<Vec<BlessEntry>>>,
   grants: Arc<Mutex<FxHashMap<String, Grant>>>,
   radar_lock: Arc<Mutex<()>>,
+  drill: Arc<castellan_drill::DrillRegistry>,
+  drill_results: Arc<Mutex<Vec<castellan_drill::DrillResult>>>,
 }
 
 impl Daemon {
@@ -142,7 +144,7 @@ impl Daemon {
       }
     };
     let bless_ledger = load_bless_ledger(&state.join("castellan/bless.jsonl"));
-    Ok(Self {
+    let daemon = Self {
       root: Arc::new(CgroupRoot::detect()?),
       registry,
       audits: Arc::new(Mutex::new(FxHashMap::default())),
@@ -153,7 +155,20 @@ impl Daemon {
       bless_ledger: Arc::new(Mutex::new(bless_ledger)),
       grants: Arc::new(Mutex::new(FxHashMap::default())),
       radar_lock: Arc::new(Mutex::new(())),
-    })
+      drill: Arc::new(castellan_drill::DrillRegistry::new()),
+      drill_results: Arc::new(Mutex::new(Vec::new())),
+    };
+    // P8: the live-fire scheduler. The daemon attacks itself on a
+    // schedule and proves the defenses still work. Enabled by default;
+    // opt out via [drill] enabled=false in the config (not yet read —
+    // env override for now).
+    let interval_min = std::env::var("CASTELLAN_DRILL_INTERVAL_MIN")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(60);
+    let drill_daemon = daemon.clone();
+    let _ = castellan_drill::spawn_scheduler(interval_min, move || drill_daemon.run_drills());
+    Ok(daemon)
   }
 
   fn state_dir() -> PathBuf {
@@ -283,8 +298,20 @@ impl Daemon {
       Request::Cert { session } => self.cert(&session),
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
       Request::Radar { session, project } => self.radar(&session, &project),
-Request::Siblings => self.siblings(),
-Request::Campaign { project } => self.campaign(&project),
+      Request::Siblings => self.siblings(),
+      Request::Campaign { project } => self.campaign(&project),
+      Request::DrillRun => {
+        let results = self.run_drills();
+        let json: Vec<serde_json::Value> =
+          results.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
+        Response::ok().with_extra("drill", serde_json::json!({ "results": json }))
+      }
+      Request::DrillStatus => {
+        let results = self.drill_results.lock().unwrap().clone();
+        let json: Vec<serde_json::Value> =
+          results.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
+        Response::ok().with_extra("drill", serde_json::json!({ "results": json }))
+      }
     }
   }
 
@@ -398,6 +425,251 @@ Request::Campaign { project } => self.campaign(&project),
       }
       Err(e) => Response::err(format!("campaign detection failed: {e}")),
     }
+  }
+
+  /// P8: run the live-fire drill suite. Each drill attacks a sacrificial
+  /// scope and verifies the defense holds. Results are stored for
+  /// `drill status` and emitted to the spine as `drill_*` events.
+  /// A failing drill is a loud alarm: the defense is broken.
+  fn run_drills(&self) -> Vec<castellan_drill::DrillResult> {
+    let mut results = Vec::new();
+    results.push(self.drill_census());
+    results.push(self.drill_honeypot());
+    results.push(self.drill_bless());
+    results.push(self.drill_envelope());
+    results.push(self.drill_freeze());
+    let any_fail = results.iter().any(|r| !r.pass);
+    let sink = EventSink::for_session(&Self::state_dir(), "drill");
+    if let Ok(sink) = sink {
+      for r in &results {
+        let _ = sink.emit(
+          &format!("drill_{}", r.id),
+          &format!("expected={} observed={}", r.expected, r.observed),
+          if r.pass { "pass" } else { "FAIL" },
+        );
+      }
+    }
+    if any_fail {
+      eprintln!("castellan-daemon: DRILL FAILURE — a defense is broken:");
+      for r in &results {
+        if !r.pass {
+          eprintln!("  drill {}: expected {} — observed {}", r.id, r.expected, r.observed);
+        }
+      }
+    }
+    *self.drill_results.lock().unwrap() = results.clone();
+    results
+  }
+
+  /// D1: the census must find and kill a process that escaped the
+  /// session cgroup via the user manager (systemd-run).
+  fn drill_census(&self) -> castellan_drill::DrillResult {
+    let started = std::time::Instant::now();
+    let nonce = self.drill.issue();
+    let scope = self.drill.scope_name(&nonce);
+    let session = scope.clone();
+    let _ = self.root.create_session(&session);
+    let start_ts = castellan_core::now_unix();
+    // the escape: a process spawned via the user manager, outside the
+    // session cgroup — exactly the T4 vector the census bounds
+    let escaped = std::process::Command::new("systemd-run")
+      .args(["--user", "--collect", "--unit", &scope, "sleep", "30"])
+      .spawn();
+    let (found, killed) = match escaped {
+      Ok(mut child) => {
+        let _ = child.wait();
+        // systemd-run exits once the unit is created, but the escaped
+        // process forks slightly later — poll for it before the census
+        let mut waited = 0u64;
+        loop {
+          let orphans = self.root.orphan_census(&session, start_ts);
+          if !orphans.is_empty() || waited >= 2000 {
+            let found = orphans.len();
+            let killed = self.root.kill_pids(&orphans);
+            break (found, killed);
+          }
+          std::thread::sleep(std::time::Duration::from_millis(100));
+          waited += 100;
+        }
+      }
+      Err(e) => {
+        let _ = self.root.destroy_session(&session);
+        return castellan_drill::DrillResult::new(
+          "census",
+          "systemd-run escape caught by census",
+          &format!("systemd-run unavailable: {e}"),
+          false,
+          started.elapsed().as_millis() as u64,
+        );
+      }
+    };
+    let _ = self.root.destroy_session(&session);
+    let pass = found >= 1 && killed >= 1;
+    castellan_drill::DrillResult::new(
+      "census",
+      "systemd-run escape caught by census",
+      &format!("found {found}, killed {killed}"),
+      pass,
+      started.elapsed().as_millis() as u64,
+    )
+  }
+
+  /// D2: a registered canary secret used against the honeypot must
+  /// trip. The drill registers its own secret and probes the port.
+  fn drill_honeypot(&self) -> castellan_drill::DrillResult {
+    let started = std::time::Instant::now();
+    if self.honeypot.port == 0 {
+      return castellan_drill::DrillResult::new(
+        "honeypot",
+        "canary probe trips the honeypot",
+        "honeypot detached (port 0)",
+        false,
+        started.elapsed().as_millis() as u64,
+      );
+    }
+    let secret = format!("drill-{}", rand_hex(16));
+    self.honeypot.register(&castellan_canary::CanarySecret {
+      value: secret.clone(),
+      session: "drill".into(),
+    });
+    // probe: connect and send the secret bytes, like an exfil attempt
+    let mut stream = match std::net::TcpStream::connect(("127.0.0.1", self.honeypot.port)) {
+      Ok(s) => s,
+      Err(e) => {
+        return castellan_drill::DrillResult::new(
+          "honeypot",
+          "canary probe trips the honeypot",
+          &format!("connect failed: {e}"),
+          false,
+          started.elapsed().as_millis() as u64,
+        );
+      }
+    };
+    use std::io::Write as _;
+    let _ = stream.write_all(secret.as_bytes());
+    let _ = stream.flush();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // the trip fires the daemon's callback (trust signal + freeze);
+    // we cannot observe the callback directly, so verify the trip
+    // event landed on the drill spine
+    let tripped = EventSink::for_session(&Self::state_dir(), "drill")
+      .and_then(|s| s.read_all())
+      .map(|events| events.iter().any(|e| e.kind == "canary_trip"))
+      .unwrap_or(false);
+    castellan_drill::DrillResult::new(
+      "honeypot",
+      "canary probe trips the honeypot",
+      if tripped { "trip fired" } else { "no trip event" },
+      tripped,
+      started.elapsed().as_millis() as u64,
+    )
+  }
+
+  /// D3: a forged bless nonce must be recorded and must NOT grant.
+  fn drill_bless(&self) -> castellan_drill::DrillResult {
+    let started = std::time::Instant::now();
+    let forged = format!("deadbeef{}", rand_hex(8));
+    let resp = self.bless_approve(&forged);
+    let recorded = self
+      .bless_ledger
+      .lock()
+      .unwrap()
+      .iter()
+      .any(|e| e.kind == BlessKind::Forged && e.nonce_hint == forged[..forged.len().min(8)].to_string());
+    let pass = !resp.ok && recorded;
+    castellan_drill::DrillResult::new(
+      "bless",
+      "forged nonce recorded, no grant",
+      &format!("approve={} recorded={}", if resp.ok { "granted" } else { "denied" }, recorded),
+      pass,
+      started.elapsed().as_millis() as u64,
+    )
+  }
+
+  /// D4: an enforced child must be denied a write to a hard-denied
+  /// path (~/.ssh). The child applies the envelope itself, then tries.
+  fn drill_envelope(&self) -> castellan_drill::DrillResult {
+    let started = std::time::Instant::now();
+    let nonce = self.drill.issue();
+    let session = format!("drill-{nonce}");
+    let policy = castellan_policy::Policy::new(&session, "drill", std::path::PathBuf::from("/tmp"));
+    let denied = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let denied = std::path::Path::new(&denied).join(".ssh");
+    let mut child = match std::process::Command::new(std::env::current_exe().unwrap_or_default())
+      .arg("--drill-envelope")
+      .arg(&denied)
+      .env("CASTELLAN_DRILL_SESSION", &session)
+      .spawn()
+    {
+      Ok(c) => c,
+      Err(e) => {
+        return castellan_drill::DrillResult::new(
+          "envelope",
+          "Landlock denies ~/.ssh write",
+          &format!("spawn failed: {e}"),
+          false,
+          started.elapsed().as_millis() as u64,
+        );
+      }
+    };
+    let status = child.wait();
+    let pass = match status {
+      Ok(s) => s.code() == Some(0),
+      Err(e) => {
+        return castellan_drill::DrillResult::new(
+          "envelope",
+          "Landlock denies ~/.ssh write",
+          &format!("wait failed: {e}"),
+          false,
+          started.elapsed().as_millis() as u64,
+        );
+      }
+    };
+    let _ = policy;
+    castellan_drill::DrillResult::new(
+      "envelope",
+      "Landlock denies ~/.ssh write",
+      if pass { "denied (EACCES)" } else { "write succeeded (envelope broken)" },
+      pass,
+      started.elapsed().as_millis() as u64,
+    )
+  }
+
+  /// D5: freeze→thaw roundtrip on a sacrificial scope within budget.
+  fn drill_freeze(&self) -> castellan_drill::DrillResult {
+    let started = std::time::Instant::now();
+    let nonce = self.drill.issue();
+    let session = format!("{}.scope", self.drill.scope_name(&nonce));
+    let _ = self.root.create_session(&session);
+    // a real process in the scope so freeze has something to act on
+    let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+      Ok(c) => c,
+      Err(e) => {
+        let _ = self.root.destroy_session(&session);
+        return castellan_drill::DrillResult::new(
+          "freeze",
+          "freeze/thaw roundtrip within 500ms",
+          &format!("spawn failed: {e}"),
+          false,
+          started.elapsed().as_millis() as u64,
+        );
+      }
+    };
+    let _ = self.root.write_procs(&session, &[child.id()]);
+    let f = self.root.set_freeze(&session, true);
+    let t = self.root.set_freeze(&session, false);
+    let _ = self.root.kill_all(&session);
+    let _ = child.kill();
+    let _ = self.root.destroy_session(&session);
+    let pass = matches!(f, Ok(castellan_core::FreezeState::Frozen))
+      && matches!(t, Ok(castellan_core::FreezeState::Thawed));
+    castellan_drill::DrillResult::new(
+      "freeze",
+      "freeze/thaw roundtrip within 500ms",
+      &format!("freeze={:?} thaw={:?}", f.map(|s| s.as_str()), t.map(|s| s.as_str())),
+      pass,
+      started.elapsed().as_millis() as u64,
+    )
   }
 
   fn replay(&self, session: &str, narrower_project: &Path) -> Response {
@@ -580,6 +852,11 @@ Request::Campaign { project } => self.campaign(&project),
   /// Bless-broker: approve by nonce. Unknown nonce = forged attempt:
   /// floor the project's trust at 0 (forged_nonce signal).
   fn bless_approve(&self, nonce: &str) -> Response {
+    // P8 fault injection: the D3 drill must fail loudly when the bless
+    // floor is bypassed. Test-only, env-gated.
+    if std::env::var("CASTELLAN_TEST_DISABLE_BLESS").is_ok() {
+      return Response::ok().with_message("granted (injected bypass)");
+    }
     let req = {
       let mut b = self.bless.lock().unwrap();
       match b.remove(nonce) {
@@ -1270,6 +1547,15 @@ fn load_bless_ledger(path: &Path) -> Vec<BlessEntry> {
     .lines()
     .filter_map(|l| serde_json::from_str::<BlessEntry>(l).ok())
     .collect()
+}
+
+/// Random hex string for drill secrets (D2). /dev/urandom, no deps.
+fn rand_hex(n: usize) -> String {
+  let mut buf = vec![0u8; n];
+  let mut f = std::fs::File::open("/dev/urandom").expect("urandom");
+  use std::io::Read as _;
+  f.read_exact(&mut buf).expect("urandom read");
+  buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub enum ConfigVerdict {

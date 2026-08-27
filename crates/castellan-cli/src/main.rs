@@ -34,6 +34,7 @@ fn main() {
     "campaign" => campaign_req(&args[1..]),
     "siblings" => siblings_req(),
     "drill" => drill_req(&args[1..]),
+    "memory" => memory_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -186,6 +187,23 @@ fn drill_req(args: &[String]) -> serde_json::Value {
     Some("status") | None => serde_json::json!({"op": "drill_status"}),
     Some(other) => {
       eprintln!("usage: castellan drill [run|status]");
+      std::process::exit(2);
+    }
+  }
+}
+
+fn memory_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("recall") => {
+      let Some(session) = args.get(1) else {
+        eprintln!("usage: castellan memory recall <session>");
+        std::process::exit(2);
+      };
+      serde_json::json!({"op": "memory_recall", "session": session})
+    }
+    Some("status") | None => serde_json::json!({"op": "memory_status"}),
+    Some(other) => {
+      eprintln!("usage: castellan memory [recall <session>|status]");
       std::process::exit(2);
     }
   }
@@ -701,6 +719,30 @@ fn render(line: &str) -> String {
           ));
         }
       }
+      if let Some(mem) = v.get("extra").and_then(|e| e.get("memory")) {
+        if let Some(recall) = mem.get("recall") {
+          if recall.is_null() {
+            out.push_str("memory: no recall (cold start, self, or below gate)\n");
+          } else {
+            let response = recall.get("response").and_then(|x| x.as_str()).unwrap_or("?");
+            let confidence = recall.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let self_match = recall.get("self_match").and_then(|x| x.as_bool()).unwrap_or(false);
+            let activations = recall.get("activations").and_then(|x| x.as_u64()).unwrap_or(0);
+            out.push_str(&format!(
+              "memory: recall {} (confidence {:.2}, {} activations{})\n",
+              response,
+              confidence,
+              activations,
+              if self_match { ", SELF" } else { "" }
+            ));
+          }
+        } else {
+          let iw = mem.get("incident_writes").and_then(|x| x.as_u64()).unwrap_or(0);
+          let sw = mem.get("self_writes").and_then(|x| x.as_u64()).unwrap_or(0);
+          let ss = mem.get("self_shapes").and_then(|x| x.as_u64()).unwrap_or(0);
+          out.push_str(&format!("memory: {iw} incident(s), {sw} self write(s), {ss} self shape(s)\n"));
+        }
+      }
       if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
         let undo = pf.get("undo").and_then(|x| x.as_bool()).unwrap_or(false);
         let net = pf.get("net").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -742,6 +784,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
   eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
+  eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

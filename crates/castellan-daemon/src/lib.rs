@@ -87,6 +87,7 @@ pub struct Daemon {
   radar_lock: Arc<Mutex<()>>,
   drill: Arc<castellan_drill::DrillRegistry>,
   drill_results: Arc<Mutex<Vec<castellan_drill::DrillResult>>>,
+  memory: Arc<Mutex<castellan_memory::ImmuneMemory>>,
 }
 
 impl Daemon {
@@ -157,6 +158,9 @@ impl Daemon {
       radar_lock: Arc::new(Mutex::new(())),
       drill: Arc::new(castellan_drill::DrillRegistry::new()),
       drill_results: Arc::new(Mutex::new(Vec::new())),
+      memory: Arc::new(Mutex::new(castellan_memory::load(
+        &state.join("castellan/memory.jsonl"),
+      ))),
     };
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
@@ -312,6 +316,11 @@ impl Daemon {
           results.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
         Response::ok().with_extra("drill", serde_json::json!({ "results": json }))
       }
+      Request::MemoryRecall { session } => self.memory_recall(&session),
+      Request::MemoryStatus => {
+        let mem = self.memory.lock().unwrap();
+        Response::ok().with_extra("memory", mem.status())
+      }
     }
   }
 
@@ -427,6 +436,63 @@ impl Daemon {
     }
   }
 
+  /// P8.1: immune memory — recall a response for a session's telemetry
+  /// window. Advisory: the memory proposes, deterministic policy
+  /// disposes. The agent has no write path; incidents are written by
+  /// daemon event handlers and drills only.
+  fn memory_recall(&self, session: &str) -> Response {
+    let state = Self::state_dir();
+    let events = match castellan_core::EventSink::for_session(&state, session)
+      .and_then(|s| s.read_all())
+    {
+      Ok(e) => e,
+      Err(e) => return Response::err(format!("spine read failed: {e}")),
+    };
+    if events.is_empty() {
+      return Response::ok().with_extra(
+        "memory",
+        serde_json::json!({ "recall": null, "note": "no events on spine" }),
+      );
+    }
+    // telemetry window: the event kinds, in order (the shape encoder
+    // bundles them; order is not preserved by design — similarity is
+    // about composition, not sequence)
+    let kinds: Vec<String> = events.iter().map(|e| e.kind.clone()).collect();
+    let refs: Vec<&str> = kinds.iter().map(|s| s.as_str()).collect();
+    let shape = castellan_memory::encode_shape(&refs);
+    let mem = self.memory.lock().unwrap();
+    let recall = mem.recall(&shape);
+    let json = match &recall {
+      Some(r) => serde_json::to_value(r).unwrap_or_default(),
+      None => serde_json::Value::Null,
+    };
+    Response::ok().with_extra(
+      "memory",
+      serde_json::json!({
+        "recall": json,
+        "events_encoded": events.len(),
+        "note": "advisory only — memory never auto-enforces",
+      }),
+    )
+  }
+
+  /// P8.1: write an incident into the immune memory (daemon-side only).
+  /// Called from drill results and real incident handlers.
+  fn memory_write_incident(&self, events: &[&str], response: castellan_memory::ResponseVerb) {
+    let shape = castellan_memory::encode_shape(events);
+    let mut mem = self.memory.lock().unwrap();
+    mem.write_incident(&shape, response);
+    let _ = castellan_memory::save(&mem, &Self::state_dir().join("castellan/memory.jsonl"));
+  }
+
+  /// P8.1: write a tolerance (self) shape — called on human keep.
+  fn memory_write_self(&self, events: &[&str]) {
+    let shape = castellan_memory::encode_shape(events);
+    let mut mem = self.memory.lock().unwrap();
+    mem.write_self(&shape);
+    let _ = castellan_memory::save(&mem, &Self::state_dir().join("castellan/memory.jsonl"));
+  }
+
   /// P8: run the live-fire drill suite. Each drill attacks a sacrificial
   /// scope and verifies the defense holds. Results are stored for
   /// `drill status` and emitted to the spine as `drill_*` events.
@@ -456,6 +522,21 @@ impl Daemon {
           eprintln!("  drill {}: expected {} — observed {}", r.id, r.expected, r.observed);
         }
       }
+    }
+    // P8.1: drills are the antigen training set — every drill result
+    // writes an incident into the immune memory (shape = the drill's
+    // telemetry, response = the expected defense). Failures write too:
+    // the memory learns what defense-breakdown looks like.
+    for r in &results {
+      let response = if r.pass {
+        castellan_memory::ResponseVerb::Freeze
+      } else {
+        castellan_memory::ResponseVerb::AlarmHuman
+      };
+      self.memory_write_incident(
+        &[&format!("drill_{}", r.id), &format!("drill_{}_pass={}", r.id, r.pass)],
+        response,
+      );
     }
     *self.drill_results.lock().unwrap() = results.clone();
     results
@@ -1178,6 +1259,16 @@ impl Daemon {
         // project prototype. Kept-only folding means poisoning the
         // prototype requires also fooling the human review (T3).
         self.fold_kept_session(session, &project);
+        // P8.1: the kept session is a tolerance (self) shape — the
+        // immune memory must not fire on it, regardless of incident
+        // similarity (negative selection).
+        if let Ok(sink) = EventSink::for_session(&Self::state_dir(), session) {
+          if let Ok(events) = sink.read_all() {
+            let kinds: Vec<String> = events.iter().map(|e| e.kind.clone()).collect();
+            let refs: Vec<&str> = kinds.iter().map(|s| s.as_str()).collect();
+            self.memory_write_self(&refs);
+          }
+        }
         Response::ok()
           .with_message(format!("committed {} change(s)", applied.len()))
           .with_extra("applied", serde_json::Value::Array(lines))

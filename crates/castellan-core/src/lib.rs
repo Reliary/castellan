@@ -194,6 +194,13 @@ pub enum Request {
   DrillRun,
   /// P8: report the last drill results.
   DrillStatus,
+  /// P8.1: immune memory — recall a response for a session's telemetry
+  /// window (advisory; the memory never auto-enforces).
+  MemoryRecall {
+    session: SessionId,
+  },
+  /// P8.1: immune memory — status (writes, activations, self shapes).
+  MemoryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

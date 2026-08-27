@@ -19,6 +19,7 @@ castellan-freezer = { path = "../castellan-freezer" }
 castellan-policy = { path = "../castellan-policy" }
 castellan-envelope = { path = "../castellan-envelope" }
 castellan-canary = { path = "../castellan-canary" }
+castellan-trust = { path = "../castellan-trust" }
 castellan-ledger = { path = "../castellan-ledger" }
 serde_json = { workspace = true }
 nix = { workspace = true }

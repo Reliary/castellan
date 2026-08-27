@@ -26,6 +26,7 @@ fn main() {
     "adopt" => adopt_req(&args[1..]),
     "diff" | "undo" | "keep" => undo_req(&args[1..], args[0].as_str()),
     "canary" => canary_req(&args[1..]),
+    "trust" => trust_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -80,6 +81,14 @@ fn canary_req(args: &[String]) -> serde_json::Value {
     std::process::exit(2);
   };
   serde_json::json!({"op": "canary_register", "session": id, "project": "", "harness": ""})
+}
+
+fn trust_req(args: &[String]) -> serde_json::Value {
+  let project = match args.first() {
+    Some(p) => std::path::PathBuf::from(p),
+    None => std::env::current_dir().unwrap_or_default(),
+  };
+  serde_json::json!({"op": "trust_score", "project": project})
 }
 
 fn launch(args: &[String], sock: &str) -> ! {

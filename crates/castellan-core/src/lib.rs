@@ -86,6 +86,17 @@ pub enum Request {
   },
   /// Return the daemon's honeypot port (0 if detached).
   HoneypotPort,
+  /// Query the trust score/tier for a project.
+  TrustScore {
+    project: PathBuf,
+  },
+  /// Apply a trust signal to a project.
+  TrustSignal {
+    project: PathBuf,
+    session: SessionId,
+    signal: String,
+    evidence: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

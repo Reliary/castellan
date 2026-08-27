@@ -46,7 +46,7 @@ Six phases. Each phase has a **kill criterion**: if the criterion fails, the pha
 
 ## Phase 2 — Surgical undo + canary credentials
 
-**Status: BUILT (undo core).** `castellan-ledger` crate: unprivileged overlayfs over the project in a user+mount namespace, upper-layer diff (creations/modifications/whiteout-deletions), discard (undo), and commit (keep). `castellan launch --undo -- cmd`; CLI verbs `diff|undo|keep <session>`. Acceptance 17/17 PASS: session writes fully invisible to the real project; diff names every change incl. deletions; discard restores exactly; commit materializes changes + deletions. P0/P1 regressions still 15/15 and 13/13. Remaining P2 scope: canary credentials + honeypot + egress proxy v0.
+**Status: BUILT.** `castellan-ledger` crate: unprivileged overlayfs over the project in a user+mountain namespace, upper-layer diff (creations/modifications/whiteout-deletions), discard (undo), and commit (keep). `castellan launch --undo -- cmd`; CLI verbs `diff|undo|keep <session>`. Acceptance 17/17 PASS: session writes fully invisible to the real project; diff names every change incl. deletions; discard restores exactly; commit materializes changes + deletions. P0/P1 regressions still 15/15 and 13/13. `castellan-canary` crate: plants fake AWS/GitHub/npm creds in session scratch, registers them with a localhost honeypot; any connection whose bytes contain a canary secret trips (logs canary_trip event, freezes the session via cgroup). Landlock ABI4 net rules kernel-deny all TCP connect except the honeypot port (port-scoped, not address-scoped — residual documented). `--net` launch flag wires the honeypot port into the envelope; `canary` CLI verb; daemon `canary_register`/`honeypot_port` ops. Verified live: plant → register → trip on secret use → event logged → session frozen. Remaining P2 scope: egress proxy v0 (local-only: blocks all real egress, only canary honeypot reachable).
 
 Kernel findings recorded during build:
 - Kernel 7.0.x DENIES self-written uid_map from inside a fresh userns (EPERM) — older kernels allowed it. Fix: a forked map-helper stays outside the ns and writes /proc/<pid>/uid_map for the session process.
@@ -57,7 +57,7 @@ Kernel findings recorded during build:
 
 **Deliverables:**
 - `castellan-ledger` crate (overlayfs mount in user namespace, upper enumeration, discard, commit) ✅
-- `castellan-canary` crate (credential planting, honeypot listener, trigger → freeze wiring)
+- `castellan-canary` crate (credential planting, honeypot listener, trigger → freeze wiring) ✅
 - egress proxy v0 (local-only: blocks all real egress, only canary honeypot reachable)
 
 **Kill criterion:** undo correctly reverses 100% of kernel-witnessed writes on 20 test sessions with concurrent user edits to unrelated files (no collateral damage). Canary trip rate is 0% on legit sessions, 100% on sessions that attempt to use a planted canary.

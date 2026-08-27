@@ -5,6 +5,7 @@ use castellan_core::{
 use castellan_envelope::{AuditWatcher, Snapshot};
 use castellan_freezer::CgroupRoot;
 use castellan_policy::Policy;
+use castellan_trust::{Signal, TrustDb, TrustEvent};
 use rustc_hash::FxHashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,12 +29,44 @@ pub struct Daemon {
   audits: Arc<Mutex<FxHashMap<SessionId, SessionAudit>>>,
   notes: Arc<Mutex<FxHashMap<SessionId, SessionNotes>>>,
   honeypot: Arc<castellan_canary::Honeypot>,
+  trust: Arc<Mutex<TrustDb>>,
 }
 
 impl Daemon {
   pub fn new() -> std::io::Result<Self> {
     let state = Self::state_dir();
-    let honeypot = match castellan_canary::Honeypot::start(&state) {
+    let trust = match TrustDb::open(&state) {
+      Ok(t) => Arc::new(Mutex::new(t)),
+      Err(e) => {
+        eprintln!("castellan-daemon: trust.db unavailable ({e}) — trust scoring disabled");
+        return Err(std::io::Error::other(format!("trust.db open failed: {e}")));
+      }
+    };
+    let registry: Arc<Mutex<Registry>> = Arc::new(Mutex::new(Registry::default()));
+    let trust_cb = Arc::clone(&trust);
+    let reg_cb = Arc::clone(&registry);
+    let honeypot = match castellan_canary::Honeypot::start_with_callback(
+      &state,
+      Arc::new(move |session: &str| {
+        // canary hit: apply the negative trust signal to the session's project
+        let project = reg_cb
+          .lock()
+          .unwrap()
+          .get(&session.to_string())
+          .map(|s| s.project.clone())
+          .unwrap_or_else(|| PathBuf::from("/"));
+        let mut db = trust_cb.lock().unwrap();
+        let _ = db.apply(
+          &project,
+          &TrustEvent {
+            ts: castellan_core::now_unix(),
+            session: session.to_string(),
+            signal: Signal::CanaryHit,
+            evidence: "canary credential used against honeypot".into(),
+          },
+        );
+      }),
+    ) {
       Ok(h) => {
         eprintln!("castellan-daemon canary honeypot on 127.0.0.1:{}", h.port);
         Arc::new(h)
@@ -46,10 +79,11 @@ impl Daemon {
     };
     Ok(Self {
       root: Arc::new(CgroupRoot::detect()?),
-      registry: Arc::new(Mutex::new(Registry::default())),
+      registry,
       audits: Arc::new(Mutex::new(FxHashMap::default())),
       notes: Arc::new(Mutex::new(FxHashMap::default())),
       honeypot,
+      trust,
     })
   }
 
@@ -128,6 +162,56 @@ impl Daemon {
       Request::HoneypotPort => {
         Response::ok().with_extra("port", serde_json::json!(self.honeypot.port))
       }
+      Request::TrustScore { project } => self.trust_score(&project),
+      Request::TrustSignal { project, session, signal, evidence } => {
+        self.trust_signal(&project, &session, &signal, &evidence)
+      }
+    }
+  }
+
+  fn trust_score(&self, project: &Path) -> Response {
+    let db = self.trust.lock().unwrap();
+    match db.score(project) {
+      Ok(t) => Response::ok().with_extra(
+        "trust",
+        serde_json::json!({
+          "score": t.score,
+          "tier": t.tier.as_str(),
+          "last_event_ts": t.last_event_ts,
+        }),
+      ),
+      Err(e) => Response::err(format!("trust query failed: {e}")),
+    }
+  }
+
+  fn trust_signal(&self, project: &Path, session: &str, signal: &str, evidence: &str) -> Response {
+    let sig = match signal {
+      "proof_passed" => Signal::ProofPassed,
+      "clean_session" => Signal::CleanSession,
+      "user_revert" => Signal::UserRevert,
+      "envelope_escape" => Signal::EnvelopeEscape,
+      "canary_hit" => Signal::CanaryHit,
+      "audit_mismatch" => Signal::AuditMismatch,
+      "forged_nonce" => Signal::ForgedNonce,
+      other => return Response::err(format!("unknown signal: {other}")),
+    };
+    let ev = TrustEvent {
+      ts: castellan_core::now_unix(),
+      session: session.to_string(),
+      signal: sig,
+      evidence: evidence.to_string(),
+    };
+    let mut db = self.trust.lock().unwrap();
+    match db.apply(project, &ev) {
+      Ok(t) => Response::ok().with_extra(
+        "trust",
+        serde_json::json!({
+          "score": t.score,
+          "tier": t.tier.as_str(),
+          "last_event_ts": t.last_event_ts,
+        }),
+      ),
+      Err(e) => Response::err(format!("trust apply failed: {e}")),
     }
   }
 
@@ -208,9 +292,28 @@ impl Daemon {
     if !self.freeze(Some(&session.to_string()), true).ok {
       eprintln!("freeze-before-undo failed");
     }
+    let project = {
+      let reg = self.registry.lock().unwrap();
+      reg.get(&session.to_string()).map(|s| s.project.clone())
+    };
     let _ = self.kill(Some(&session.to_string()));
     match castellan_ledger::discard(&upper, &work) {
-      Ok(()) => Response::ok().with_message("discarded"),
+      Ok(()) => {
+        // user reverted the session: negative trust signal
+        if let Some(project) = project {
+          let mut db = self.trust.lock().unwrap();
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: session.to_string(),
+              signal: Signal::UserRevert,
+              evidence: "user invoked castellan undo".into(),
+            },
+          );
+        }
+        Response::ok().with_message("discarded")
+      }
       Err(e) => Response::err(format!("discard failed: {e}")),
     }
   }
@@ -244,6 +347,17 @@ impl Daemon {
     match castellan_ledger::commit(&project, &upper) {
       Ok(applied) => {
         let _ = castellan_ledger::discard(&upper, &work);
+        // user kept the session: positive trust signal
+        let mut db = self.trust.lock().unwrap();
+        let _ = db.apply(
+          &project,
+          &TrustEvent {
+            ts: castellan_core::now_unix(),
+            session: session.to_string(),
+            signal: Signal::CleanSession,
+            evidence: format!("user kept session; {} change(s) committed", applied.len()),
+          },
+        );
         let lines: Vec<serde_json::Value> =
           applied.iter().map(|l| serde_json::Value::String(l.clone())).collect();
         Response::ok()

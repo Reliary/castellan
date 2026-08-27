@@ -12,6 +12,10 @@ pub struct CanarySecret {
   pub session: String,
 }
 
+/// Called when a canary credential is used against the honeypot.
+/// The daemon uses this to apply the canary_hit trust signal.
+pub type TripCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Files planted into the session's canary dir. The agent can read them
 /// (read roots are broad); using any value against the honeypot trips.
 pub struct Planted {
@@ -82,12 +86,18 @@ type Registry = Arc<Mutex<HashMap<String, String>>>;
 pub struct Honeypot {
   pub port: u16,
   secrets: Registry,
+  #[allow(dead_code)]
+  on_trip: TripCallback,
 }
 
 impl Honeypot {
   /// Bind on a kernel-assigned port and start the accept thread.
   /// Returns immediately; the thread runs for the daemon's lifetime.
   pub fn start(state_home: &Path) -> io::Result<Self> {
+    Self::start_with_callback(state_home, Arc::new(|_| {}))
+  }
+
+  pub fn start_with_callback(state_home: &Path, on_trip: TripCallback) -> io::Result<Self> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let secrets: Registry = Arc::new(Mutex::new(HashMap::new()));
@@ -96,22 +106,27 @@ impl Honeypot {
 
     let reg = Arc::clone(&secrets);
     let sink_dir_thread = sink_dir.clone();
+    let cb = Arc::clone(&on_trip);
     std::thread::Builder::new().name("honeypot".into()).spawn(move || {
       for stream in listener.incoming() {
         match stream {
-          Ok(s) => handle_conn(s, &reg, &sink_dir_thread),
+          Ok(s) => handle_conn(s, &reg, &sink_dir_thread, &cb),
           Err(_) => continue,
         }
       }
     })?;
 
-    Ok(Self { port, secrets })
+    Ok(Self { port, secrets, on_trip })
   }
 
   /// Fallback when binding fails: no port, registrations accepted but
   /// inert (no trip detection).
   pub fn detached() -> Self {
-    Self { port: 0, secrets: Arc::new(Mutex::new(HashMap::new())) }
+    Self {
+      port: 0,
+      secrets: Arc::new(Mutex::new(HashMap::new())),
+      on_trip: Arc::new(|_| {}),
+    }
   }
 
   pub fn register(&self, secret: &CanarySecret) {
@@ -124,7 +139,7 @@ impl Honeypot {
   }
 }
 
-fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path) {
+fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path, on_trip: &TripCallback) {
   let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
   let mut buf = vec![0u8; 8192];
   let mut total = Vec::new();
@@ -155,6 +170,7 @@ fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path) {
     );
     log_trip(state_home, &session, &secret);
     freeze_session(&session);
+    on_trip(&session);
     let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
   }
 }

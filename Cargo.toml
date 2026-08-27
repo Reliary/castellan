@@ -8,6 +8,7 @@ members = [
   "crates/castellan-ledger",
   "crates/castellan-canary",
   "crates/castellan-trust",
+  "crates/castellan-proof",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

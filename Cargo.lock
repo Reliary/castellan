@@ -71,10 +71,12 @@ dependencies = [
  "castellan-freezer",
  "castellan-ledger",
  "castellan-policy",
+ "castellan-proof",
  "castellan-trust",
  "nix",
  "rustc-hash",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -114,6 +116,15 @@ dependencies = [
  "castellan-core",
  "rustc-hash",
  "toml",
+]
+
+[[package]]
+name = "castellan-proof"
+version = "0.1.0"
+dependencies = [
+ "castellan-core",
+ "castellan-ledger",
+ "serde",
 ]
 
 [[package]]

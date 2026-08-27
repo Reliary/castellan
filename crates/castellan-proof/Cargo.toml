@@ -1,0 +1,11 @@
+[package]
+name = "castellan-proof"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Placebo-controlled proof pipeline: danger signal + guard-insertion proof."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+castellan-ledger = { path = "../castellan-ledger" }
+serde = { version = "1", features = ["derive"] }

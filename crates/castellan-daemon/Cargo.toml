@@ -20,7 +20,9 @@ castellan-policy = { path = "../castellan-policy" }
 castellan-envelope = { path = "../castellan-envelope" }
 castellan-canary = { path = "../castellan-canary" }
 castellan-trust = { path = "../castellan-trust" }
+castellan-proof = { path = "../castellan-proof" }
 castellan-ledger = { path = "../castellan-ledger" }
+toml = "0.8"
 serde_json = { workspace = true }
 nix = { workspace = true }
 rustc-hash = { workspace = true }

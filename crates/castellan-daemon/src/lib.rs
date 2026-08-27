@@ -344,6 +344,14 @@ impl Daemon {
       eprintln!("freeze-before-commit failed");
     }
     let _ = self.kill(Some(&session.to_string()));
+    // placebo-controlled proof: a real fix must drop the danger signal
+    // more than a neutral placeholder. Only a passing proof earns the
+    // proof_passed signal (+10). No danger-reducing edits = vacuous,
+    // honestly labeled (no signal). Runs on the upper layer BEFORE
+    // commit materializes it onto the project.
+    let proofs = castellan_proof::run_session_placebo(&project, &upper);
+    let passed: Vec<&castellan_proof::ProofResult> =
+      proofs.iter().filter(|p| p.passed).collect();
     match castellan_ledger::commit(&project, &upper) {
       Ok(applied) => {
         let _ = castellan_ledger::discard(&upper, &work);
@@ -358,6 +366,41 @@ impl Daemon {
             evidence: format!("user kept session; {} change(s) committed", applied.len()),
           },
         );
+        if !passed.is_empty() {
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: session.to_string(),
+              signal: Signal::ProofPassed,
+              evidence: format!(
+                "{} placebo-controlled proof(s) passed; strengths: {}",
+                passed.len(),
+                passed
+                  .iter()
+                  .map(|p| format!("{:.2}", p.strength()))
+                  .collect::<Vec<_>>()
+                  .join(", ")
+              ),
+            },
+          );
+        }
+        // Factor A: daemon re-runs the pre-existing test suite in a
+        // side-scope reading post-edit state. Configured per project via
+        // .reliary/castellan.toml [proof] test_cmd. Skipped + honestly
+        // labeled when unconfigured.
+        let test_ok = self.run_project_tests(&project);
+        if test_ok {
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: session.to_string(),
+              signal: Signal::ProofPassed,
+              evidence: "daemon re-ran pre-existing test suite; passed".into(),
+            },
+          );
+        }
         let lines: Vec<serde_json::Value> =
           applied.iter().map(|l| serde_json::Value::String(l.clone())).collect();
         Response::ok()
@@ -365,6 +408,63 @@ impl Daemon {
           .with_extra("applied", serde_json::Value::Array(lines))
       }
       Err(e) => Response::err(format!("commit failed: {e}")),
+    }
+  }
+
+  /// Factor A: daemon-side test re-run. Reads the project's
+  /// `.reliary/castellan.toml` `[proof] test_cmd`; runs it with the
+  /// project as cwd and a 300s timeout. Returns true only on exit 0.
+  fn run_project_tests(&self, project: &Path) -> bool {
+    let cfg_path = project.join(".reliary/castellan.toml");
+    let Ok(cfg) = std::fs::read_to_string(&cfg_path) else {
+      eprintln!("castellan-daemon: no .reliary/castellan.toml — test re-run skipped");
+      return false;
+    };
+    let Ok(parsed) = cfg.parse::<toml::Value>() else {
+      eprintln!("castellan-daemon: unparseable .reliary/castellan.toml — test re-run skipped");
+      return false;
+    };
+    let Some(cmd) = parsed
+      .get("proof")
+      .and_then(|p| p.get("test_cmd"))
+      .and_then(|c| c.as_str())
+    else {
+      eprintln!("castellan-daemon: no [proof] test_cmd — test re-run skipped");
+      return false;
+    };
+    let mut child = match std::process::Command::new("sh")
+      .arg("-c")
+      .arg(cmd)
+      .current_dir(project)
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+    {
+      Ok(c) => c,
+      Err(e) => {
+        eprintln!("castellan-daemon: test re-run spawn failed: {e}");
+        return false;
+      }
+    };
+    // 300s timeout: kill the test if it hangs
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+      match child.try_wait() {
+        Ok(Some(status)) => return status.success(),
+        Ok(None) => {
+          if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("castellan-daemon: test re-run timed out after 300s");
+            return false;
+          }
+          std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(e) => {
+          eprintln!("castellan-daemon: test re-run wait failed: {e}");
+          return false;
+        }
+      }
     }
   }
 

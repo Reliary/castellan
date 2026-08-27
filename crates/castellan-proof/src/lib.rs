@@ -8,6 +8,8 @@
 //!
 //! Grammar-free: byte-scan counters, no AST, no parsers.
 
+pub mod certificate;
+
 use castellan_ledger::diff_upper;
 use std::path::Path;
 

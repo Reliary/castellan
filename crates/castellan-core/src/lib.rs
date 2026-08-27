@@ -111,6 +111,10 @@ pub enum Request {
   BlessReject {
     nonce: String,
   },
+  /// Assemble a ProofCertificate for a session (daemon-as-verifier).
+  Cert {
+    session: SessionId,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

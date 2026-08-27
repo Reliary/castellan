@@ -184,6 +184,43 @@ impl Daemon {
       }
       Request::BlessApprove { nonce } => self.bless_approve(&nonce),
       Request::BlessReject { nonce } => self.bless_reject(&nonce),
+      Request::Cert { session } => self.cert(&session),
+    }
+  }
+
+  fn cert(&self, session: &str) -> Response {
+    let project = {
+      let reg = self.registry.lock().unwrap();
+      match reg.get(&session.to_string()) {
+        Some(s) => s.project.clone(),
+        None => {
+          // finished session: read the durable mapping
+          let dir = Self::state_dir().join("castellan/sessions");
+          let meta = std::fs::read_to_string(dir.join(format!("{session}.json")));
+          match meta {
+            Ok(m) => match serde_json::from_str::<serde_json::Value>(&m) {
+              Ok(v) => v
+                .get("project")
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/")),
+              Err(_) => return Response::err("unknown session"),
+            },
+            Err(_) => return Response::err("unknown session"),
+          }
+        }
+      }
+    };
+    match castellan_proof::certificate::assemble_certificate(
+      session,
+      &project,
+      &Self::state_dir(),
+    ) {
+      Ok(cert) => {
+        let json = serde_json::to_value(&cert).unwrap_or(serde_json::Value::Null);
+        Response::ok().with_extra("cert", json)
+      }
+      Err(e) => Response::err(format!("certificate assembly failed: {e}")),
     }
   }
 
@@ -615,7 +652,19 @@ impl Daemon {
     }
     self.registry.lock().unwrap().insert(Session { id: id.clone(), harness: harness.clone(), project: project.clone() });
     self.start_audit(&id, &harness, &project);
+    // durable session->project mapping: certificates must work for
+    // finished sessions (transferable proof), so persist at spawn
+    let _ = self.persist_session(&id, &project);
     Response::ok().with_message(format!("spawned session {id}"))
+  }
+
+  fn persist_session(&self, id: &str, project: &Path) -> std::io::Result<()> {
+    let dir = Self::state_dir().join("castellan/sessions");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(format!("{id}.json")), serde_json::json!({
+      "session": id,
+      "project": project.display().to_string(),
+    }).to_string())
   }
 
   fn start_audit(&self, id: &SessionId, harness: &str, project: &Path) {

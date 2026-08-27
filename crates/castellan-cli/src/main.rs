@@ -28,6 +28,7 @@ fn main() {
     "canary" => canary_req(&args[1..]),
     "trust" => trust_req(&args[1..]),
     "bless" => bless_req(&args[1..]),
+    "cert" => cert_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -90,6 +91,14 @@ fn trust_req(args: &[String]) -> serde_json::Value {
     None => std::env::current_dir().unwrap_or_default(),
   };
   serde_json::json!({"op": "trust_score", "project": project})
+}
+
+fn cert_req(args: &[String]) -> serde_json::Value {
+  let Some(session) = args.first() else {
+    eprintln!("usage: castellan cert <session>");
+    std::process::exit(2);
+  };
+  serde_json::json!({"op": "cert", "session": session})
 }
 
 fn bless_req(args: &[String]) -> serde_json::Value {
@@ -478,6 +487,17 @@ fn render(line: &str) -> String {
           out.push_str(&format!("approved: {approved}\n"));
         }
       }
+      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
+        let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
+        let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
+        let oob = cert.get("bounds").and_then(|b| b.get("out_of_bounds_attempts")).and_then(|x| x.as_u64()).unwrap_or(0);
+        let placebo = cert.get("placebo").and_then(|p| p.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
+        let proofs = cert.get("placebo").and_then(|p| p.get("proofs_passed")).and_then(|x| x.as_u64()).unwrap_or(0);
+        let tests = cert.get("placebo").and_then(|p| p.get("test_rerun_passed")).and_then(|x| x.as_bool()).unwrap_or(false);
+        out.push_str(&format!("quality: {label}\n"));
+        out.push_str(&format!("bounds: {bounds} ({} out-of-bounds)\n", oob));
+        out.push_str(&format!("placebo: {placebo} ({} proofs, tests {})\n", proofs, if tests { "pass" } else { "n/a" }));
+      }
       out
     }
     Err(_) => format!("raw: {line}\n"),
@@ -499,6 +519,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan bless request --session S --want W [--reason R]");
   eprintln!("  castellan bless approve <nonce>   approve an expansion (human only)");
   eprintln!("  castellan bless reject <nonce>    reject an expansion");
+  eprintln!("  castellan cert <session>          assemble a ProofCertificate");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

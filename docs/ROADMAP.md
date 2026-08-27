@@ -71,11 +71,11 @@ Kernel findings recorded during build:
 **Scope:** trust scoring engine (cortex-rs tier-promotion, no time-decay — half-life is KILLed), negative-dominant signals (revert, envelope-escape-attempt, canary-hit), placebo-controlled positive signal (proof-fixes methodology, daemon-re-run tests), trust gates ONLY expansion (egress unlock, config-dir writes via bless-broker). Cold start at tier 2 (full-auto within workspace, no expansion).
 
 **Deliverables:**
-- `castellan-trust` crate (EWMA, tier mapping, single-writer trust.db)
-- placebo-proof pipeline (daemon test re-run, danger-signal comparison)
-- bless-broker v1 (nonce-gated, rate-limited, fp-toggle biometric for high-risk)
+- `castellan-trust` crate (EWMA, tier mapping, single-writer trust.db) ✅
+- placebo-proof pipeline (daemon test re-run, danger-signal comparison) ✅
+- bless-broker v1 (nonce-gated, rate-limited, fp-toggle biometric for high-risk) ✅ (v1 records approval; envelope re-mint + restart is P4)
 
-**Kill criterion:** monotonic relationship between trust tier and user-revert outcomes on a labelled corpus (sessions the user reverted should cluster at lower tiers than sessions the user kept). If no monotonic relationship, trust is demoted to advisory-only (expansion gates stay at manual approval, no auto-tiering).
+**Kill criterion:** monotonic relationship between trust tier and user-revert outcomes on a labelled corpus (sessions the user reverted should cluster at lower tiers than sessions the user kept). If no monotonic relationship, trust is demoted to advisory-only (expansion gates stay at manual approval, no auto-tiering). **Status: engine + signals built and verified live; the labelled-corpus benchmark is the remaining gate.**
 
 **Dependencies:** Phase 2 (undo for revert signal, canary for negative signal), Phase 1 (envelope for escape-attempt signal).
 

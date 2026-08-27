@@ -27,6 +27,7 @@ fn main() {
     "diff" | "undo" | "keep" => undo_req(&args[1..], args[0].as_str()),
     "canary" => canary_req(&args[1..]),
     "trust" => trust_req(&args[1..]),
+    "bless" => bless_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -89,6 +90,67 @@ fn trust_req(args: &[String]) -> serde_json::Value {
     None => std::env::current_dir().unwrap_or_default(),
   };
   serde_json::json!({"op": "trust_score", "project": project})
+}
+
+fn bless_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("request") => {
+      let mut session = String::new();
+      let mut want = String::new();
+      let mut reason = String::new();
+      let mut i = 1;
+      while i < args.len() {
+        match args[i].as_str() {
+          "--session" | "-s" => {
+            if i + 1 < args.len() {
+              session = args[i + 1].clone();
+              i += 1;
+            }
+          }
+          "--want" | "-w" => {
+            if i + 1 < args.len() {
+              want = args[i + 1].clone();
+              i += 1;
+            }
+          }
+          "--reason" | "-r" => {
+            if i + 1 < args.len() {
+              reason = args[i + 1].clone();
+              i += 1;
+            }
+          }
+          other => {
+            eprintln!("unexpected bless request argument: {other}");
+            std::process::exit(2);
+          }
+        }
+        i += 1;
+      }
+      if session.is_empty() || want.is_empty() {
+        eprintln!("usage: castellan bless request --session <id> --want <egress|config-dir|system-config> [--reason ...]");
+        std::process::exit(2);
+      }
+      serde_json::json!({"op": "bless_request", "session": session, "want": want, "reason": reason})
+    }
+    Some("approve") => {
+      let Some(nonce) = args.get(1) else {
+        eprintln!("usage: castellan bless approve <nonce>");
+        std::process::exit(2);
+      };
+      serde_json::json!({"op": "bless_approve", "nonce": nonce})
+    }
+    Some("reject") => {
+      let Some(nonce) = args.get(1) else {
+        eprintln!("usage: castellan bless reject <nonce>");
+        std::process::exit(2);
+      };
+      serde_json::json!({"op": "bless_reject", "nonce": nonce})
+    }
+    _ => {
+      eprintln!("usage: castellan bless <request|approve|reject> ...");
+      std::process::exit(2);
+    }
+  }
 }
 
 fn launch(args: &[String], sock: &str) -> ! {
@@ -399,6 +461,23 @@ fn render(line: &str) -> String {
           out.push_str(&format!("{}\n", a.as_str().unwrap_or("?")));
         }
       }
+      if let Some(bless) = v.get("extra").and_then(|e| e.get("bless")) {
+        if let Some(nonce) = bless.get("nonce").and_then(|n| n.as_str()) {
+          out.push_str(&format!("nonce: {nonce}\n"));
+        }
+        if let Some(want) = bless.get("want").and_then(|w| w.as_str()) {
+          out.push_str(&format!("want: {want}\n"));
+        }
+        if let Some(session) = bless.get("session").and_then(|s| s.as_str()) {
+          out.push_str(&format!("session: {session}\n"));
+        }
+        if let Some(note) = bless.get("note").and_then(|n| n.as_str()) {
+          out.push_str(&format!("note: {note}\n"));
+        }
+        if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
+          out.push_str(&format!("approved: {approved}\n"));
+        }
+      }
       out
     }
     Err(_) => format!("raw: {line}\n"),
@@ -417,6 +496,9 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan launch [--harness H] [--project P] [--enforce] -- CMD [args...]");
   eprintln!("  castellan audit <session>     show envelope violations for a session");
   eprintln!("  castellan adopt <session> <pid> [pid...]   move running procs into a scope");
+  eprintln!("  castellan bless request --session S --want W [--reason R]");
+  eprintln!("  castellan bless approve <nonce>   approve an expansion (human only)");
+  eprintln!("  castellan bless reject <nonce>    reject an expansion");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

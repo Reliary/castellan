@@ -22,6 +22,17 @@ struct SessionNotes {
   undo_upper: Option<PathBuf>,
 }
 
+/// A pending bless-broker expansion request.
+#[derive(Debug, Clone)]
+struct BlessRequest {
+  session: SessionId,
+  project: PathBuf,
+  want: String,
+  #[allow(dead_code)]
+  reason: String,
+  created_ts: u64,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
   root: Arc<CgroupRoot>,
@@ -30,6 +41,7 @@ pub struct Daemon {
   notes: Arc<Mutex<FxHashMap<SessionId, SessionNotes>>>,
   honeypot: Arc<castellan_canary::Honeypot>,
   trust: Arc<Mutex<TrustDb>>,
+  bless: Arc<Mutex<FxHashMap<String, BlessRequest>>>,
 }
 
 impl Daemon {
@@ -84,6 +96,7 @@ impl Daemon {
       notes: Arc::new(Mutex::new(FxHashMap::default())),
       honeypot,
       trust,
+      bless: Arc::new(Mutex::new(FxHashMap::default())),
     })
   }
 
@@ -166,6 +179,11 @@ impl Daemon {
       Request::TrustSignal { project, session, signal, evidence } => {
         self.trust_signal(&project, &session, &signal, &evidence)
       }
+      Request::BlessRequest { session, want, reason } => {
+        self.bless_request(&session, &want, &reason)
+      }
+      Request::BlessApprove { nonce } => self.bless_approve(&nonce),
+      Request::BlessReject { nonce } => self.bless_reject(&nonce),
     }
   }
 
@@ -212,6 +230,122 @@ impl Daemon {
         }),
       ),
       Err(e) => Response::err(format!("trust apply failed: {e}")),
+    }
+  }
+
+  /// Bless-broker: register an expansion request. The nonce is returned
+  /// to the CALLER (the human's terminal), never to the agent's env.
+  /// Rate limits: 3/session, 10/project/day, 5min cooling-off.
+  fn bless_request(&self, session: &str, want: &str, reason: &str) -> Response {
+    let now = castellan_core::now_unix();
+    let project = {
+      let reg = self.registry.lock().unwrap();
+      match reg.get(&session.to_string()) {
+        Some(s) => s.project.clone(),
+        None => return Response::err("unknown session"),
+      }
+    };
+    // per-session cap: 3
+    let session_count = {
+      let b = self.bless.lock().unwrap();
+      b.values().filter(|r| r.session == session).count()
+    };
+    if session_count >= 3 {
+      return Response::err("expansion limit reached (3 per session)");
+    }
+    // per-project daily cap: 10
+    let day = now / 86_400;
+    let project_count = {
+      let b = self.bless.lock().unwrap();
+      b.values()
+        .filter(|r| r.project == project && r.created_ts / 86_400 == day)
+        .count()
+    };
+    if project_count >= 10 {
+      return Response::err("expansion limit reached (10 per project per day)");
+    }
+    // cooling-off: 5 minutes between expansions for this session
+    let last_ts = {
+      let b = self.bless.lock().unwrap();
+      b.values()
+        .filter(|r| r.session == session)
+        .map(|r| r.created_ts)
+        .max()
+        .unwrap_or(0)
+    };
+    if now - last_ts < 300 {
+      return Response::err("cooling-off period active (5 minutes between expansions)");
+    }
+    let nonce = castellan_core::new_bless_nonce();
+    let req = BlessRequest {
+      session: session.to_string(),
+      project,
+      want: want.to_string(),
+      reason: reason.to_string(),
+      created_ts: now,
+    };
+    self.bless.lock().unwrap().insert(nonce.clone(), req);
+    Response::ok().with_extra(
+      "bless",
+      serde_json::json!({
+        "nonce": nonce,
+        "want": want,
+        "session": session,
+        "note": "nonce is for the human operator only — never pass it to the agent",
+      }),
+    )
+  }
+
+  /// Bless-broker: approve by nonce. Unknown nonce = forged attempt:
+  /// floor the project's trust at 0 (forged_nonce signal).
+  fn bless_approve(&self, nonce: &str) -> Response {
+    let req = {
+      let mut b = self.bless.lock().unwrap();
+      match b.remove(nonce) {
+        Some(r) => r,
+        None => {
+          // forged nonce: floor the project's trust at 0
+          let project = self
+            .registry
+            .lock()
+            .unwrap()
+            .values()
+            .find(|s| s.id == nonce)
+            .map(|s| s.project.clone())
+            .unwrap_or_else(|| PathBuf::from("/"));
+          let mut db = self.trust.lock().unwrap();
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: "bless".into(),
+              signal: Signal::ForgedNonce,
+              evidence: format!("approve with unknown nonce {nonce}"),
+            },
+          );
+          return Response::err("unknown nonce — approval forged?");
+        }
+      }
+    };
+    // v1: approval is recorded; the restart-with-wider-envelope
+    // orchestration is a follow-up (documented in bless-broker.md).
+    Response::ok().with_extra(
+      "bless",
+      serde_json::json!({
+        "approved": true,
+        "session": req.session,
+        "want": req.want,
+        "note": "v1 records approval; envelope re-mint + restart is P4",
+      }),
+    )
+  }
+
+  fn bless_reject(&self, nonce: &str) -> Response {
+    let removed = self.bless.lock().unwrap().remove(nonce).is_some();
+    if removed {
+      Response::ok().with_message("rejected")
+    } else {
+      Response::err("unknown nonce")
     }
   }
 

@@ -31,6 +31,7 @@ fn main() {
     "cert" => cert_req(&args[1..]),
     "replay" => replay_req(&args[1..]),
     "radar" => radar_req(&args[1..]),
+    "campaign" => campaign_req(&args[1..]),
     "siblings" => siblings_req(),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
@@ -122,6 +123,14 @@ fn radar_req(args: &[String]) -> serde_json::Value {
     None => std::env::current_dir().unwrap_or_default(),
   };
   serde_json::json!({"op": "radar", "session": session, "project": project})
+}
+
+fn campaign_req(args: &[String]) -> serde_json::Value {
+  let project = match args.first() {
+    Some(p) => std::path::PathBuf::from(p),
+    None => std::env::current_dir().unwrap_or_default(),
+  };
+  serde_json::json!({"op": "campaign", "project": project})
 }
 
 /// N5: sibling detector — scan for known harness processes running
@@ -650,6 +659,21 @@ fn render(line: &str) -> String {
           events,
           if anomaly { "ANOMALY (advisory)" } else { "normal" }
         ));
+      }
+      if let Some(cp) = v.get("extra").and_then(|e| e.get("campaign")) {
+        let scanned = cp.get("sessions_scanned").and_then(|x| x.as_u64()).unwrap_or(0);
+        let campaigns = cp.get("campaigns").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        out.push_str(&format!("campaign: {} session(s) scanned, {} campaign(s)\n", scanned, campaigns.len()));
+        for c in campaigns {
+          let start = c.get("start_ts").and_then(|x| x.as_u64()).unwrap_or(0);
+          let end = c.get("end_ts").and_then(|x| x.as_u64()).unwrap_or(0);
+          let sessions = c.get("sessions").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
+          let sig = c.get("dominant_signal").and_then(|x| x.as_str()).unwrap_or("?");
+          let sev = c.get("severity").and_then(|x| x.as_str()).unwrap_or("?");
+          out.push_str(&format!(
+            "  campaign {start}..{end}: {sessions} session(s), dominant={sig}, severity={sev}\n"
+          ));
+        }
       }
       if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {
         let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);

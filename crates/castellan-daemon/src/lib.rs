@@ -284,6 +284,7 @@ impl Daemon {
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
       Request::Radar { session, project } => self.radar(&session, &project),
 Request::Siblings => self.siblings(),
+Request::Campaign { project } => self.campaign(&project),
     }
   }
 
@@ -382,6 +383,21 @@ Request::Siblings => self.siblings(),
     Response::ok()
       .with_message(format!("{} untagged harness process(es)", found.len()))
       .with_extra("siblings", serde_json::json!({ "untagged": found }))
+  }
+
+  /// N1: campaign detector — cross-session slow-drip attack detection
+  /// over the project's trust-event stream. Advisory (silent tier):
+  /// reports campaign windows, never freezes.
+  fn campaign(&self, project: &Path) -> Response {
+    match castellan_campaign::detect_campaigns(project, &Self::state_dir()) {
+      Ok(report) => {
+        let json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+        Response::ok()
+          .with_message(format!("{} campaign(s) detected", report.campaigns.len()))
+          .with_extra("campaign", json)
+      }
+      Err(e) => Response::err(format!("campaign detection failed: {e}")),
+    }
   }
 
   fn replay(&self, session: &str, narrower_project: &Path) -> Response {

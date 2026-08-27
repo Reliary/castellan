@@ -185,6 +185,11 @@ pub enum Request {
   /// N5: sibling detector — report known harness processes running
   /// without the CASTELLAN_SESSION tag (advisory).
   Siblings,
+  /// N1: campaign detector — cross-session slow-drip attack detection
+  /// over the project's trust-event stream (advisory, silent tier).
+  Campaign {
+    project: PathBuf,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

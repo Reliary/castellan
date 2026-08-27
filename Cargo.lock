@@ -30,6 +30,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "castellan-campaign"
+version = "0.1.0"
+dependencies = [
+ "castellan-core",
+ "castellan-trust",
+ "serde",
+]
+
+[[package]]
 name = "castellan-canary"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +75,7 @@ dependencies = [
 name = "castellan-daemon"
 version = "0.1.0"
 dependencies = [
+ "castellan-campaign",
  "castellan-canary",
  "castellan-core",
  "castellan-envelope",

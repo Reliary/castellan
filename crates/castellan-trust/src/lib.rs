@@ -234,7 +234,7 @@ fn tier_floor(t: Tier) -> f64 {
   }
 }
 
-fn signal_from_str(s: &str) -> Signal {
+pub fn signal_from_str(s: &str) -> Signal {
   match s {
     "proof_passed" => Signal::ProofPassed,
     "clean_session" => Signal::CleanSession,

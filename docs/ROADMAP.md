@@ -81,7 +81,7 @@ Kernel findings recorded during build:
 
 **Estimated effort:** 2 weeks. proof-fixes + cert-evals are owned; the wiring is new.
 
-## Phase 4 — Proof-carrying sessions (the novel core)
+## Phase 4 — Proof-carrying sessions (the composition core)
 
 **Scope:** ProofCertificate generation (daemon-as-verifier, from kernel-witnessed state), certificate schema (bounds-stayed, validation-paths-preserved via relay-vuln, completeness-preserved via seq-engine/config-radar, placebo-tests-passed), evidence-pack export, deterministic replay via llm-replay + spec-exec (forensic, permissive-case delta + max-strict re-exec, coverage % reported honestly).
 
@@ -96,7 +96,7 @@ Kernel findings recorded during build:
 
 **Estimated effort:** 3 weeks. relay-vuln is substantial but built; the wiring + certificate schema is the new work.
 
-**Upstream shape:** this is the novel contribution. Standalone first; upstream proposal as a follow-up once benchmarks pass.
+**Upstream shape:** this is the composition contribution (see [PRIOR_ART.md](PRIOR_ART.md) — the individual primitives are crowded; the one-daemon composition across all harnesses is unbuilt as of Aug 2026). Standalone first; upstream proposal as a follow-up once benchmarks pass.
 
 ## Phase 5 — Opt-in analysis + fleet
 

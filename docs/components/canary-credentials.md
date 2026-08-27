@@ -4,7 +4,7 @@ Fake credentials planted in the envelope, wired to a localhost honeypot listener
 
 ## The inversion
 
-Normal honeypots: plant a fake, watch for someone using it. The agent can probe before using, so a naive honeypot has a safe-probe path.
+Normal honeypots: plant a fake, watch for someone using it. The agent can probe before using, so a naive honeypot has a safe-probe path. (Prior art: Thinkst Canarytokens ships AI Agent Guardrail Triggers and an MCP token — alert-only tripwires, no auto-freeze. AWS injects synthetic honeypot cases that trigger demotion. Neither wires canaries into an OS envelope with auto-freeze — see PRIOR_ART.md.)
 
 Castellan's inversion: real credentials never enter the envelope (commitment #4). Every credential the agent can read is a canary by definition. The agent cannot distinguish "real key" from "canary" by reading — both look like valid-format keys. The only way to test if a key is real is to use it, and using it IS the trigger.
 

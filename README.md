@@ -4,7 +4,7 @@
 
 Castellan is a Linux-native agent safety system that confines, observes, and proves what AI coding agents do on your machine — at the kernel level, where prompt injection cannot reach. It is being designed as a contribution to [Omarchy](https://github.com/basecamp/omarchy) (DHH's Arch + Hyprland distro), but the core is reusable on any systemd + Landlock Linux.
 
-> **Status: early, working.** Two phases are implemented and acceptance-tested on Linux 7.x / Landlock ABI 8: session substrate + freeze (P0) and the envelope floor with audit + enforce launch (P1). Undo, earned autonomy, and proof-carrying sessions are designed but not built. Every claim below is scoped accordingly; see [docs/ROADMAP.md](docs/ROADMAP.md) for phase status and [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for how claims get earned.
+> **Status: working.** P0–P4 are implemented and acceptance-tested on Linux 7.x / Landlock ABI 8: session substrate + freeze (P0), the envelope floor with audit + enforce launch (P1), surgical undo + canary credentials (P2), earned autonomy (trust engine + placebo-proof pipeline + bless-broker, P3), and proof-carrying sessions (certificate assembly + kill-criterion benchmarks, P4). P5 (HV radar, engfield, sentinel) is designed but not built. Every claim below is scoped accordingly; see [docs/ROADMAP.md](docs/ROADMAP.md) for phase status, [docs/PRIOR_ART.md](docs/PRIOR_ART.md) for what already exists elsewhere, and [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for how claims get earned.
 
 ## The problem in one sentence
 
@@ -21,11 +21,15 @@ Shipped:
 1. **Kernel walls** — `castellan launch --enforce -- claude ...` confines the session via Landlock + seccomp before any agent code runs: writes limited to project + harness state + scratch, hard-deny for `~/.ssh`, systemd units, autostart, shell rcs, `/etc` `/usr` `/boot`; ptrace/process_vm/io_uring/module syscalls return EPERM. Verified: workspace work (git included) runs clean under enforce; home-dir escapes get EACCES.
 2. **Panic button** — every launched or adopted session lives in its own cgroup scope. `castellan freeze` stops all sessions at once: zero CPU, no userspace execution until thaw. (Kernel 7.x note: SIGKILL still kills frozen processes — freeze stops computation, it does not shield against external kill.)
 3. **Security camera** — default mode is audit: sessions run unrestricted while every file write is classified into `events.jsonl` as allowed or would-deny (`castellan audit <session>`). Harness-state folders are fingerprinted at spawn and diffed at exit, so a poisoned skill or hook gets flagged. This produces the false-block-rate data that decides whether enforce becomes the default.
+4. **Surgical undo** — per-session rollback via overlayfs upper layer (`castellan launch --undo`), so one bad agent doesn't force a whole-disk rollback. `castellan diff/undo/keep` shows, discards, or commits the session's changes.
+5. **Canary credentials** — fake credentials planted in the envelope, wired to a localhost honeypot. Using a canary IS the trigger: trip → event logged + session frozen. Egress lockdown (Landlock ABI 4 net rules) denies all TCP connect except the honeypot port.
+6. **Earned autonomy** — per-project trust score (EWMA, tiers 0–4) fed by kernel-witnessed signals: placebo-controlled proof (+10, the only positive signal), clean session (+1), user revert (−30), envelope escape (−20), canary hit (−50), forged bless nonce (floor 0). Expansion beyond the workspace is gated by the bless-broker (nonce-gated, rate-limited).
+7. **Proof-carrying sessions** — `castellan cert <session>` assembles a ProofCertificate from kernel-witnessed state: bounds proof (event spine), placebo + test evidence (trust ledger, session-scoped). Quality labels STRONG/MODERATE/WEAK/NON-EVIDENTIAL. Kill-criterion benchmarks pass: 0/20 known-bad FN, 0/20 known-good FN, monotonic tier↔revert (ρ=0.900).
 
 Designed, not built yet:
 
-4. **Surgical undo** — per-session rollback via overlayfs upper layer, so one bad agent doesn't force a whole-disk rollback.
-5. **Earned autonomy + proof-carrying sessions** — expansion beyond the workspace gated by placebo-controlled evidence rather than self-reported test results.
+8. **Forensic replay** — action-stream extraction from harness JSONL, overlayfs shadow execution, diff.
+9. **HV radar + fleet sync** — opt-in hypervector fingerprints, ed25519-signed, synced via Omarchy's usage-sync-folder.
 
 ## Why this fits Omarchy
 
@@ -33,7 +37,7 @@ Omarchy already treats agents as first-class (launchers, agents panel, crash dia
 
 ## What we bring
 
-No moat, no secrecy: everything here is buildable by anyone willing to write the kernel plumbing — Landlock and cgroups are documented Linux features, and nothing in this repo is protected. What we have is momentum and inventory: the observation/proof layers are accelerated by internal primitives already built and benchmarked elsewhere in our repos (grammar-free fingerprinting, deterministic replay, placebo-controlled eval methodology, HDC memory) — see [docs/PRIMITIVES.md](docs/PRIMITIVES.md) for the full list with honest verdicts, including which ones died in testing. The kernel-enforcement layer contains zero borrowed magic; it is plain documented syscall work that anyone can replicate.
+No moat, no secrecy: everything here is buildable by anyone willing to write the kernel plumbing — Landlock and cgroups are documented Linux features, and nothing in this repo is protected. The individual primitives are all crowded (see [docs/PRIOR_ART.md](docs/PRIOR_ART.md) for the dated survey: Codex/Claude/Gemini sandboxes, AWS graduated autonomy, Thinkst canaries, overlayfs undo tools). What is unbuilt as of Aug 2026 is the **composition** — one OS-owned daemon applying envelope + freeze + undo + canaries + trust + approval + certificates across all harnesses simultaneously — plus the **placebo-controlled proof** as the only positive trust signal, and the **desktop-native unprivileged** form factor. What we have is momentum and inventory: the observation/proof layers are accelerated by internal primitives already built and benchmarked elsewhere in our repos (grammar-free fingerprinting, deterministic replay, placebo-controlled eval methodology, HDC memory) — see [docs/PRIMITIVES.md](docs/PRIMITIVES.md) for the full list with honest verdicts, including which ones died in testing. The kernel-enforcement layer contains zero borrowed magic; it is plain documented syscall work that anyone can replicate.
 
 ## Repo layout
 

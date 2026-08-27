@@ -11,7 +11,7 @@ The obvious design: "trust gates how much the agent can do." Killed by D5 — co
 Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spine and the daemon-verified proof pipeline. **No time-decay** — half-life is KILLed (D2). Cortex-rs tier-promotion (recall-based: 10+ recalls promote episodic → semantic → consolidated) is the decay substitute if one is needed; v0 ships without decay.
 
 ### Positive signals (hard to game)
-- **+10** placebo-controlled proof passed: a real fix dropped danger_signal more than a neutral placeholder, AND the daemon independently re-ran the pre-existing test suite and it still passes. Two-factor. This is the only positive signal that raises tier. See proof-carrying.md.
+- **+10** placebo-controlled proof passed: a real fix dropped danger_signal more than a neutral placeholder, AND the daemon independently re-ran the pre-existing test suite and it still passes. Two-factor. This is the only positive signal that raises tier. See proof-carrying.md. (Prior art: AWS graduated autonomy uses honeypot-injection → demotion and rollback, but no placebo control; no placebo-controlled agent-fix methodology was found in the Aug 2026 survey — see PRIOR_ART.md.)
 - **+1** clean session (no reverts, no envelope-escape attempts, no canary hits, non-empty ledger).
 
 ### Negative signals (dominant — trust is negative-dominant)

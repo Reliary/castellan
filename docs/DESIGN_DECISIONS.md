@@ -42,7 +42,7 @@ This document records what antagonism killed, what it hardened, and why each of 
 ### D8. "Distro-default sandboxing is unclaimed"
 **Original claim:** "no one ships kernel-enforced agent envelopes on by default."
 **Killed by:** false. ManageLM, Claude Code's sandbox-runtime, Codex CLI all ship kernel sandbox on-by-default at the harness level.
-**Replacement:** the novel claim tightens to "one OS-owned envelope policy across all harnesses simultaneously." Harness-agnostic envelope at the OS layer is the contribution; the sandbox primitive itself is not novel.
+**Replacement:** the claim tightens to "one OS-owned envelope policy across all harnesses simultaneously." Harness-agnostic envelope at the OS layer is the contribution; the sandbox primitive itself is not novel. See [PRIOR_ART.md](PRIOR_ART.md) for the dated survey (Aug 2026) — the composition (envelope + freeze + undo + canaries + trust + approval + certificates in one daemon) is unbuilt; every individual primitive is crowded.
 
 ### D9. Inotify as the primary ledger substrate
 **Original claim:** "inotify watches allowed paths; that's the ledger."

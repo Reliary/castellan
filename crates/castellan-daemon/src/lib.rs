@@ -283,6 +283,7 @@ impl Daemon {
       Request::Cert { session } => self.cert(&session),
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
       Request::Radar { session, project } => self.radar(&session, &project),
+Request::Siblings => self.siblings(),
     }
   }
 
@@ -308,13 +309,79 @@ impl Daemon {
       Err(_) => castellan_radar::Prototype::empty(),
     };
     let report = castellan_radar::radar_report(session, &hv, &prototype, events_encoded);
+    // N3: prototypes fold ONLY on keep (undo_commit) — human-validated
+    // sessions. Folding here would let an attacker session poison the
+    // shared prototype so legit sessions flag (T3).
+    let json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    Response::ok().with_extra("radar", json)
+  }
+
+  /// N3: fold a session's HV into the project prototype. Called only
+  /// from undo_commit (user kept the session). Serialized with the
+  /// radar_lock to keep the read-fold-write cycle atomic.
+  fn fold_kept_session(&self, session: &str, project: &Path) {
+    let _guard = self.radar_lock.lock().unwrap();
+    let state = Self::state_dir();
+    let Ok(hv) = castellan_radar::encode_session_from_spine(session, &state) else {
+      return;
+    };
+    let proto_path = state
+      .join("castellan/radar")
+      .join(format!("{}.bin", castellan_radar::project_hash(project)));
+    let mut prototype = match std::fs::read(&proto_path) {
+      Ok(bytes) => castellan_radar::Prototype::from_bytes(&bytes),
+      Err(_) => castellan_radar::Prototype::empty(),
+    };
     prototype.fold(&hv);
     if let Some(dir) = proto_path.parent() {
       let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&proto_path, prototype.to_bytes());
-    let json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
-    Response::ok().with_extra("radar", json)
+  }
+
+  /// N5: sibling detector — scan /proc for known harness processes
+  /// running without the CASTELLAN_SESSION tag. Advisory: detects the
+  /// boundary violation (T5), cannot prevent it.
+  fn siblings(&self) -> Response {
+    let harnesses = ["claude", "codex", "pi", "opencode", "aider", "cursor-agent", "gemini", "crush"];
+    let mut found: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+      for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid: u32 = match name.to_string_lossy().parse() {
+          Ok(p) => p,
+          Err(_) => continue,
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+          continue;
+        };
+        let argv: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+        let Some(prog) = argv.first() else { continue };
+        let prog = String::from_utf8_lossy(prog);
+        let base = std::path::Path::new(prog.as_ref())
+          .file_name()
+          .map(|f| f.to_string_lossy().to_string())
+          .unwrap_or_default();
+        if !harnesses.contains(&base.as_str()) {
+          continue;
+        }
+        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+          continue;
+        };
+        let tagged = environ
+          .split(|&b| b == 0)
+          .any(|kv| kv.starts_with(b"CASTELLAN_SESSION="));
+        if !tagged {
+          found.push(serde_json::json!({
+            "pid": pid,
+            "harness": base,
+          }));
+        }
+      }
+    }
+    Response::ok()
+      .with_message(format!("{} untagged harness process(es)", found.len()))
+      .with_extra("siblings", serde_json::json!({ "untagged": found }))
   }
 
   fn replay(&self, session: &str, narrower_project: &Path) -> Response {
@@ -814,6 +881,10 @@ impl Daemon {
         }
         let lines: Vec<serde_json::Value> =
           applied.iter().map(|l| serde_json::Value::String(l.clone())).collect();
+        // N3: the user kept this session — fold its HV into the
+        // project prototype. Kept-only folding means poisoning the
+        // prototype requires also fooling the human review (T3).
+        self.fold_kept_session(session, &project);
         Response::ok()
           .with_message(format!("committed {} change(s)", applied.len()))
           .with_extra("applied", serde_json::Value::Array(lines))

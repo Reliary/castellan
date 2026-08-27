@@ -53,6 +53,30 @@ pub struct SessionReport {
   pub pids: usize,
 }
 
+/// N2: two-tier response routing. Low-confidence signals (radar drift,
+/// would_deny in audit mode) log silently — freezing on them would
+/// teach the attacker the detection rules (T2) and freeze legit
+/// sessions on novel-but-benign behavior. High-confidence signals
+/// (canary trip, hard-deny write, cgroup membership drift) freeze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseTier {
+  /// Log to the spine only. Never freezes.
+  Silent,
+  /// Freeze the session (kernel-enforced pause).
+  Freeze,
+}
+
+/// The routing table. Add a signal here when wiring a new detector;
+/// the default for anything not listed is Silent (fail-open on
+/// detection, fail-closed on enforcement).
+pub fn response_tier(signal: &str) -> ResponseTier {
+  match signal {
+    "canary_trip" | "hard_deny" | "membership_drift" => ResponseTier::Freeze,
+    _ => ResponseTier::Silent,
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -158,6 +182,9 @@ pub enum Request {
     session: SessionId,
     project: PathBuf,
   },
+  /// N5: sibling detector — report known harness processes running
+  /// without the CASTELLAN_SESSION tag (advisory).
+  Siblings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,4 +394,28 @@ pub fn project_key(realpath: &Path) -> String {
   let canon = realpath.canonicalize().unwrap_or_else(|_| realpath.to_path_buf());
   let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
   digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn high_confidence_signals_freeze() {
+    assert_eq!(response_tier("canary_trip"), ResponseTier::Freeze);
+    assert_eq!(response_tier("hard_deny"), ResponseTier::Freeze);
+    assert_eq!(response_tier("membership_drift"), ResponseTier::Freeze);
+  }
+
+  #[test]
+  fn low_confidence_signals_are_silent() {
+    assert_eq!(response_tier("radar_anomaly"), ResponseTier::Silent);
+    assert_eq!(response_tier("would_deny"), ResponseTier::Silent);
+    assert_eq!(response_tier("harness_drift"), ResponseTier::Silent);
+  }
+
+  #[test]
+  fn unknown_signals_default_to_silent() {
+    assert_eq!(response_tier("something_new"), ResponseTier::Silent);
+  }
 }

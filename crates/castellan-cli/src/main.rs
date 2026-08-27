@@ -31,6 +31,7 @@ fn main() {
     "cert" => cert_req(&args[1..]),
     "replay" => replay_req(&args[1..]),
     "radar" => radar_req(&args[1..]),
+    "siblings" => siblings_req(),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -121,6 +122,52 @@ fn radar_req(args: &[String]) -> serde_json::Value {
     None => std::env::current_dir().unwrap_or_default(),
   };
   serde_json::json!({"op": "radar", "session": session, "project": project})
+}
+
+/// N5: sibling detector — scan for known harness processes running
+/// WITHOUT the CASTELLAN_SESSION tag. Advisory: any process not
+/// launched via castellan can read trust.db, the spine, and the
+/// signing key; this detects the boundary violation, it cannot
+/// prevent it.
+fn siblings_req() -> serde_json::Value {
+  let harnesses = ["claude", "codex", "pi", "opencode", "aider", "cursor-agent", "gemini", "crush"];
+  let mut found: Vec<serde_json::Value> = Vec::new();
+  if let Ok(entries) = std::fs::read_dir("/proc") {
+    for entry in entries.flatten() {
+      let name = entry.file_name();
+      let pid: u32 = match name.to_string_lossy().parse() {
+        Ok(p) => p,
+        Err(_) => continue,
+      };
+      let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        continue;
+      };
+      let argv: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+      let Some(prog) = argv.first() else { continue };
+      let prog = String::from_utf8_lossy(prog);
+      let base = std::path::Path::new(prog.as_ref())
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+      if !harnesses.contains(&base.as_str()) {
+        continue;
+      }
+      let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        continue;
+      };
+      let tagged = environ
+        .split(|&b| b == 0)
+        .any(|kv| kv.starts_with(b"CASTELLAN_SESSION="));
+      if !tagged {
+        found.push(serde_json::json!({
+          "pid": pid,
+          "harness": base,
+          "tagged": false,
+        }));
+      }
+    }
+  }
+  serde_json::json!({"op": "siblings", "found": found})
 }
 
 fn replay_req(args: &[String]) -> serde_json::Value {
@@ -266,6 +313,11 @@ fn launch(args: &[String], sock: &str) -> ! {
     eprintln!("launch failed: {resp}");
     std::process::exit(1);
   });
+  // N5: tag the launched process so the sibling detector can tell
+  // castellan-wrapped harnesses from unenrolled ones.
+  unsafe {
+    std::env::set_var("CASTELLAN_SESSION", &session);
+  }
   // trust floor coupling: the daemon may have forced flags regardless
   // of what the launcher requested (tiers 0-1 run fail-closed unless a
   // human grant was consumed)

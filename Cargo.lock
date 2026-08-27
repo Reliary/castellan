@@ -165,6 +165,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "castellan-pharmaco"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "castellan-policy"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,9 @@
+[package]
+name = "castellan-pharmaco"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P8.4 pharmacovigilance for agent fleets: PRR/ROR/EBGM signal detection on trust-event streams."
+
+[dependencies]
+serde = { workspace = true }

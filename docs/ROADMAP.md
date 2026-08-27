@@ -73,9 +73,10 @@ Kernel findings recorded during build:
 **Deliverables:**
 - `castellan-trust` crate (EWMA, tier mapping, single-writer trust.db) ✅
 - placebo-proof pipeline (daemon test re-run, danger-signal comparison) ✅
-- bless-broker v1 (nonce-gated, rate-limited, fp-toggle biometric for high-risk) ✅ (v1 records approval; envelope re-mint + restart is P4)
+- bless-broker v1 (nonce-gated, rate-limited, fp-toggle biometric for high-risk) ✅
+- trust floor coupling ✅ — spawn consults the tier: tiers 0–1 fail-closed (enforce+undo+net forced, launcher flags ignored), consumed bless grants override the floor one-shot. Verified live (cdb419d).
 
-**Kill criterion:** monotonic relationship between trust tier and user-revert outcomes on a labelled corpus (sessions the user reverted should cluster at lower tiers than sessions the user kept). If no monotonic relationship, trust is demoted to advisory-only (expansion gates stay at manual approval, no auto-tiering). **Status: engine + signals built and verified live; the labelled-corpus benchmark is the remaining gate.**
+**Kill criterion:** monotonic relationship between trust tier and user-revert outcomes on a labelled corpus (sessions the user reverted should cluster at lower tiers than sessions the user kept). If no monotonic relationship, trust is demoted to advisory-only (expansion gates stay at manual approval, no auto-tiering). **Status: PASSES — ρ=0.900 on the 40-session labelled corpus (f60e999). The corpus is signal-simulated (real agent sessions remain a follow-up); the coupling that makes the tier load-bearing is shipped (cdb419d).**
 
 **Dependencies:** Phase 2 (undo for revert signal, canary for negative signal), Phase 1 (envelope for escape-attempt signal).
 

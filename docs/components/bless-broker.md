@@ -54,4 +54,4 @@ Each request includes a quale risk card (advisory): hub-risk of the paths this e
 
 ## Status
 
-Greenfield (dbus nonce flow, restart orchestration). Phase 3.
+Approval ledger + rate limits + daemon-side one-shot grants are shipped and verified live (`cdb419d`): a grant is consumed at spawn, keyed `project:want`, in-memory only (the agent cannot forge a grant without the daemon), and overrides the trust tier floor for that expansion. The dbus notification flow and the mid-session envelope re-mint (kill → relaunch same session id in a wider domain) remain designed, not built. Landlock cannot be loosened mid-session, so the current semantics are "grant the next launch," not "widen this session."

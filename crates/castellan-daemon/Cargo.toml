@@ -26,6 +26,7 @@ castellan-radar = { path = "../castellan-radar" }
 castellan-campaign = { path = "../castellan-campaign" }
 castellan-drill = { path = "../castellan-drill" }
 castellan-memory = { path = "../castellan-memory" }
+castellan-voice = { path = "../castellan-voice" }
 castellan-ledger = { path = "../castellan-ledger" }
 sha2 = "0.10"
 toml = "0.8"

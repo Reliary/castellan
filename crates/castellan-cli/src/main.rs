@@ -35,6 +35,7 @@ fn main() {
     "siblings" => siblings_req(),
     "drill" => drill_req(&args[1..]),
     "memory" => memory_req(&args[1..]),
+    "voice" => voice_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -207,6 +208,26 @@ fn memory_req(args: &[String]) -> serde_json::Value {
       std::process::exit(2);
     }
   }
+}
+
+fn voice_req(args: &[String]) -> serde_json::Value {
+  let Some(sub) = args.first().map(|s| s.as_str()) else {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  };
+  if sub != "approve" {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  }
+  let Some(session) = args.get(1) else {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  };
+  let Some(utterance) = args.get(2) else {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  };
+  serde_json::json!({"op": "voice_approve", "session": session, "utterance": utterance})
 }
 
 fn replay_req(args: &[String]) -> serde_json::Value {
@@ -653,6 +674,12 @@ fn render(line: &str) -> String {
         if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
           out.push_str(&format!("approved: {approved}\n"));
         }
+        if let Some(channel) = bless.get("channel").and_then(|c| c.as_str()) {
+          out.push_str(&format!("channel: {channel}\n"));
+        }
+        if let Some(attempts) = bless.get("attempts_left").and_then(|a| a.as_u64()) {
+          out.push_str(&format!("attempts_left: {attempts}\n"));
+        }
       }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
         let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
         let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
@@ -785,6 +812,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
   eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
+  eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

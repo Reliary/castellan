@@ -201,6 +201,14 @@ pub enum Request {
   },
   /// P8.1: immune memory — status (writes, activations, self shapes).
   MemoryStatus,
+  /// P8.3: acoustic channel — approve a pending bless request by
+  /// spoken nonce. The utterance is the STT-transcribed human voice
+  /// (or the typed fallback); the daemon matches it against the
+  /// voice session's nonce under the constrained grammar.
+  VoiceApprove {
+    session: SessionId,
+    utterance: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -88,6 +88,7 @@ pub struct Daemon {
   drill: Arc<castellan_drill::DrillRegistry>,
   drill_results: Arc<Mutex<Vec<castellan_drill::DrillResult>>>,
   memory: Arc<Mutex<castellan_memory::ImmuneMemory>>,
+  voice: Arc<Mutex<FxHashMap<String, castellan_voice::VoiceSession>>>,
 }
 
 impl Daemon {
@@ -161,6 +162,7 @@ impl Daemon {
       memory: Arc::new(Mutex::new(castellan_memory::load(
         &state.join("castellan/memory.jsonl"),
       ))),
+      voice: Arc::new(Mutex::new(FxHashMap::default())),
     };
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
@@ -321,6 +323,7 @@ impl Daemon {
         let mem = self.memory.lock().unwrap();
         Response::ok().with_extra("memory", mem.status())
       }
+      Request::VoiceApprove { session, utterance } => self.voice_approve(&session, &utterance),
     }
   }
 
@@ -911,6 +914,12 @@ impl Daemon {
       created_ts: now,
     };
     self.bless.lock().unwrap().insert(nonce.clone(), req);
+    // P8.3: every bless request also creates a voice session — the
+    // acoustic channel's nonce is independent of the terminal nonce
+    // (the human speaks the voice nonce; the terminal nonce stays a
+    // fallback). The voice nonce is spoken by the daemon, never
+    // printed to the agent's environment.
+    self.voice.lock().unwrap().insert(session.to_string(), castellan_voice::VoiceSession::new());
     self.append_bless_ledger(BlessEntry {
       ts: now,
       kind: BlessKind::Requested,
@@ -928,6 +937,98 @@ impl Daemon {
         "note": "nonce is for the human operator only — never pass it to the agent",
       }),
     )
+  }
+
+  /// P8.3: acoustic channel — process a spoken (or typed-fallback)
+  /// utterance against the session's voice nonce. On match, the
+  /// pending bless request is approved (grant recorded daemon-side).
+  /// The utterance is the STT transcription of the human's voice —
+  /// the agent cannot speak (kernel-verified: /dev/snd writes are
+  /// denied under the envelope), so this channel is human-exclusive.
+  fn voice_approve(&self, session: &str, utterance: &str) -> Response {
+    let mut voice = self.voice.lock().unwrap();
+    let Some(vs) = voice.get_mut(session) else {
+      return Response::err("no voice session for this session — request a bless first");
+    };
+    let state = vs.process(utterance);
+    match state {
+      castellan_voice::VoiceState::Panic => {
+        // the panic phrase triggers the kill switch, NOT a grant.
+        // Freeze all sessions + census; the human can thaw.
+        let targets = self.resolve_targets(None);
+        let mut frozen = 0usize;
+        for id in &targets {
+          if let Ok(castellan_core::FreezeState::Frozen) = self.root.set_freeze(id, true) {
+            frozen += 1;
+          }
+        }
+        Response::ok().with_extra(
+          "bless",
+          serde_json::json!({
+            "panic": true,
+            "frozen": frozen,
+            "note": "panic phrase — all sessions frozen; thaw with castellan thaw",
+          }),
+        )
+      }
+      castellan_voice::VoiceState::Authorized => {
+        // find the pending bless request for this session
+        let req = {
+          let mut b = self.bless.lock().unwrap();
+          let found = b
+            .iter()
+            .find(|(_, r)| r.session == session)
+            .map(|(k, r)| (k.clone(), r.clone()));
+          if let Some((k, _)) = &found {
+            b.remove(k);
+          }
+          found.map(|(_, r)| r)
+        };
+        let Some(req) = req else {
+          return Response::err("no pending bless request for this session");
+        };
+        self.append_bless_ledger(BlessEntry {
+          ts: castellan_core::now_unix(),
+          kind: BlessKind::Approved,
+          session: req.session.clone(),
+          project: req.project.clone(),
+          want: req.want.clone(),
+          nonce_hint: "voice".into(),
+        });
+        self.grants.lock().unwrap().insert(
+          format!("{}:{}", req.project.display(), req.want),
+          Grant {
+            session: req.session.clone(),
+            want: req.want.clone(),
+            granted_ts: castellan_core::now_unix(),
+          },
+        );
+        Response::ok().with_extra(
+          "bless",
+          serde_json::json!({
+            "approved": true,
+            "channel": "voice",
+            "session": req.session,
+            "want": req.want,
+            "note": "grant recorded daemon-side; consumed on next launch",
+          }),
+        )
+      }
+      castellan_voice::VoiceState::Rejected => {
+        Response::err("voice approval rejected (attempts exhausted)")
+      }
+      castellan_voice::VoiceState::Awaiting => {
+        Response::ok().with_extra(
+          "bless",
+          serde_json::json!({
+            "approved": false,
+            "channel": "voice",
+            "attempts_left": vs.attempts_left,
+            "note": "utterance did not match — try again",
+          }),
+        )
+      }
+    }
   }
 
   /// Bless-broker: approve by nonce. Unknown nonce = forged attempt:

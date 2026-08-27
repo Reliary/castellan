@@ -1,0 +1,9 @@
+[package]
+name = "castellan-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P8.3 acoustic channel: kernel-enforced human exclusivity for high-stakes ops."
+
+[dependencies]
+serde = { workspace = true }

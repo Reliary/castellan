@@ -14,6 +14,7 @@ members = [
   "crates/castellan-campaign",
   "crates/castellan-drill",
   "crates/castellan-memory",
+  "crates/castellan-voice",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

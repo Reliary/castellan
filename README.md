@@ -23,13 +23,14 @@ Shipped:
 3. **Security camera** — default mode is audit: sessions run unrestricted while every file write is classified into `events.jsonl` as allowed or would-deny (`castellan audit <session>`). Harness-state folders are fingerprinted at spawn and diffed at exit, so a poisoned skill or hook gets flagged. This produces the false-block-rate data that decides whether enforce becomes the default.
 4. **Surgical undo** — per-session rollback via overlayfs upper layer (`castellan launch --undo`), so one bad agent doesn't force a whole-disk rollback. `castellan diff/undo/keep` shows, discards, or commits the session's changes.
 5. **Canary credentials** — fake credentials planted in the envelope, wired to a localhost honeypot. Using a canary IS the trigger: trip → event logged + session frozen. Egress lockdown (Landlock ABI 4 net rules) denies all TCP connect except the honeypot port.
-6. **Earned autonomy** — per-project trust score (EWMA, tiers 0–4) fed by kernel-witnessed signals: placebo-controlled proof (+10, the only positive signal), clean session (+1), user revert (−30), envelope escape (−20), canary hit (−50), forged bless nonce (floor 0). Expansion beyond the workspace is gated by the bless-broker (nonce-gated, rate-limited).
+6. **Earned autonomy** — per-project trust score (EWMA, tiers 0–4) fed by kernel-witnessed signals: placebo-controlled proof (+10, the only positive signal), clean session (+1), user revert (−30), envelope escape (−20), canary hit (−50). Bless-broker v1 records nonce-gated, rate-limited expansion approvals in a durable ledger. **Honest status:** the score is computed and persisted, but no envelope decision consults it yet — coupling trust tiers to launch-time envelope width is designed, not built. Forged-nonce attempts are recorded and alerted (floor-at-zero applies only when the attempt is attributable to a session's project).
 7. **Proof-carrying sessions** — `castellan cert <session>` assembles a ProofCertificate from kernel-witnessed state: bounds proof (event spine), placebo + test evidence (trust ledger, session-scoped). Quality labels STRONG/MODERATE/WEAK/NON-EVIDENTIAL. Kill-criterion benchmarks pass: 0/20 known-bad FN, 0/20 known-good FN, monotonic tier↔revert (ρ=0.900).
+8. **Forensic replay** — `castellan replay <session> <narrower-project>` re-classifies the recorded event spine against an alternate envelope (static re-classification, never re-execution) and reports the permissive-case delta: writes the original envelope allowed that a narrower one would deny.
 
 Designed, not built yet:
 
-8. **Forensic replay** — action-stream extraction from harness JSONL, overlayfs shadow execution, diff.
-9. **HV radar + fleet sync** — opt-in hypervector fingerprints, ed25519-signed, synced via Omarchy's usage-sync-folder.
+9. **HV fleet sync** — ed25519-signed cross-machine prototype exchange via Omarchy's usage-sync-folder (local outlier detection is shipped and live-verified; see `castellan radar`).
+10. **Trust→envelope coupling** — launch consulting the tier to pick envelope width; bless approvals triggering envelope re-mint + restart.
 
 ## Why this fits Omarchy
 

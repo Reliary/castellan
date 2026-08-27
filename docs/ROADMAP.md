@@ -84,10 +84,10 @@ Kernel findings recorded during build:
 
 ## Phase 4 — Proof-carrying sessions (the composition core)
 
-**Scope:** ProofCertificate generation (daemon-as-verifier, from kernel-witnessed state), certificate schema (bounds-stayed, validation-paths-preserved via relay-vuln, completeness-preserved via seq-engine/config-radar, placebo-tests-passed), evidence-pack export, deterministic replay via llm-replay + spec-exec (forensic, permissive-case delta + max-strict re-exec, coverage % reported honestly).
+**Scope:** ProofCertificate generation (daemon-as-verifier, from kernel-witnessed state), certificate schema (bounds-stayed, validation-paths-preserved via relay-vuln, completeness-preserved via config-radar, placebo-tests-passed), evidence-pack export, deterministic replay via llm-replay + spec-exec (forensic, permissive-case delta + max-strict re-exec, coverage % reported honestly).
 
 **Deliverables:**
-- `castellan-proof` crate (certificate assembly, relay-vuln + seq-engine + config-radar integration)
+- `castellan-proof` crate (certificate assembly, relay-vuln + config-radar integration)
 - `castellan-replay` crate (action-stream extraction from harness JSONL, overlayfs shadow execution, diff)
 - evidence-pack integration (STRONG/MODERATE/WEAK/NON-EVIDENTIAL labels)
 

@@ -11,7 +11,7 @@ castellan/
 │   ├── castellan-undo/             3-way merge, freeze-before-undo, pinned GC
 │   ├── castellan-trust/            EWMA, tier mapping, placebo-proof ingest, single-writer trust.db (rusqlite bundled)
 │   ├── castellan-proof/            ProofCertificate assembly + export (was evidence-pack), placebo pipeline (was proof-fixes), relay-vuln + config-radar wiring
-│   ├── castellan-completeness/     expected-pair + drift/R0 completeness (was seq-engine), config key audit (was config-radar)
+│   ├── castellan-completeness/     config key audit (was config-radar). seq-engine KILLed 2026-08-27 — see PRIMITIVES.md
 │   ├── castellan-replay/           action-stream extraction, overlayfs shadow execution, permissive-case diff
 │   ├── castellan-egress/           HTTP proxy, real-cred injection, canary honeypot listener
 │   ├── castellan-canary/           credential planting, honeypot trigger → freeze wiring
@@ -53,7 +53,7 @@ castellan-cli → castellan-daemon → {castellan-envelope, castellan-freezer, c
                                      castellan-radar, castellan-bless, castellan-watch}
                                   → castellan-core
 castellan-trust → castellan-proof (positive signal), castellan-ledger (events), castellan-core
-castellan-proof → relay-vuln (Rust crate, opt-in), seq-engine (Rust crate), config-radar (Rust crate), castellan-ledger
+castellan-proof → relay-vuln (Rust crate, opt-in), config-radar (Rust crate), castellan-ledger
 castellan-radar → sensor-hdc (Rust crate, vendored), castellan-core
 castellan-watch → skein (Rust crate), carrion (Rust crate)
 ```
@@ -76,9 +76,10 @@ This mirrors the project directive: "relay must be pure Rust (no Python runtime)
 | agent-audit-trail | 109 | castellan-audit (in castellan-ledger) | trivial — hash chain + JSON |
 | evidence-pack | 302 | castellan-proof (export module) | trivial — serde_json + quality labels |
 | proof-fixes | 270 | castellan-proof (placebo module) | small — placebo orchestration over relay-vuln |
-| seq-engine | 1368 | castellan-completeness | medium — completeness logic, algorithmic not Python-specific |
 
-~2050 lines of Python total, all small, all algorithmic, all in the proof pipeline. Rewrite as Rust crates and the daemon is pure Rust.
+~680 lines of Python total, all small, all algorithmic, all in the proof pipeline. Rewrite as Rust crates and the daemon is pure Rust.
+
+**seq-engine is NOT rewritten.** KILLed 2026-08-27 by real-data probe on 29 local spines: 78% of learned expectations are within-event tautologies (tokens co-emitted by the same event); the composite-only encoding learns zero expectations; ordered fingerprints add no separation over radar's order-agnostic encoding (identical cosine 0.0150); the trust stream has 5 distinct tokens in 30 events. The earlier claim of a 1,368-LOC Rust port was false — the Rust crate is a "Hello, world!" stub. See PRIMITIVES.md.
 
 **What stays Python** (dev/CI tooling, NOT shipped, NOT in the daemon):
 - cert-evals (319 LOC) — benchmark harness run by humans/CI, not user-facing

@@ -68,7 +68,7 @@ Bash `castellan-*` shims stay thin (socket queries), matching Omarchy's `omarchy
 │   harness-state drift → skein                                │
 │   edit confinement → stria guard/contract/verify-packet      │
 │   output entropy gate → gate.js / sift                       │
-│   completeness → seq-engine + config-radar                   │
+│   completeness → config-radar (seq-engine KILLed 2026-08-27)  │
 │   architecture-shift → git-archaeology                       │
 │   speculative next-action → spec-exec                        │
 ├─────────────────────────────────────────────────────────────┤

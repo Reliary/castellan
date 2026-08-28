@@ -1,0 +1,13 @@
+[package]
+name = "castellan-policycheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P9.6 policy regression replay: replay kept-session spines through a candidate policy before it lands (Leveson: CI for the controller)."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+castellan-policy = { path = "../castellan-policy" }
+castellan-replay = { path = "../castellan-replay" }
+castellan-trust = { path = "../castellan-trust" }
+serde = { workspace = true }

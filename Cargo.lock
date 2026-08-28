@@ -202,6 +202,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "castellan-policycheck"
+version = "0.1.0"
+dependencies = [
+ "castellan-core",
+ "castellan-policy",
+ "castellan-replay",
+ "castellan-trust",
+ "serde",
+]
+
+[[package]]
 name = "castellan-proof"
 version = "0.1.0"
 dependencies = [

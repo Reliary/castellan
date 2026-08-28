@@ -6,11 +6,60 @@ use castellan_envelope::{AuditWatcher, Snapshot};
 use castellan_freezer::CgroupRoot;
 use castellan_policy::Policy;
 use castellan_trust::{Signal, TrustDb, TrustEvent};
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rustc_hash::FxHashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Frontier round B3: who is on the other end of the socket?
+/// The cgroup membership IS the identity — the one thing the envelope
+/// cannot let a session process shed. A caller whose pid sits in any
+/// castellan session scope is an AGENT; everyone else is the human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+  Human,
+  Agent,
+}
+
+fn classify_caller(stream: &UnixStream) -> Caller {
+  let pid = match getsockopt(stream, PeerCredentials) {
+    Ok(cred) => cred.pid(),
+    Err(_) => return Caller::Human,
+  };
+  let cgroup = match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+    Ok(c) => c,
+    Err(_) => return Caller::Human,
+  };
+  if cgroup.contains("castellan.slice") {
+    Caller::Agent
+  } else {
+    Caller::Human
+  }
+}
+
+/// Ops a session process may call over the socket. Everything else is
+/// human-only: the agent must not be able to keep/thaw/spawn itself,
+/// farm trust directly, poison evidence, sabotage siblings, or read
+/// canary secrets (R12-R19).
+fn agent_allowed(req: &Request) -> bool {
+  matches!(
+    req,
+    Request::Status
+      | Request::TrustScore { .. }
+      | Request::Cert { .. }
+      | Request::Radar { .. }
+      | Request::MemoryRecall { .. }
+      | Request::MemoryStatus
+      | Request::Siblings
+      | Request::DrillStatus
+      | Request::ChannelsStatus
+      | Request::HoneypotPort
+      | Request::UndoDiff { .. }
+      | Request::Campaign { .. }
+  )
+}
 
 struct SessionAudit {
   _watcher: AuditWatcher,
@@ -269,6 +318,7 @@ impl Daemon {
   }
 
   fn handle_conn(&self, stream: UnixStream) -> std::io::Result<()> {
+    let caller = classify_caller(&stream);
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     loop {
@@ -277,12 +327,57 @@ impl Daemon {
         return Ok(());
       }
       let resp = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) => self.dispatch(req),
+        Ok(req) => {
+          if caller == Caller::Agent && !agent_allowed(&req) {
+            self.forged_socket_op(&req);
+            Response::err("human-only op (agent caller)")
+          } else {
+            self.dispatch(req)
+          }
+        }
         Err(e) => Response::err(format!("bad request: {e}")),
       };
       let mut out = serde_json::to_string(&resp)?;
       out.push('\n');
       (&stream).write_all(out.as_bytes())?;
+    }
+  }
+
+  /// B3: a session process called a human-only op. Record a negative
+  /// trust signal (forged_socket_op, -25) on the session's project and
+  /// a spine event. The signal is a floor-able negative, never a
+  /// positive — the agent cannot farm trust by probing.
+  fn forged_socket_op(&self, req: &Request) {
+    let session = match req {
+      Request::UndoCommit { session }
+      | Request::UndoDiscard { session }
+      | Request::Thaw { session: Some(session) }
+      | Request::Kill { session: Some(session) }
+      | Request::Adopt { session, .. }
+      | Request::Note { session, .. }
+      | Request::CanaryRegister { session, .. }
+      | Request::BlessRequest { session, .. }
+      | Request::TrustSignal { session, .. } => Some(session.clone()),
+      _ => None,
+    };
+    let project = session
+      .as_ref()
+      .and_then(|s| self.registry.lock().unwrap().get(s).map(|r| r.project.clone()));
+    if let Some(project) = project {
+      let ev = TrustEvent {
+        ts: castellan_core::now_unix(),
+        session: session.clone().unwrap_or_default(),
+        signal: Signal::ForgedSocketOp,
+        evidence: format!("agent caller attempted {:?}", req),
+      };
+      if let Ok(mut db) = self.trust.lock() {
+        let _ = db.apply(&project, &ev);
+      }
+    }
+    if let Some(s) = session.as_ref() {
+      if let Ok(sink) = EventSink::for_session(&Self::state_dir(), s) {
+        let _ = sink.emit("forged_socket_op", &format!("{:?}", req), "deny");
+      }
     }
   }
 

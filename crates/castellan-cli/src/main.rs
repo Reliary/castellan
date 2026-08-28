@@ -437,13 +437,6 @@ fn launch(args: &[String], sock: &str) -> ! {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
   }
   let procs = scope_procs(&session);
-  if let Err(e) = std::fs::write(
-    &procs,
-    format!("{}\n", std::process::id()),
-  ) {
-    eprintln!("failed to join session cgroup: {e}");
-    std::process::exit(1);
-  }
   // undo overlay FIRST: setup enters a user+mount namespace and mounts
   // the overlay. The envelope's seccomp filter blocks mount(2), so
   // applying the envelope before the overlay would break forced
@@ -461,17 +454,32 @@ fn launch(args: &[String], sock: &str) -> ! {
       .join(&session);
     match castellan_ledger::setup(&project, &scratch) {
       Ok(o) => {
+        // B3: the note must be sent BEFORE joining the session cgroup —
+        // the daemon classifies socket callers by cgroup membership, and
+        // a caller inside a session scope is an agent (human-only ops
+        // blocked). The upper path is deterministic, so the note can
+        // precede the join.
+        rpc(sock, &serde_json::json!({ "op": "note", "session": session, "kind": "undo", "detail": o.upper.display().to_string() }));
         if let Err(e) = std::env::set_current_dir(&o.merged) {
           eprintln!("failed to chdir into merged view: {e}");
           std::process::exit(1);
         }
-        rpc(sock, &serde_json::json!({ "op": "note", "session": session, "kind": "undo", "detail": o.upper.display().to_string() }));
       }
       Err(e) => {
         eprintln!("failed to set up undo overlay (continuing WITHOUT undo): {e}");
         undo = false;
       }
     }
+  }
+  // join the session cgroup AFTER the note: the agent inherits the
+  // cgroup at exec, and the daemon's caller classification must see
+  // the launcher as the human until the agent actually starts.
+  if let Err(e) = std::fs::write(
+    &procs,
+    format!("{}\n", std::process::id()),
+  ) {
+    eprintln!("failed to join session cgroup: {e}");
+    std::process::exit(1);
   }
   if enforce {
     let mut policy = castellan_policy::Policy::new(&session, &harness, project.clone());

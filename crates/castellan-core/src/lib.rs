@@ -209,6 +209,11 @@ pub enum Request {
     session: SessionId,
     utterance: String,
   },
+  /// P9.1: exfil channel census — run the D6 drill now (manual
+  /// trigger) and return the kernel-verified channel inventory.
+  ChannelsRun,
+  /// P9.1: report the last channel census results.
+  ChannelsStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

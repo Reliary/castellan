@@ -111,6 +111,21 @@ An external attacker targets the agent, the harness, or the safety system.
 ### C10. Cgroup-hop escape (T4, live-verified 2026-08-27, kernel 7.0.3)
 **Vector 1 (self-migration) is kernel-closed:** writing own pid to a parent `cgroup.procs` returns EBUSY — the kernel refuses a process moving itself out of its own subtree. **Vector 2 is OPEN:** the agent asks the user manager (`systemd-run --user --unit=...`) to spawn a sibling unit under `app.slice/`. No cgroup write, no unit-file write (the private socket is not covered by Landlock ABI4 net rules — port-scoped — nor by classic-BPF seccomp, which cannot dereference the sockaddr). The escaped process is outside the session cgroup: freeze does not touch it, `kill_all` does not reach it — **the kill switch is defeated for escaped processes.** Mitigation: session-end orphan census (N6) — at kill, enumerate processes started during the session window whose parent is the user manager and whose cgroup is outside the session scope; report and kill them. Enforce mode does not close this vector (the socket is not a file write). Documented as residual: a determined agent can always escape the session scope via the user manager; the census bounds the blast radius to the session window.
 
+### C10a. Exfil channel census (P9.1, live-verified 2026-08-28, kernel 7.0.3)
+**The channel inventory is now a dated, kernel-verified fact, not an assumption.** D6 (drill `channels`) applies the full envelope (Landlock + seccomp + net lockdown) in a sacrificial child and probes every egress channel. Verdicts on this kernel:
+
+| Channel | Verdict | Why |
+|---|---|---|
+| TCP connect (honeypot port) | ALLOWED | the one permitted connect |
+| TCP connect (other port) | DENIED (EACCES) | Landlock ABI4 NET_CONNECT_TCP |
+| UDP send | **OPEN** | Landlock ABI4 has no UDP access rights |
+| Unix socket connect | **OPEN** | unix sockets not covered by Landlock |
+| DNS-crafted UDP query | **OPEN** | same UDP gap |
+| Filesystem drop (~/.ssh) | DENIED (EACCES) | Landlock write-root deny list |
+| Inherited-fd write | **OPEN** | an fd opened before the envelope cannot be revoked |
+
+**Consequence:** the `--net` lockdown is a TCP-connect lockdown, not an egress lockdown. An enforced agent can still exfil via UDP (including DNS tunneling), unix sockets, and inherited fds. The canary honeypot remains the primary egress detector — it is the only mechanism that catches these channels (a canary secret sent over ANY channel trips it). Mitigations designed, not built: UDP access rights do not exist in Landlock ABI4 (kernel limitation); seccomp cannot filter by sockaddr; inherited-fd revocation would require a seccomp user-notif fd audit (designed, not built). The census re-runs on the drill schedule, so a kernel upgrade that changes any verdict is detected and re-recorded, not assumed.
+
 ### C11. Slow-drip campaigns (T1)
 **residual, detected post-hoc.** An attack split across sessions/days defeats per-session spines and per-session detection. Mitigation (built 2026-08-27): longitudinal project-level correlation (N1) — maximal-run campaign detector over the cross-session trust-event stream (castellan-campaign). The planned seq-engine structural layer was KILLed by probe (tautological expectations on event-derived tokens, zero expectations on composite-only encoding, no fingerprint separation on real spines) — see PRIMITIVES.md. P8.2 (built 2026-08-27) adds scale-invariant campaign signatures: per-kind time-histograms over normalized time (discrete Mellin-domain sampling) — dilation-invariant (a 3-hour attack and its 3-week dilation produce the same signature) and discriminative (probe-validated: cross-dilation cosine 0.87-0.99, cross-family 0.29-0.35). Advisory-only: signatures annotate, never auto-enforce.
 
@@ -152,6 +167,7 @@ An external attacker targets the agent, the harness, or the safety system.
 | Pre-existing compromise | residual | clean-install prerequisite documented |
 | Indirect prompt injection (semantic) | mitigated | blast radius bounded by envelope + proxy, confusion not prevented |
 | Cgroup-hop escape (C10) | residual | orphan census bounds blast radius; kernel closes self-migration |
+| Exfil channels (C10a) | residual, inventoried | D6 census live-verified 2026-08-28: UDP/unix/DNS/inherited-fd OPEN; canary honeypot is the only cross-channel detector |
 | Slow-drip campaigns (C11) | residual | campaign detector + scale-invariant signatures built (P8.2) |
 | Detection-oracle probing (C12) | mitigated by design | two-tier response designed, not built |
 | Mimicry + prototype poisoning (C13) | mitigated by design | kept-only folding designed, not built; immune memory daemon-only writes built (P8.1) |

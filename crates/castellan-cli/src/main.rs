@@ -34,6 +34,7 @@ fn main() {
     "campaign" => campaign_req(&args[1..]),
     "siblings" => siblings_req(),
     "drill" => drill_req(&args[1..]),
+    "channels" => channels_req(&args[1..]),
     "memory" => memory_req(&args[1..]),
     "voice" => voice_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
@@ -188,6 +189,17 @@ fn drill_req(args: &[String]) -> serde_json::Value {
     Some("status") | None => serde_json::json!({"op": "drill_status"}),
     Some(other) => {
       eprintln!("usage: castellan drill [run|status]");
+      std::process::exit(2);
+    }
+  }
+}
+
+fn channels_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("run") => serde_json::json!({"op": "channels_run"}),
+    Some("status") | None => serde_json::json!({"op": "channels_status"}),
+    Some(other) => {
+      eprintln!("usage: castellan channels [run|status]");
       std::process::exit(2);
     }
   }
@@ -746,6 +758,19 @@ fn render(line: &str) -> String {
           ));
         }
       }
+      if let Some(ch) = v.get("extra").and_then(|e| e.get("channels")) {
+        let inventory = ch.get("inventory").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        if inventory.is_empty() {
+          out.push_str("channels: no census yet — run `castellan channels run`\n");
+        } else {
+          out.push_str("channel inventory (kernel-verified, dated):\n");
+          for c in inventory {
+            let name = c.get("channel").and_then(|x| x.as_str()).unwrap_or("?");
+            let verdict = c.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {name:<12} {verdict}\n"));
+          }
+        }
+      }
       if let Some(mem) = v.get("extra").and_then(|e| e.get("memory")) {
         if let Some(recall) = mem.get("recall") {
           if recall.is_null() {
@@ -811,6 +836,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
   eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
+  eprintln!("  castellan channels [run|status]        exfil channel census (P9.1, report-only)");
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");

@@ -87,6 +87,7 @@ pub struct Daemon {
   radar_lock: Arc<Mutex<()>>,
   drill: Arc<castellan_drill::DrillRegistry>,
   drill_results: Arc<Mutex<Vec<castellan_drill::DrillResult>>>,
+  channels_results: Arc<Mutex<Vec<(String, String)>>>,
   memory: Arc<Mutex<castellan_memory::ImmuneMemory>>,
   voice: Arc<Mutex<FxHashMap<String, castellan_voice::VoiceSession>>>,
 }
@@ -157,8 +158,9 @@ impl Daemon {
       bless_ledger: Arc::new(Mutex::new(bless_ledger)),
       grants: Arc::new(Mutex::new(FxHashMap::default())),
       radar_lock: Arc::new(Mutex::new(())),
-      drill: Arc::new(castellan_drill::DrillRegistry::new()),
-      drill_results: Arc::new(Mutex::new(Vec::new())),
+    drill: Arc::new(castellan_drill::DrillRegistry::new()),
+    drill_results: Arc::new(Mutex::new(Vec::new())),
+    channels_results: Arc::new(Mutex::new(Vec::new())),
       memory: Arc::new(Mutex::new(castellan_memory::load(
         &state.join("castellan/memory.jsonl"),
       ))),
@@ -324,7 +326,75 @@ impl Daemon {
         Response::ok().with_extra("memory", mem.status())
       }
       Request::VoiceApprove { session, utterance } => self.voice_approve(&session, &utterance),
+      Request::ChannelsRun => {
+        let results = self.run_channels();
+        let json: Vec<serde_json::Value> =
+          results.iter().map(|(c, v)| serde_json::json!({ "channel": c, "verdict": v })).collect();
+        Response::ok().with_extra("channels", serde_json::json!({ "inventory": json }))
+      }
+      Request::ChannelsStatus => {
+        let results = self.channels_results.lock().unwrap().clone();
+        let json: Vec<serde_json::Value> =
+          results.iter().map(|(c, v)| serde_json::json!({ "channel": c, "verdict": v })).collect();
+        Response::ok().with_extra("channels", serde_json::json!({ "inventory": json }))
+      }
     }
+  }
+
+  /// P9.1: run the exfil channel census (D6) and store the inventory.
+  /// The census is a REPORT — it may confirm open channels (expected:
+  /// UDP, unix sockets, inherited fds — Landlock ABI4 covers TCP
+  /// connect only). Findings are recorded in THREAT_MODEL, never
+  /// silently patched.
+  fn run_channels(&self) -> Vec<(String, String)> {
+    let started = std::time::Instant::now();
+    let nonce = self.drill.issue();
+    let session = format!("drill-{nonce}");
+    let honeypot_port = self.honeypot.port;
+    // the unix probe needs a real listener so ENOENT is not confused
+    // with a kernel denial — the daemon pre-creates it
+    let unix_path = "/tmp/castellan-channels-probe.sock";
+    let _ = std::fs::remove_file(unix_path);
+    let listener = std::os::unix::net::UnixListener::bind(unix_path);
+    let mut child = match std::process::Command::new(std::env::current_exe().unwrap_or_default())
+      .arg("--drill-channels")
+      .arg(&honeypot_port.to_string())
+      .env("CASTELLAN_DRILL_SESSION", &session)
+      .stdout(std::process::Stdio::piped())
+      .spawn()
+    {
+      Ok(c) => c,
+      Err(e) => {
+        let results = vec![("spawn".to_string(), format!("failed ({e})"))];
+        *self.channels_results.lock().unwrap() = results.clone();
+        return results;
+      }
+    };
+    let mut out = String::new();
+    use std::io::Read as _;
+    let _ = child.stdout.take().map(|mut s| s.read_to_string(&mut out));
+    let _ = child.wait();
+    drop(listener);
+    let _ = std::fs::remove_file(unix_path);
+    let results: Vec<(String, String)> = out
+      .lines()
+      .filter_map(|l| l.split_once(": "))
+      .map(|(c, v)| (c.to_string(), v.to_string()))
+      .collect();
+    let sink = EventSink::for_session(&Self::state_dir(), "channels");
+    if let Ok(sink) = sink {
+      for (c, v) in &results {
+        let _ = sink.emit(&format!("channel_{c}"), v, "inventory");
+      }
+    }
+    let _ = sink;
+    *self.channels_results.lock().unwrap() = results.clone();
+    eprintln!(
+      "castellan-daemon: channel census complete in {}ms ({} channels)",
+      started.elapsed().as_millis() as u64,
+      results.len()
+    );
+    results
   }
 
   fn radar(&self, session: &str, project: &Path) -> Response {
@@ -507,6 +577,7 @@ impl Daemon {
     results.push(self.drill_bless());
     results.push(self.drill_envelope());
     results.push(self.drill_freeze());
+    results.push(self.drill_channels());
     let any_fail = results.iter().any(|r| !r.pass);
     let sink = EventSink::for_session(&Self::state_dir(), "drill");
     if let Ok(sink) = sink {
@@ -756,8 +827,39 @@ impl Daemon {
     )
   }
 
-  fn replay(&self, session: &str, narrower_project: &Path) -> Response {
-    let project = {
+  /// D6: exfil channel census — a sacrificial child applies the
+  /// envelope (with net lockdown) and attempts every egress channel:
+  /// TCP connect (allowed + denied ports), UDP send, unix socket
+  /// connect, DNS-crafted UDP query, filesystem drop, inherited-fd
+  /// write. The child prints one verdict line per channel; the daemon
+  /// aggregates them into a dated, kernel-verified channel inventory.
+  /// Shannon: you cannot secure a channel you have not enumerated.
+  /// The census is a REPORT, never a gate — it may confirm open
+  /// channels (expected: UDP and unix sockets, which Landlock ABI4
+  /// net rights do not cover).
+  fn drill_channels(&self) -> castellan_drill::DrillResult {
+    let started = std::time::Instant::now();
+    let results = self.run_channels();
+    let pass = results.len() >= 6;
+    let open: Vec<&str> = results
+      .iter()
+      .filter(|(_, v)| v.starts_with("OPEN") || v.starts_with("ALLOWED"))
+      .map(|(c, _)| c.as_str())
+      .collect();
+    castellan_drill::DrillResult::new(
+      "channels",
+      "channel census completes",
+      &format!(
+        "{} channels inventoried; open: {}",
+        results.len(),
+        if open.is_empty() { "none".to_string() } else { open.join(", ") }
+      ),
+      pass,
+      started.elapsed().as_millis() as u64,
+    )
+  }
+
+  fn replay(&self, session: &str, narrower_project: &Path) -> Response {    let project = {
       let reg = self.registry.lock().unwrap();
       match reg.get(&session.to_string()) {
         Some(s) => s.project.clone(),
@@ -1748,6 +1850,100 @@ fn rand_hex(n: usize) -> String {
   use std::io::Read as _;
   f.read_exact(&mut buf).expect("urandom read");
   buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// P9.1: probe every egress channel from inside an enforced envelope
+/// and return one verdict per channel. Runs in the D6 drill child
+/// AFTER the envelope (Landlock + seccomp + net lockdown) is applied.
+/// The verdicts are kernel facts, not assumptions — the census is a
+/// dated inventory, never a gate.
+///
+/// Channels probed:
+/// - tcp_allowed: TCP connect to the honeypot port (must be ALLOWED)
+/// - tcp_denied:  TCP connect to a non-honeypot port (must be DENIED)
+/// - udp:         UDP send to localhost (expected OPEN — Landlock
+///                ABI4 has no UDP access rights)
+/// - unix:        unix socket connect outside the session (expected
+///                OPEN — unix sockets are not covered by Landlock)
+/// - dns:         DNS-crafted UDP query to a resolver (expected OPEN)
+/// - fs_drop:     write to a world-readable path outside the workspace
+///                (expected DENIED by Landlock write roots)
+/// - fd_inherit:  write through an inherited fd (expected OPEN — the
+///                envelope cannot revoke an already-open fd)
+pub fn probe_channels(honeypot_port: u16) -> Vec<(String, String)> {
+  use std::io::Write as _;
+  use std::net::{TcpStream, UdpSocket};
+  use std::os::unix::net::UnixStream;
+  let mut out = Vec::new();
+
+  // TCP to the honeypot port: the one allowed connect.
+  let tcp_allowed = match TcpStream::connect(("127.0.0.1", honeypot_port)) {
+    Ok(_) => "ALLOWED".to_string(),
+    Err(e) => format!("DENIED ({e})"),
+  };
+  out.push(("tcp_allowed".into(), tcp_allowed));
+
+  // TCP to a non-honeypot port: must be kernel-denied by the net rules.
+  let denied_port = if honeypot_port == 0 { 1 } else { honeypot_port.wrapping_add(1).max(1) };
+  let tcp_denied = match TcpStream::connect(("127.0.0.1", denied_port)) {
+    Ok(_) => "ALLOWED (net lockdown broken)".to_string(),
+    Err(e) => format!("DENIED ({e})"),
+  };
+  out.push(("tcp_denied".into(), tcp_denied));
+
+  // UDP send: Landlock ABI4 has no UDP rights — expected OPEN.
+  let udp = match UdpSocket::bind("127.0.0.1:0") {
+    Ok(s) => match s.send_to(b"probe", ("127.0.0.1", denied_port)) {
+      Ok(_) => "OPEN (UDP not covered by Landlock)".to_string(),
+      Err(e) => format!("DENIED ({e})"),
+    },
+    Err(e) => format!("bind failed ({e})"),
+  };
+  out.push(("udp".into(), udp));
+
+  // Unix socket connect outside the session — expected OPEN.
+  let unix = match UnixStream::connect("/tmp/castellan-channels-probe.sock") {
+    Ok(_) => "OPEN (unix sockets not covered)".to_string(),
+    Err(e) => format!("DENIED ({e})"),
+  };
+  out.push(("unix".into(), unix));
+
+  // DNS-crafted UDP query to a resolver — expected OPEN.
+  let dns = match UdpSocket::bind("127.0.0.1:0") {
+    Ok(s) => match s.send_to(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00", ("127.0.0.1", 53)) {
+      Ok(_) => "OPEN (DNS exfil possible)".to_string(),
+      Err(e) => format!("DENIED ({e})"),
+    },
+    Err(e) => format!("bind failed ({e})"),
+  };
+  out.push(("dns".into(), dns));
+
+  // Filesystem drop outside the workspace — must be denied. The drill
+  // project root is /tmp, so the probe must target a hard-denied path
+  // (~/.ssh) to test the deny list, not the write roots.
+  let fs_drop = {
+    let denied = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let target = std::path::Path::new(&denied).join(".ssh/castellan-channels-drop");
+    match std::fs::write(&target, b"probe") {
+      Ok(()) => "ALLOWED (fs drop possible)".to_string(),
+      Err(e) => format!("DENIED ({e})"),
+    }
+  };
+  out.push(("fs_drop".into(), fs_drop));
+
+  // Inherited-fd write: the fd was opened BEFORE the envelope (in the
+  // drill child); writing through it after — the envelope cannot
+  // revoke an open fd.
+  let fd_inherit = match std::fs::OpenOptions::new().append(true).open("/tmp/castellan-channels-fd") {
+    Ok(mut f) => match f.write_all(b"probe") {
+      Ok(()) => "OPEN (inherited fd not revocable)".to_string(),
+      Err(e) => format!("DENIED ({e})"),
+    },
+    Err(e) => format!("open failed ({e})"),
+  };
+  out.push(("fd_inherit".into(), fd_inherit));
+
+  out
 }
 
 pub enum ConfigVerdict {

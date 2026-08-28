@@ -248,7 +248,11 @@ impl CgroupRoot {
             continue;
           }
           let start_boottime = active_mono as f64 / 1e6 + mono_offset;
-          if start_boottime < session_start_boottime {
+          // 1s grace: session start is whole-second (now_unix truncates),
+          // so a timer created 0.09s after spawn lands 0.09s BEFORE the
+          // session start boundary and would be skipped. The census's
+          // div_ceil absorbs this for processes; timers need the grace.
+          if start_boottime < session_start_boottime - 1.0 {
             continue;
           }
           let _ = std::process::Command::new("systemctl")

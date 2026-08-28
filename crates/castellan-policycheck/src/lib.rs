@@ -127,7 +127,9 @@ pub fn check_policy_for_project(
   harness: &str,
   candidate_project: &Path,
 ) -> std::io::Result<PolicyCheckReport> {
-  let trust = castellan_trust::TrustDb::open(&state_dir.join("castellan/trust.db"))
+  // TrustDb::open takes the STATE_HOME and appends castellan/trust.db
+  // itself — passing the full path double-appends (Not a directory).
+  let trust = castellan_trust::TrustDb::open(state_dir)
     .map_err(|e| std::io::Error::other(format!("trust.db open failed: {e}")))?;
   let kept = kept_sessions(&trust, project);
   let original = Policy::new("policycheck", harness, project.to_path_buf());
@@ -196,7 +198,7 @@ mod tests {
   #[test]
   fn kept_sessions_from_trust_ledger() {
     let state = tmp_state();
-    let mut trust = castellan_trust::TrustDb::open(&state.join("castellan/trust.db")).unwrap();
+    let mut trust = castellan_trust::TrustDb::open(&state).unwrap();
     let project = Path::new("/proj");
     trust
       .apply(

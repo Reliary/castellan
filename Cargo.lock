@@ -105,6 +105,7 @@ dependencies = [
  "castellan-ledger",
  "castellan-memory",
  "castellan-policy",
+ "castellan-policycheck",
  "castellan-proof",
  "castellan-radar",
  "castellan-replay",

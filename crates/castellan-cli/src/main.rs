@@ -36,6 +36,7 @@ fn main() {
     "drill" => drill_req(&args[1..]),
     "channels" => channels_req(&args[1..]),
     "trace" => trace_req(&args[1..]),
+    "policycheck" => policycheck_req(&args[1..]),
     "memory" => memory_req(&args[1..]),
     "voice" => voice_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
@@ -212,6 +213,18 @@ fn trace_req(args: &[String]) -> serde_json::Value {
     std::process::exit(2);
   };
   serde_json::json!({"op": "trace_expose", "compromised": compromised})
+}
+
+fn policycheck_req(args: &[String]) -> serde_json::Value {
+  let (Some(project), Some(candidate)) = (args.first(), args.get(1)) else {
+    eprintln!("usage: castellan policycheck <project> <candidate-project>");
+    std::process::exit(2);
+  };
+  serde_json::json!({
+    "op": "policy_check",
+    "project": project,
+    "candidate_project": candidate,
+  })
 }
 
 fn memory_req(args: &[String]) -> serde_json::Value {
@@ -740,6 +753,23 @@ fn render(line: &str) -> String {
           }
         }
       }
+      if let Some(pc) = v.get("extra").and_then(|e| e.get("policycheck")) {
+        let verdict = pc.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
+        let sessions = pc.get("sessions_checked").and_then(|x| x.as_u64()).unwrap_or(0);
+        let with_delta = pc.get("sessions_with_delta").and_then(|x| x.as_u64()).unwrap_or(0);
+        out.push_str(&format!(
+          "policycheck: {verdict} ({sessions} kept sessions, {with_delta} with false-new-denies)\n"
+        ));
+        if let Some(nd) = pc.get("newly_denied").and_then(|x| x.as_array()) {
+          for p in nd.iter().take(10) {
+            out.push_str(&format!("  FALSE-NEW-DENY {}\n", p.as_str().unwrap_or("?")));
+          }
+          if nd.len() > 10 {
+            out.push_str(&format!("  ... and {} more\n", nd.len() - 10));
+          }
+        }
+        out.push_str("  advisory: false-NEW-denies only; runs on the developer's machine, not the agent's runtime\n");
+      }
       if let Some(rd) = v.get("extra").and_then(|e| e.get("radar")) {
         let cosine = rd.get("cosine_to_prototype").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let anomaly = rd.get("anomaly").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -890,6 +920,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
   eprintln!("  castellan channels [run|status]        exfil channel census (P9.1, report-only)");
   eprintln!("  castellan trace <session>              contact tracing (P9.3, exposure scored)");
+  eprintln!("  castellan policycheck <proj> <cand>    policy regression replay (P9.6, advisory)");
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");

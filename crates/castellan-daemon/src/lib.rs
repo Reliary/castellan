@@ -317,6 +317,9 @@ impl Daemon {
       Request::BlessReject { nonce } => self.bless_reject(&nonce),
       Request::Cert { session } => self.cert(&session),
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
+      Request::PolicyCheck { project, candidate_project } => {
+        self.policy_check(&project, &candidate_project)
+      }
       Request::Radar { session, project } => self.radar(&session, &project),
       Request::Siblings => self.siblings(),
       Request::Campaign { project } => self.campaign(&project),
@@ -971,6 +974,26 @@ impl Daemon {
         Response::ok().with_extra("replay", json)
       }
       Err(e) => Response::err(format!("replay failed: {e}")),
+    }
+  }
+
+  /// P9.6: policy regression replay — replay kept-session spines
+  /// through a CANDIDATE policy before it lands. Kept sessions only
+  /// (the "what humans approved" corpus); false-NEW-denies only;
+  /// advisory at release time (runs on the developer's machine, not
+  /// the agent's runtime).
+  fn policy_check(&self, project: &Path, candidate_project: &Path) -> Response {
+    match castellan_policycheck::check_policy_for_project(
+      &Self::state_dir(),
+      project,
+      "claude",
+      candidate_project,
+    ) {
+      Ok(report) => {
+        let json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+        Response::ok().with_extra("policycheck", json)
+      }
+      Err(e) => Response::err(format!("policycheck failed: {e}")),
     }
   }
 

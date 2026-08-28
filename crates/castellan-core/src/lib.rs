@@ -229,6 +229,13 @@ pub enum Request {
   TraceExpose {
     compromised: SessionId,
   },
+  /// P9.6: policy regression replay — replay kept-session spines
+  /// through a CANDIDATE policy before it lands (false-NEW-denies
+  /// only, advisory at release time).
+  PolicyCheck {
+    project: PathBuf,
+    candidate_project: PathBuf,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

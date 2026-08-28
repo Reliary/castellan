@@ -18,6 +18,7 @@ members = [
   "crates/castellan-pharmaco",
   "crates/castellan-scan",
   "crates/castellan-hub",
+  "crates/castellan-trace",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

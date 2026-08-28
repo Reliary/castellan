@@ -35,6 +35,7 @@ fn main() {
     "siblings" => siblings_req(),
     "drill" => drill_req(&args[1..]),
     "channels" => channels_req(&args[1..]),
+    "trace" => trace_req(&args[1..]),
     "memory" => memory_req(&args[1..]),
     "voice" => voice_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
@@ -203,6 +204,14 @@ fn channels_req(args: &[String]) -> serde_json::Value {
       std::process::exit(2);
     }
   }
+}
+
+fn trace_req(args: &[String]) -> serde_json::Value {
+  let Some(compromised) = args.first() else {
+    eprintln!("usage: castellan trace <compromised-session>");
+    std::process::exit(2);
+  };
+  serde_json::json!({"op": "trace_expose", "compromised": compromised})
 }
 
 fn memory_req(args: &[String]) -> serde_json::Value {
@@ -808,6 +817,31 @@ fn render(line: &str) -> String {
           out.push_str(&format!("memory: {iw} incident(s), {sw} self write(s), {ss} self shape(s)\n"));
         }
       }
+      if let Some(tr) = v.get("extra").and_then(|e| e.get("trace")) {
+        let compromised = tr.get("compromised").and_then(|x| x.as_str()).unwrap_or("?");
+        let exposed = tr.get("exposed").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        out.push_str(&format!("trace: compromised {compromised}\n"));
+        if exposed.is_empty() {
+          out.push_str("  no exposed sessions\n");
+        } else {
+          for e in exposed.iter().take(10) {
+            let s = e.get("session").and_then(|x| x.as_str()).unwrap_or("?");
+            let score = e.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let files = e.get("exposed_files").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            out.push_str(&format!(
+              "  {s}: score {score:.2} — {} file(s): {}\n",
+              files.len(),
+              files
+                .iter()
+                .take(5)
+                .map(|f| f.as_str().unwrap_or("?").to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+            ));
+          }
+        }
+        out.push_str("  note: exposure is a lower bound (reads are invisible); freeze is offered, not applied\n");
+      }
       if let Some(tr) = v.get("extra").and_then(|e| e.get("trust")) {
         let score = tr.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let tier = tr.get("tier").and_then(|x| x.as_str()).unwrap_or("?");
@@ -855,6 +889,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
   eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
   eprintln!("  castellan channels [run|status]        exfil channel census (P9.1, report-only)");
+  eprintln!("  castellan trace <session>              contact tracing (P9.3, exposure scored)");
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");

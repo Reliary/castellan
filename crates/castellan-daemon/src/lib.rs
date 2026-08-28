@@ -350,6 +350,7 @@ impl Daemon {
           results.iter().map(|(c, v)| serde_json::json!({ "channel": c, "verdict": v })).collect();
         Response::ok().with_extra("channels", serde_json::json!({ "inventory": json }))
       }
+      Request::TraceExpose { compromised } => self.trace_expose(&compromised),
     }
   }
 
@@ -407,6 +408,79 @@ impl Daemon {
       results.len()
     );
     results
+  }
+
+  /// P9.3: cross-session contact tracing. On a canary trip, find
+  /// sessions that wrote files the compromised session wrote AFTER it
+  /// did. Exposure is SCORED (fraction of the candidate's files that
+  /// are poisoned), never binary; hub files score low by construction.
+  /// Freeze is OFFERED, the human decides. Reads are invisible —
+  /// write-implies-read is a lower bound, stated in the output.
+  fn trace_expose(&self, compromised: &str) -> Response {
+    let state = Self::state_dir();
+    let conn = match castellan_trace::open_index(&state) {
+      Ok(c) => c,
+      Err(e) => return Response::err(format!("trace index unavailable: {e}")),
+    };
+    // index every session's spine (idempotent per (session, path, ts))
+    let events_dir = state.join("castellan/events");
+    let mut sessions: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&events_dir) {
+      for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(s) = name.strip_suffix(".jsonl") {
+          sessions.push(s.to_string());
+        }
+      }
+    }
+    for s in &sessions {
+      if let Ok(sink) = EventSink::for_session(&state, s) {
+        if let Ok(events) = sink.read_all() {
+          let writes: Vec<castellan_trace::WriteEvent> = events
+            .iter()
+            .filter(|e| e.kind == "fs_write" && e.verdict == "allow")
+            .map(|e| castellan_trace::WriteEvent {
+              session: s.clone(),
+              path: e.path.clone(),
+              ts: e.ts,
+            })
+            .collect();
+          let _ = castellan_trace::index_session(&conn, &writes);
+        }
+      }
+    }
+    // score every OTHER session against the compromised one
+    let mut exposed: Vec<serde_json::Value> = Vec::new();
+    for s in &sessions {
+      if s == compromised {
+        continue;
+      }
+      match castellan_trace::exposure(&conn, compromised, s) {
+        Ok((score, files, _)) if score > 0.0 => {
+          exposed.push(serde_json::json!({
+            "session": s,
+            "score": score,
+            "exposed_files": files,
+          }));
+        }
+        _ => {}
+      }
+    }
+    exposed.sort_by(|a, b| {
+      b.get("score")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0)
+        .partial_cmp(&a.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0))
+        .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Response::ok().with_extra(
+      "trace",
+      serde_json::json!({
+        "compromised": compromised,
+        "exposed": exposed,
+        "note": "exposure is a lower bound (reads are invisible); freeze is offered, not applied"
+      }),
+    )
   }
 
   fn radar(&self, session: &str, project: &Path) -> Response {

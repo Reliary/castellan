@@ -214,6 +214,12 @@ pub enum Request {
   ChannelsRun,
   /// P9.1: report the last channel census results.
   ChannelsStatus,
+  /// P9.3: cross-session contact tracing — sessions that wrote files
+  /// the compromised session wrote AFTER it did (exposure scored,
+  /// freeze offered, human decides).
+  TraceExpose {
+    compromised: SessionId,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

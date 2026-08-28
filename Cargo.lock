@@ -108,6 +108,7 @@ dependencies = [
  "castellan-radar",
  "castellan-replay",
  "castellan-scan",
+ "castellan-trace",
  "castellan-trust",
  "castellan-voice",
  "nix",
@@ -225,6 +226,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "castellan-trace"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
 ]
 
 [[package]]

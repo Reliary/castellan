@@ -2153,19 +2153,21 @@ impl Daemon {
       // via the user manager (systemd-run) are invisible to kill_all.
       // Bounds the blast radius to the session window.
       if let Some(start) = started_at {
+        // B2 (red-team R4): stop escaped transient units BEFORE the
+        // census kills their processes. A unit with Restart=always
+        // respawns the escaped process — killing processes is not
+        // enough, the UNIT must be stopped. Order matters: the unit
+        // check reads /proc/<main-pid>/stat, which fails once the
+        // census has killed the process (dead pid -> unit skipped).
+        let units_stopped = self.root.stop_escaped_units(&id, start);
+        if units_stopped > 0 {
+          msgs.push(format!("{id}: {units_stopped} escaped unit(s) stopped"));
+        }
         let orphans = self.root.orphan_census(&id, start);
         if !orphans.is_empty() {
           let killed = self.root.kill_pids(&orphans);
           msgs.push(format!("{id}: orphan census {}/{} killed", killed, orphans.len()));
           self.record_census(&id, orphans.len(), killed);
-        }
-        // B2 (red-team R4): a transient unit with Restart=always
-        // respawns the escaped process — killing processes is not
-        // enough, the UNIT must be stopped. The census's kill would
-        // be undone by systemd within seconds.
-        let units_stopped = self.root.stop_escaped_units(&id, start);
-        if units_stopped > 0 {
-          msgs.push(format!("{id}: {units_stopped} escaped unit(s) stopped"));
         }
       }
       let _ = self.root.destroy_session(&id);

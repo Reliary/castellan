@@ -171,6 +171,12 @@ An external attacker targets the agent, the harness, or the safety system.
 ### C24. Policy-replay gaming (P9.6)
 **mitigated by design.** An agent staging approvals to game a future policy check cannot forge the spine (hash-chained ledger). The check is advisory at release time on the developer's machine, not the agent's runtime. Measures false-NEW-denies only, never claims false-accept measurement.
 
+### C25. Unauthenticated daemon socket (frontier round, found-then-fixed 2026-08-28)
+**fixed.** The socket accepted any same-user process: a session process could self-keep (bypass the human gate, farm trust), self-thaw (reverse the panic button), self-spawn unconfined (tier >= 2 means no P6 forcing), farm trust directly via `trust_signal` (or force-fail-closed a competitor's project with `canary_hit`), poison evidence via `note`, sabotage siblings via `kill`/`adopt`, and read canary secrets via `canary_register`. Fix: SO_PEERCRED caller classification — a pid inside any castellan session scope is an agent; agent callers get a curated allowlist, everything else is human-only. Rejection records `forged_socket_op` (-25, floor-able negative, never a positive). Live-verified: R12-R14, R16-R19 all blocked.
+
+### C26. Timer-delayed escape (frontier round, found-then-fixed 2026-08-28)
+**fixed.** `systemd-run --user --on-calendar` creates a timer with MainPID=0, invisible to both the orphan census and the B2 service sweep; it fires later, outside any envelope, unattributable. Fix: the census sweeps timer units by ActiveEnterTimestampMonotonic (converted into the boottime domain via a measured CLOCK_MONOTONIC->uptime offset) with a 1s grace for whole-second session starts. Live-verified: timer active before keep, inactive after.
+
 ## Residual risks summary
 
 | Risk | Status | Mitigation |
@@ -198,3 +204,5 @@ An external attacker targets the agent, the harness, or the safety system.
 | Decoy mimicry (C22) | residual | decoys observe, not constrain (P9.5) |
 | Contact-tracing blind spots (C23) | residual | reads invisible, lower bound stated (P9.3) |
 | Policy-replay gaming (C24) | mitigated by design | hash-chained spines, advisory at release (P9.6) |
+| Unauthenticated socket (C25) | fixed | SO_PEERCRED caller classification (frontier round, 2026-08-28) |
+| Timer-delayed escape (C26) | fixed | timer-unit sweep + 1s grace (frontier round, 2026-08-28) |

@@ -38,20 +38,106 @@ pub fn file_weight(db_path: &Path, file: &str) -> f64 {
     return 1.0;
   };
   // hubness = number of files referencing this file's DEFINITION
-  // phrases (fan-out of the file, from the phrase_occ index). Only
-  // definition phrases count (flags & 0x03 >= 2, the is_def > 0
-  // filter stria's blast_radius uses) — common keywords would make
-  // every file look like a hub. Grammar-free: no parsers involved.
+  // phrases (fan-out of the file, from the phrase_occ index).
+  //
+  // The flags byte is decoded in RUST, not SQL: SQLite's bitwise
+  // operators convert a BLOB operand to an integer by parsing the
+  // byte as ASCII text, so `flags & 3` on a 1-byte BLOB only works
+  // when the byte happens to be an ASCII digit (0x32 = '2' passes,
+  // 0x0A = newline fails). The P9.4 kill criterion passed on stria's
+  // index by that accident; the fresh-index probe exposed it. The
+  // packed layout (stria index/schema.rs): is_def+1 in the low 2
+  // bits, zone bit 2, count bits 3-7. is_def >= 1 (packed >= 2) is
+  // a definition phrase.
   let Ok(mut stmt) = conn.prepare(
-    "SELECT COUNT(DISTINCT po2.file_id)
+    "SELECT po1.phrase_id, po1.flags
      FROM phrase_occ po1
-     JOIN phrase_occ po2 ON po1.phrase_id = po2.phrase_id AND po1.file_id != po2.file_id
      JOIN file_map fm ON fm.id = po1.file_id
-     WHERE fm.file_path = ?1 AND (po1.flags & 3) >= 2",
+     WHERE fm.file_path = ?1",
   ) else {
     return 1.0;
   };
-  let Ok(fanout) = stmt.query_row([file], |r| r.get::<_, i64>(0)) else {
+  let Ok(rows) = stmt.query_map([file], |r| {
+    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+  }) else {
+    return 1.0;
+  };
+  let mut def_phrases: Vec<i64> = Vec::new();
+  for row in rows.flatten() {
+    let (phrase_id, flags) = row;
+    if flags.first().map(|b| (b & 0x03) >= 2).unwrap_or(false) {
+      def_phrases.push(phrase_id);
+    }
+  }
+  if def_phrases.is_empty() {
+    return 0.5;
+  }
+  // KEYWORD FILTER: a phrase that is a DEFINITION in many files is a
+  // language keyword (e.g. `int` in C, marked is_def by stria's DFA),
+  // not a distinctive identifier. Only phrases whose definition-df is
+  // small (<= 3) carry hubness signal. Grammar-free: pure statistics,
+  // no language knowledge. Found by the synthetic-corpus probe: every
+  // file scored 1.629 because `int` was a definition phrase in all 33.
+  //
+  // The definition-df is computed in RUST: SQLite's bitwise operators
+  // parse a BLOB operand as ASCII text, so `flags & 3` in SQL only
+  // works when the byte happens to be an ASCII digit (0x32 = '2'
+  // passes, 0x0A = newline fails). The P9.4 kill criterion passed on
+  // stria's index by that accident; the fresh-index probe exposed it.
+  let placeholders = vec!["?"; def_phrases.len()].join(",");
+  let occ_sql = format!(
+    "SELECT po1.phrase_id, po1.file_id, po1.flags
+     FROM phrase_occ po1
+     WHERE po1.phrase_id IN ({placeholders})"
+  );
+  let occ_params: Vec<&dyn rusqlite::ToSql> =
+    def_phrases.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+  let Ok(mut occ_stmt) = conn.prepare(&occ_sql) else {
+    return 1.0;
+  };
+  let Ok(occ_rows) = occ_stmt.query_map(occ_params.as_slice(), |r| {
+    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?))
+  }) else {
+    return 1.0;
+  };
+  // phrase -> set of files where it is a DEFINITION
+  let mut def_files: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+    std::collections::HashMap::new();
+  // phrase -> set of files where it occurs at all (fan-out base)
+  let mut all_files: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+    std::collections::HashMap::new();
+  for row in occ_rows.flatten() {
+    let (phrase_id, file_id, flags) = row;
+    all_files.entry(phrase_id).or_default().insert(file_id);
+    if flags.first().map(|b| (b & 0x03) >= 2).unwrap_or(false) {
+      def_files.entry(phrase_id).or_default().insert(file_id);
+    }
+  }
+  let mut distinctive: Vec<i64> = Vec::new();
+  for phrase_id in &def_phrases {
+    if def_files.get(phrase_id).map(|s| s.len()).unwrap_or(0) <= 3 {
+      distinctive.push(*phrase_id);
+    }
+  }
+  if distinctive.is_empty() {
+    return 0.5;
+  }
+  // fan-out: distinct files sharing any of this file's DISTINCTIVE
+  // definition phrases, excluding the file itself. All placeholders
+  // are positional `?` — mixing `?` and `?N` in one statement makes
+  // rusqlite treat `?1` as parameter 1, colliding with the positional
+  // ones (InvalidParameterCount).
+  let placeholders = vec!["?"; distinctive.len()].join(",");
+  let sql = format!(
+    "SELECT COUNT(DISTINCT po2.file_id)
+     FROM phrase_occ po2
+     WHERE po2.phrase_id IN ({placeholders}) AND po2.file_id !=
+       (SELECT id FROM file_map WHERE file_path = ?)"
+  );
+  let mut params: Vec<&dyn rusqlite::ToSql> =
+    distinctive.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+  params.push(&file);
+  let Ok(fanout) = conn.query_row(&sql, params.as_slice(), |r| r.get::<_, i64>(0)) else {
     return 1.0;
   };
   // map fan-out to [0.5, 2.0]: 0 refs -> 0.5, ~10 refs -> 1.0,

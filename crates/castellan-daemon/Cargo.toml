@@ -28,6 +28,7 @@ castellan-drill = { path = "../castellan-drill" }
 castellan-memory = { path = "../castellan-memory" }
 castellan-voice = { path = "../castellan-voice" }
 castellan-ledger = { path = "../castellan-ledger" }
+castellan-scan = { path = "../castellan-scan" }
 sha2 = "0.10"
 toml = "0.8"
 serde = { workspace = true }

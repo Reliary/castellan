@@ -16,6 +16,7 @@ members = [
   "crates/castellan-memory",
   "crates/castellan-voice",
   "crates/castellan-pharmaco",
+  "crates/castellan-scan",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]

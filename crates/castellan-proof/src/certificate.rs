@@ -28,6 +28,18 @@ pub struct PlaceboProof {
   pub verdict: String,
 }
 
+/// P9.2: artifact-scan factor. Findings-only-negative: a clean delta
+/// is None (no claim), a finding delta is Some with the scanner
+/// identity and the finding list. The cert states what the scanner
+/// CANNOT see, never "0 findings" — absence of evidence is not
+/// evidence of absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactScan {
+  pub scanner: String,
+  pub new_findings: Vec<String>,
+  pub scope: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofCertificate {
   pub session: String,
@@ -41,6 +53,10 @@ pub struct ProofCertificate {
   /// cgroup via the user manager were found and killed at session end.
   #[serde(default)]
   pub census: Option<(usize, usize)>,
+  /// P9.2: artifact-scan factor. None = no scan ran (unconfigured) or
+  /// clean delta (findings-only-negative — no claim either way).
+  #[serde(default)]
+  pub artifact_scan: Option<ArtifactScan>,
   pub quality_label: String,
 }
 
@@ -86,6 +102,11 @@ pub fn assemble_certificate(
   // N6 census attestation: read the census file if present.
   let census = read_census(state_dir, session);
 
+  // P9.2 artifact-scan factor: read the scan evidence from the spine.
+  // Findings-only-negative: only a finding delta produces a factor;
+  // a clean delta or no scan = None (no claim either way).
+  let artifact_scan = read_artifact_scan(state_dir, session);
+
   let quality_label = match (bounds_verdict, proofs_passed, test_rerun_passed, spine_exists) {
     ("STAYED_IN_BOUNDS", p, t, true) if p > 0 && t => "STRONG",
     ("STAYED_IN_BOUNDS", p, _, true) if p > 0 => "MODERATE",
@@ -109,7 +130,34 @@ pub fn assemble_certificate(
       verdict: placebo_verdict.to_string(),
     },
     census,
+    artifact_scan,
     quality_label: quality_label.to_string(),
+  })
+}
+
+/// Read the P9.2 artifact-scan factor from the session spine. The
+/// daemon emits `vuln_introduced` events with the finding summary;
+/// the scanner identity and scope are recorded in the event detail.
+fn read_artifact_scan(state_dir: &Path, session: &str) -> Option<ArtifactScan> {
+  let sink = EventSink::for_session(state_dir, session).ok()?;
+  let events = sink.read_all().ok()?;
+  let ev = events.iter().find(|e| e.kind == "vuln_introduced")?;
+  let detail = ev.path.clone();
+  let scanner = detail
+    .split("scanner=")
+    .nth(1)
+    .and_then(|s| s.split(')').next())
+    .unwrap_or("unknown")
+    .to_string();
+  let new_findings: Vec<String> = detail
+    .split(": ")
+    .nth(1)
+    .map(|s| s.split(';').map(|f| f.trim().to_string()).collect())
+    .unwrap_or_default();
+  Some(ArtifactScan {
+    scanner,
+    new_findings,
+    scope: "session-touched files only; scanner coverage is partial — absence of findings is NOT evidence of safety".into(),
   })
 }
 

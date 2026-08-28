@@ -53,6 +53,9 @@ pub enum Signal {
   AuditMismatch,
   /// Bless-broker forged nonce attempt (floor 0, project frozen).
   ForgedNonce,
+  /// P9.2: artifact scan found NEW findings in session-touched files
+  /// at keep (findings-only-negative: a clean delta earns nothing).
+  VulnIntroduced,
 }
 
 impl Signal {
@@ -65,6 +68,7 @@ impl Signal {
       Signal::CanaryHit => -50.0,
       Signal::AuditMismatch => -10.0,
       Signal::ForgedNonce => f64::NEG_INFINITY,
+      Signal::VulnIntroduced => -15.0,
     }
   }
 
@@ -77,6 +81,7 @@ impl Signal {
       Signal::CanaryHit => "canary_hit",
       Signal::AuditMismatch => "audit_mismatch",
       Signal::ForgedNonce => "forged_nonce",
+      Signal::VulnIntroduced => "vuln_introduced",
     }
   }
 }

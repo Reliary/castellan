@@ -73,6 +73,18 @@ struct Grant {
   granted_ts: u64,
 }
 
+/// P9.2: context for the keep-gate artifact scan (background thread).
+/// The config pin is captured BEFORE kill (kill removes the session
+/// from the registry), so the scan thread never looks it up.
+#[derive(Debug, Clone)]
+struct ScanCtx {
+  session: String,
+  project: PathBuf,
+  touched: Vec<String>,
+  state_dir: PathBuf,
+  pinned_config_sha: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
   root: Arc<CgroupRoot>,
@@ -939,6 +951,8 @@ impl Daemon {
       "canary_hit" => Signal::CanaryHit,
       "audit_mismatch" => Signal::AuditMismatch,
       "forged_nonce" => Signal::ForgedNonce,
+      "vuln_introduced" => Signal::VulnIntroduced,
+      "vuln_introduced" => Signal::VulnIntroduced,
       other => return Response::err(format!("unknown signal: {other}")),
     };
     let ev = TrustEvent {
@@ -1388,10 +1402,10 @@ impl Daemon {
       }
     };
     // commit needs the real project root — read it from the registry
-    let project = {
+    let (project, pinned_config_sha) = {
       let reg = self.registry.lock().unwrap();
       match reg.get(&session.to_string()) {
-        Some(s) => s.project.clone(),
+        Some(s) => (s.project.clone(), s.config_sha.clone()),
         None => return Response::err("unknown session"),
       }
     };
@@ -1456,6 +1470,31 @@ impl Daemon {
             },
           );
         }
+        // P9.2: artifact scan at the keep gate. Baseline-delta on
+        // session-touched files; findings-only-negative (a clean delta
+        // earns nothing). Config-pinned via config_sha (same mechanism
+        // as test_cmd). The scan runs in a background thread; the cert
+        // is amended when done; the trust signal applies to the NEXT
+        // launch — never retroactively punish after a human keep.
+        let touched: Vec<String> = applied
+          .iter()
+          .filter_map(|l| l.strip_prefix("+ ").or_else(|| l.strip_prefix("- ")))
+          .map(|p| p.to_string())
+          .collect();
+        let scan_ctx = ScanCtx {
+          session: session.to_string(),
+          project: project.clone(),
+          touched,
+          state_dir: Self::state_dir(),
+          pinned_config_sha: pinned_config_sha.clone(),
+        };
+        let scan_daemon = self.clone();
+        std::thread::Builder::new()
+          .name("scan".into())
+          .spawn(move || {
+            let _ = scan_daemon.run_artifact_scan(&scan_ctx);
+          })
+          .expect("scan thread");
         let lines: Vec<serde_json::Value> =
           applied.iter().map(|l| serde_json::Value::String(l.clone())).collect();
         // N3: the user kept this session — fold its HV into the
@@ -1478,6 +1517,161 @@ impl Daemon {
       }
       Err(e) => Response::err(format!("commit failed: {e}")),
     }
+  }
+
+  /// P9.2: capture the artifact-scan baseline at spawn. The baseline
+  /// is the set of files with findings in the pre-session tree; the
+  /// keep-gate scan diffs against it. Config-pinned (same mechanism
+  /// as test_cmd). Best-effort: a scan failure at spawn means no
+  /// baseline, and the keep-gate scan is skipped (honestly labeled).
+  fn capture_scan_baseline(&self, session: &str, project: &Path) {
+    let cfg_path = project.join(".reliary/castellan.toml");
+    let Ok(cfg) = std::fs::read_to_string(&cfg_path) else {
+      return;
+    };
+    let Ok(parsed) = cfg.parse::<toml::Value>() else {
+      return;
+    };
+    let Some(scan) = parsed.get("scan") else {
+      return;
+    };
+    let Some(scanner) = scan.get("scanner").and_then(|c| c.as_str()) else {
+      return;
+    };
+    let Some(cmd) = scan.get("cmd").and_then(|c| c.as_str()) else {
+      return;
+    };
+    let argv: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+    if argv.is_empty() {
+      return;
+    }
+    let cfg = castellan_scan::ScannerConfig { scanner: scanner.to_string(), cmd: argv };
+    match castellan_scan::run_scanner(&cfg, project) {
+      Ok(r) => {
+        let files: Vec<String> = r.findings.iter().map(|f| f.file.clone()).collect();
+        let dir = Self::state_dir().join("castellan/sessions");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+          dir.join(format!("{session}.baseline")),
+          serde_json::to_string(&files).unwrap_or_default(),
+        );
+      }
+      Err(e) => {
+        eprintln!("castellan-daemon: artifact-scan baseline failed at spawn: {e}");
+      }
+    }
+  }
+
+  /// P9.2: keep-gate artifact scan. Baseline-delta on session-touched
+  /// files; findings-only-negative (a clean delta earns nothing).
+  /// Config-pinned via config_sha (same mechanism as test_cmd). Runs
+  /// in a background thread; the trust signal applies to the NEXT
+  /// launch — never retroactively punish after a human keep.
+  fn run_artifact_scan(&self, ctx: &ScanCtx) {
+    let pinned = ctx.pinned_config_sha.clone();
+    let current = project_config_sha(&ctx.project);
+    match verify_config_pin(&pinned, &current) {
+      ConfigVerdict::NotPinned => {
+        eprintln!("castellan-daemon: project config not pinned at launch — artifact scan refused");
+        return;
+      }
+      ConfigVerdict::Drifted => {
+        eprintln!(
+          "castellan-daemon: project config changed since launch — artifact scan REFUSED (possible agent tampering)"
+        );
+        return;
+      }
+      ConfigVerdict::Ok => {}
+    }
+    let cfg_path = ctx.project.join(".reliary/castellan.toml");
+    let Ok(cfg) = std::fs::read_to_string(&cfg_path) else {
+      eprintln!("castellan-daemon: no .reliary/castellan.toml — artifact scan skipped");
+      return;
+    };
+    let Ok(parsed) = cfg.parse::<toml::Value>() else {
+      eprintln!("castellan-daemon: unparseable .reliary/castellan.toml — artifact scan skipped");
+      return;
+    };
+    let Some(scan) = parsed.get("scan") else {
+      eprintln!("castellan-daemon: no [scan] section — artifact scan skipped");
+      return;
+    };
+    let Some(scanner) = scan.get("scanner").and_then(|c| c.as_str()) else {
+      eprintln!("castellan-daemon: no [scan] scanner — artifact scan skipped");
+      return;
+    };
+    let Some(cmd) = scan.get("cmd").and_then(|c| c.as_str()) else {
+      eprintln!("castellan-daemon: no [scan] cmd — artifact scan skipped");
+      return;
+    };
+    let argv: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+    if argv.is_empty() {
+      eprintln!("castellan-daemon: empty [scan] cmd — artifact scan skipped");
+      return;
+    }
+    let cfg = castellan_scan::ScannerConfig { scanner: scanner.to_string(), cmd: argv };
+    // baseline: the pre-session state captured at spawn (persisted as
+    // <session>.baseline). A baseline scanned at keep would see the
+    // session's own changes and the delta would always be empty.
+    let baseline_files: Vec<String> = std::fs::read_to_string(
+      Self::state_dir().join("castellan/sessions").join(format!("{}.baseline", ctx.session)),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str(&raw).ok())
+    .unwrap_or_default();
+    let baseline = castellan_scan::ScanResult {
+      scanner: scanner.to_string(),
+      findings: baseline_files
+        .iter()
+        .map(|f| castellan_scan::Finding {
+          file: f.clone(),
+          line: 0,
+          class: "baseline".into(),
+          severity: "low".into(),
+          rule_id: "baseline".into(),
+        })
+        .collect(),
+    };
+    let current_scan = match castellan_scan::run_scanner(&cfg, &ctx.project) {
+      Ok(r) => r,
+      Err(e) => {
+        eprintln!("castellan-daemon: artifact scan failed: {e}");
+        return;
+      }
+    };
+    let delta = castellan_scan::delta_findings(&baseline, &current_scan, &ctx.touched);
+    if delta.is_empty() {
+      // findings-only-negative: a clean delta earns NOTHING
+      eprintln!("castellan-daemon: artifact scan clean delta — no signal (by design)");
+      return;
+    }
+    let detail = format!(
+      "{} new finding(s) in session-touched files (scanner={}): {}",
+      delta.len(),
+      scanner,
+      delta
+        .iter()
+        .map(|f| format!("{}:{} {}", f.file, f.line, f.class))
+        .collect::<Vec<_>>()
+        .join("; ")
+    );
+    let mut db = self.trust.lock().unwrap();
+    let _ = db.apply(
+      &ctx.project,
+      &TrustEvent {
+        ts: castellan_core::now_unix(),
+        session: ctx.session.clone(),
+        signal: Signal::VulnIntroduced,
+        evidence: format!("artifact scan: {detail}"),
+      },
+    );
+    if let Ok(sink) = EventSink::for_session(&ctx.state_dir, &ctx.session) {
+      let _ = sink.emit("vuln_introduced", &detail, "negative");
+    }
+    eprintln!(
+      "castellan-daemon: artifact scan found {} new finding(s) in session-touched files — trust signal applied",
+      delta.len()
+    );
   }
 
   /// Factor A: daemon-side test re-run. The config is read from the
@@ -1618,6 +1812,11 @@ impl Daemon {
       config_sha: pinned,
       started_at: castellan_core::now_unix(),
     });
+    // P9.2: capture the artifact-scan BASELINE at spawn — the
+    // pre-session state. The keep-gate scan diffs against this; a
+    // baseline captured at keep would see the session's own changes
+    // and the delta would always be empty.
+    self.capture_scan_baseline(&id, &project);
     self.start_audit(&id, &harness, &project);
     // durable session->project mapping: certificates must work for
     // finished sessions (transferable proof), so persist at spawn

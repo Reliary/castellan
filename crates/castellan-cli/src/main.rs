@@ -422,25 +422,10 @@ fn launch(args: &[String], sock: &str) -> ! {
     eprintln!("failed to join session cgroup: {e}");
     std::process::exit(1);
   }
-  if enforce {
-    let mut policy = castellan_policy::Policy::new(&session, &harness, project.clone());
-    if net {
-      let port = rpc(sock, &serde_json::json!({ "op": "honeypot_port" }));
-      let port: u16 = serde_json::from_str(&port)
-        .ok()
-        .and_then(|v: serde_json::Value| v["port"].as_u64().map(|p| p as u16))
-        .unwrap_or(0);
-      if port == 0 {
-        eprintln!("--net requested but daemon honeypot is detached; continuing WITHOUT net lockdown");
-      } else {
-        policy.set_net(castellan_policy::NetMode::Loopback(vec![port]));
-      }
-    }
-    if let Err(e) = castellan_envelope::apply_envelope(&policy) {
-      eprintln!("failed to apply envelope (fail-closed): {e}");
-      std::process::exit(1);
-    }
-  }
+  // undo overlay FIRST: setup enters a user+mount namespace and mounts
+  // the overlay. The envelope's seccomp filter blocks mount(2), so
+  // applying the envelope before the overlay would break forced
+  // fail-closed sessions (tiers 0-1 force undo regardless of flags).
   if undo {
     // overlay setup enters a user+mount namespace; every write the agent
     // makes lands in the session upper layer. undo/diff/commit operate
@@ -464,6 +449,25 @@ fn launch(args: &[String], sock: &str) -> ! {
         eprintln!("failed to set up undo overlay (continuing WITHOUT undo): {e}");
         undo = false;
       }
+    }
+  }
+  if enforce {
+    let mut policy = castellan_policy::Policy::new(&session, &harness, project.clone());
+    if net {
+      let port = rpc(sock, &serde_json::json!({ "op": "honeypot_port" }));
+      let port: u16 = serde_json::from_str(&port)
+        .ok()
+        .and_then(|v: serde_json::Value| v["port"].as_u64().map(|p| p as u16))
+        .unwrap_or(0);
+      if port == 0 {
+        eprintln!("--net requested but daemon honeypot is detached; continuing WITHOUT net lockdown");
+      } else {
+        policy.set_net(castellan_policy::NetMode::Loopback(vec![port]));
+      }
+    }
+    if let Err(e) = castellan_envelope::apply_envelope(&policy) {
+      eprintln!("failed to apply envelope (fail-closed): {e}");
+      std::process::exit(1);
     }
   }
   eprintln!(
@@ -702,6 +706,15 @@ fn render(line: &str) -> String {
         out.push_str(&format!("quality: {label}\n"));
         out.push_str(&format!("bounds: {bounds} ({} out-of-bounds)\n", oob));
         out.push_str(&format!("placebo: {placebo} ({} proofs, tests {})\n", proofs, if tests { "pass" } else { "n/a" }));
+        if let Some(scan) = cert.get("artifact_scan") {
+          let scanner = scan.get("scanner").and_then(|x| x.as_str()).unwrap_or("?");
+          let findings = scan.get("new_findings").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+          out.push_str(&format!("artifact: {} new finding(s) (scanner={})\n", findings.len(), scanner));
+          for f in findings.iter().take(5) {
+            out.push_str(&format!("  FINDING {}\n", f.as_str().unwrap_or("?")));
+          }
+          out.push_str("  scope: session-touched files only; absence of findings is NOT evidence of safety\n");
+        }
       }
       if let Some(rp) = v.get("extra").and_then(|e| e.get("replay")) {
         let verdict = rp.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
@@ -794,6 +807,11 @@ fn render(line: &str) -> String {
           let ss = mem.get("self_shapes").and_then(|x| x.as_u64()).unwrap_or(0);
           out.push_str(&format!("memory: {iw} incident(s), {sw} self write(s), {ss} self shape(s)\n"));
         }
+      }
+      if let Some(tr) = v.get("extra").and_then(|e| e.get("trust")) {
+        let score = tr.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let tier = tr.get("tier").and_then(|x| x.as_str()).unwrap_or("?");
+        out.push_str(&format!("trust: score {score:.1} (tier {tier})\n"));
       }
       if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
         let undo = pf.get("undo").and_then(|x| x.as_bool()).unwrap_or(false);

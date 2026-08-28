@@ -49,9 +49,11 @@ enum Outcome {
 fn outcome(signal: Signal) -> Outcome {
   match signal {
     Signal::ProofPassed | Signal::CleanSession => Outcome::Good,
-    Signal::UserRevert | Signal::CanaryHit | Signal::EnvelopeEscape | Signal::AuditMismatch => {
-      Outcome::Bad
-    }
+    Signal::UserRevert
+    | Signal::CanaryHit
+    | Signal::EnvelopeEscape
+    | Signal::AuditMismatch
+    | Signal::VulnIntroduced => Outcome::Bad,
     Signal::ForgedNonce => Outcome::Bad,
   }
 }
@@ -62,7 +64,7 @@ fn signal_rank(signal: Signal) -> u8 {
   match signal {
     Signal::CanaryHit | Signal::EnvelopeEscape => 3,
     Signal::ForgedNonce => 2,
-    Signal::UserRevert | Signal::AuditMismatch => 1,
+    Signal::UserRevert | Signal::AuditMismatch | Signal::VulnIntroduced => 1,
     Signal::ProofPassed | Signal::CleanSession => 0,
   }
 }

@@ -106,6 +106,7 @@ dependencies = [
  "castellan-proof",
  "castellan-radar",
  "castellan-replay",
+ "castellan-scan",
  "castellan-trust",
  "castellan-voice",
  "nix",
@@ -207,6 +208,14 @@ dependencies = [
  "castellan-core",
  "castellan-policy",
  "serde",
+]
+
+[[package]]
+name = "castellan-scan"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

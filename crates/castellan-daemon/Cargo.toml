@@ -31,6 +31,7 @@ castellan-ledger = { path = "../castellan-ledger" }
 castellan-scan = { path = "../castellan-scan" }
 castellan-hub = { path = "../castellan-hub" }
 castellan-trace = { path = "../castellan-trace" }
+castellan-decoy = { path = "../castellan-decoy" }
 sha2 = "0.10"
 toml = "0.8"
 serde = { workspace = true }

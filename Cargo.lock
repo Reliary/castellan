@@ -97,6 +97,7 @@ dependencies = [
  "castellan-campaign",
  "castellan-canary",
  "castellan-core",
+ "castellan-decoy",
  "castellan-drill",
  "castellan-envelope",
  "castellan-freezer",
@@ -117,6 +118,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+]
+
+[[package]]
+name = "castellan-decoy"
+version = "0.1.0"
+dependencies = [
+ "castellan-proof",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

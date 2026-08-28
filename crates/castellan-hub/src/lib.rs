@@ -78,6 +78,18 @@ pub fn index_path(project: &Path) -> PathBuf {
   project.join(".stria/phrases.sqlite")
 }
 
+/// sha256 of the stria index, or None if it does not exist. The
+/// P9.4 weight is read at keep from a file inside the agent's write
+/// roots; the spawn-time pin is the authority (see Session::hub_index_sha).
+pub fn index_sha(project: &Path) -> Option<String> {
+  use sha2::{Digest, Sha256};
+  let path = index_path(project);
+  let bytes = std::fs::read(&path).ok()?;
+  let mut h = Sha256::new();
+  h.update(&bytes);
+  Some(format!("{:x}", h.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

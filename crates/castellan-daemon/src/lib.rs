@@ -1516,7 +1516,28 @@ impl Daemon {
           .map(|p| p.to_string())
           .collect();
         let hub_db = castellan_hub::index_path(&project);
-        let weight = castellan_hub::session_weight(&hub_db, &touched);
+        // P9.4 gap-plug: the weight is only trusted if the index is
+        // byte-identical to the spawn-time pin. Missing index or
+        // drifted pin -> weight 1.0 (neutral). The pin is read from
+        // the DURABLE session record (the registry entry was removed
+        // by kill above — the durable record survives).
+        let pinned_index_sha = Self::durable_session_meta(&session.to_string())
+          .and_then(|m| m.get("hub_index_sha").and_then(|v| v.as_str()).map(String::from));
+        let weight = if let Some(pinned) = pinned_index_sha {
+          if castellan_hub::index_sha(&project).as_deref() == Some(pinned.as_str()) {
+            castellan_hub::session_weight(&hub_db, &touched)
+          } else {
+            eprintln!(
+              "castellan-daemon: stria index changed since launch — weight neutral (possible agent tampering)"
+            );
+            if let Ok(sink) = EventSink::for_session(&Self::state_dir(), session) {
+              let _ = sink.emit("hub_index_drift", ".stria/phrases.sqlite", "neutral");
+            }
+            1.0
+          }
+        } else {
+          1.0
+        };
         // user kept the session: positive trust signal
         let mut db = self.trust.lock().unwrap();
         let _ = db.apply_weighted(
@@ -1947,12 +1968,20 @@ impl Daemon {
     };
     let config_sha = project_config_sha(&project);
     let pinned = config_sha.clone();
+    // P9.4 gap-plug: pin the stria phrase index at spawn. The weight
+    // is read at keep from a file inside the agent's write roots —
+    // an unpinned read lets the agent rewrite the index mid-session
+    // to inflate positive trust signals. Neutral-fail (weight 1.0)
+    // on missing/mismatched pin: weighting is advisory, so neutral
+    // is the right failure mode (unlike test_cmd's refuse).
+    let hub_index_sha = castellan_hub::index_sha(&project);
     self.registry.lock().unwrap().insert(Session {
       id: id.clone(),
       harness: harness.clone(),
       project: project.clone(),
       config_sha: pinned,
       started_at: castellan_core::now_unix(),
+      hub_index_sha,
     });
     // P9.2: capture the artifact-scan BASELINE at spawn — the
     // pre-session state. The keep-gate scan diffs against this; a
@@ -2007,6 +2036,7 @@ impl Daemon {
         "project": project.display().to_string(),
         "harness": harness,
         "config_sha": config_sha,
+        "hub_index_sha": castellan_hub::index_sha(project),
         "command": command,
         "enforce": enforce,
         "undo": undo,
@@ -2342,6 +2372,29 @@ mod tests {
       ConfigVerdict::NotPinned
     ));
     assert!(matches!(verify_config_pin(&None, &None), ConfigVerdict::NotPinned));
+  }
+
+  #[test]
+  fn hub_index_sha_missing_when_no_index() {
+    let dir = std::env::temp_dir().join(format!("castellan-hubpin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(castellan_hub::index_sha(&dir).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn hub_index_sha_changes_when_tampered() {
+    let dir = std::env::temp_dir().join(format!("castellan-hubpin2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".stria")).unwrap();
+    let idx = dir.join(".stria/phrases.sqlite");
+    std::fs::write(&idx, b"index-v1").unwrap();
+    let before = castellan_hub::index_sha(&dir).expect("index exists");
+    std::fs::write(&idx, b"index-v2-tampered").unwrap();
+    let after = castellan_hub::index_sha(&dir).expect("index exists");
+    assert_ne!(before, after, "tampered index must change the pin");
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]

@@ -8,3 +8,4 @@ description = "P9.4 blast-radius-weighted trust: hub scores from the stria phras
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { workspace = true }
+sha2 = "0.10"

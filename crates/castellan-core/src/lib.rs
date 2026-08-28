@@ -24,6 +24,15 @@ pub struct Session {
   /// session cgroup via the user manager.
   #[serde(default)]
   pub started_at: u64,
+  /// sha256 of the project's stria phrase index (.stria/phrases.sqlite)
+  /// at spawn time. None = no index at launch. The P9.4 blast-radius
+  /// weight is read at KEEP from this file, which lives inside the
+  /// agent's write roots — an agent could rewrite the index mid-session
+  /// to make its touched files look like hubs and inflate positive
+  /// trust signals. On missing/mismatched pin the weight is 1.0
+  /// (neutral, not refused — weighting is advisory).
+  #[serde(default)]
+  pub hub_index_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

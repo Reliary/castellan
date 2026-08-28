@@ -14,6 +14,12 @@ fn main() {
       }
     }
     let target = std::path::Path::new(&denied).join("drill-probe");
+    // the probe must be meaningful regardless of HOME contents: create
+    // the parent BEFORE the envelope so a missing dir (ENOENT) can
+    // never masquerade as a denied write (EACCES)
+    if let Some(parent) = target.parent() {
+      let _ = std::fs::create_dir_all(parent);
+    }
     match std::fs::write(&target, b"probe") {
       Ok(()) => {
         eprintln!("drill-envelope: WRITE SUCCEEDED — envelope broken");

@@ -932,8 +932,16 @@ impl Daemon {
     let nonce = self.drill.issue();
     let session = format!("drill-{nonce}");
     let policy = castellan_policy::Policy::new(&session, "drill", std::path::PathBuf::from("/tmp"));
-    let denied = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let denied = std::path::Path::new(&denied).join(".ssh");
+    // the denied path must be the REAL user home, not $HOME: the lab
+    // redirects HOME into a sacrificial dir under /tmp, which is the
+    // drill's write root — a redirected ~/.ssh would be inside the
+    // allowed set and the write would legitimately succeed
+    let denied = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+      .ok()
+      .flatten()
+      .map(|u| u.dir)
+      .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/root".into()).into());
+    let denied = denied.join(".ssh");
     let mut child = match std::process::Command::new(std::env::current_exe().unwrap_or_default())
       .arg("--drill-envelope")
       .arg(&denied)

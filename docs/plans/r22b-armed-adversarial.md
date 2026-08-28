@@ -179,3 +179,19 @@ unexercised; lab fixes verified working (canaries armed, rail clean,
 daemon stable). Full report: docs/ATTACK_EXERCISE.md R22b section.
 Part B (adversarial model) pending: requires ollama install + model
 pull approval, or the defensive reframe.
+
+## Status: Part A2 COMPLETE (2026-08-28) — defensive reframe
+
+3 full audits (D2, D3, D4), 2 aborted (todowrite auto-reject), 1
+partial (D6). The audits found real, verified weaknesses with zero
+harm and zero trace: classify_caller fails open (fork/reap race
+wins Human classification — VERIFIED LIVE), child-pid cgroup
+migration escapes the scope, the C10 escape flips the C25 socket
+identity to Human, --undo is not interposed, an unwired real
+credential sat inside the envelope, freezer ownership separation
+is not implemented, seccomp is a denylist not an allowlist. The
+daemon is a privileged confused deputy. Fix priority (all audits
+converge): socket auth deny-by-default. Full report:
+docs/ATTACK_EXERCISE.md R22b Part A2 section. C29 recorded in
+THREAT_MODEL. Part B (adversarial model) still pending: requires
+ollama install + model pull approval.

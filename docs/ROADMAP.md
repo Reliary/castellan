@@ -143,7 +143,13 @@ Kernel findings recorded during build:
 
 **Kill criteria (all met):** channels kernel-verified inventory (UDP/unix/DNS/fd OPEN recorded); scanner ≥70% direction discrimination (100/100/90%); hub separation 1.17; trace chain identified live; decoy both directions live; policycheck injected regression flagged.
 
-**Not built (honest):** semgrep adapter live-verified (no binary on this machine — parser + config path ship, capability-detected); UDP/unix/fd channel closures (kernel limitations — Landlock ABI4 has no UDP rights; seccomp cannot filter by sockaddr; fd revocation would need seccomp user-notif, designed not built); pharmaco daemon wiring (fleet-blocked).
+**Not built (honest):** UDP/unix/fd channel closures (kernel limitations — Landlock ABI4 has no UDP rights; seccomp cannot filter by sockaddr; fd revocation would need seccomp user-notif, designed not built); pharmaco daemon wiring (fleet-blocked).
+
+**Gap-plugging 2026-08-28 (all four gaps closed):**
+- 9.4 index pin: sha256 of `.stria/phrases.sqlite` captured at spawn, weight 1.0 (neutral) on missing/mismatched pin — closes the mid-session index-rewrite gaming vector.
+- 9.4 honest re-measurement: the original kill criterion (separation 1.17) passed by accident — SQLite's bitwise ops parse BLOB flags as ASCII text, so `flags & 3` only worked when the byte was an ASCII digit. Fixed by decoding flags in Rust + a keyword filter (definition-df <= 3). Re-measured: top-third avg 1.663 vs bottom-third avg 1.025, separation 0.637, sign test 225/0. Live-verified through the daemon: hub-file touch weight 1.73, leaf-file touch weight 1.00, pin held.
+- 9.6 wired: `castellan policycheck <project> <candidate>` verb + daemon op + `test/shell.d/p9-policycheck.sh` (6/6 PASS). Live-verified on scan-proj's kept sessions: narrower root → FALSE_NEW_DENIES, identical root → NO_FALSE_NEW_DENIES.
+- semgrep live-verified: 1.172.0 installed (pysemgrep entrypoint; the OCaml wrapper needs pysemgrep on PATH). Local offline rule (gets() detection), live keep → finding → vuln_introduced trust signal → evidence names scanner=semgrep.
 
 ## Total
 

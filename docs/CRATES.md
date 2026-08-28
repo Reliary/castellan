@@ -20,6 +20,11 @@ castellan/
 │   ├── castellan-memory/           P8.1 Kanerva-immune memory: SDM (vendored from engfield), fragment recall, self/tolerance shapes
 │   ├── castellan-voice/            P8.3 acoustic channel: nonce grammar, panic phrase, protocol state machine (STT/TTS feature-gated)
 │   ├── castellan-pharmaco/         P8.4 pharmacovigilance: PRR/ROR/EBGM estimators (methodology only, fleet-pending)
+│   ├── castellan-scan/             P9.2 pluggable artifact scanner: findings interface, relay-vuln + semgrep adapters, baseline-delta
+│   ├── castellan-hub/              P9.4 blast-radius-weighted trust: stria phrase-index fan-out (grammar-free, pure Rust)
+│   ├── castellan-trace/            P9.3 cross-session contact tracing: spine index, exposure scoring
+│   ├── castellan-decoy/            P9.5 decoy-vulnerability edit canaries: direction-sensitive tripwires
+│   ├── castellan-policycheck/      P9.6 policy regression replay: kept-spine replay through candidate policies
 │   ├── castellan-bless/            dbus nonce-gated approval, rate limit, fp-toggle biometric integration
 │   ├── castellan-watch/            harness-state-watcher: skein + carrion baseline, skill quarantine
 │   ├── castellan-daemon/           unix socket, single-writer-per-session, watchdog, all-component orchestration
@@ -64,6 +69,11 @@ castellan-watch → skein (Rust crate), carrion (Rust crate)
 castellan-memory → blake3 (SDM vendored from engfield, MIT)
 castellan-campaign → castellan-core, castellan-trust (signature module: P8.2)
 castellan-pharmaco → standalone estimators (P8.4, no daemon wiring yet)
+castellan-scan → standalone (P9.2, subprocess adapters, config-pinned)
+castellan-hub → rusqlite over the stria phrase index (P9.4)
+castellan-trace → rusqlite spine index (P9.3)
+castellan-decoy → castellan-proof (danger_signal) (P9.5)
+castellan-policycheck → castellan-replay, castellan-trust, castellan-policy (P9.6)
 ```
 
 ## Pure Rust — no Python in the daemon

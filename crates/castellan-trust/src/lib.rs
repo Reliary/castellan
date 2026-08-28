@@ -160,9 +160,21 @@ impl TrustDb {
   /// Apply a signal. Returns the new score and tier.
   /// Ceiling: a project cannot gain more than one tier per day.
   pub fn apply(&mut self, project: &Path, ev: &TrustEvent) -> rusqlite::Result<ProjectTrust> {
+    self.apply_weighted(project, ev, 1.0)
+  }
+
+  /// Apply a signal with a blast-radius weight (P9.4). The weight
+  /// scales the delta: a hub-function fix earns more, a hub-function
+  /// regression costs more. Weight 1.0 = neutral (no index).
+  pub fn apply_weighted(
+    &mut self,
+    project: &Path,
+    ev: &TrustEvent,
+    weight: f64,
+  ) -> rusqlite::Result<ProjectTrust> {
     let hash = project_hash(project);
     let before = self.score(project)?;
-    let mut new_score = before.score + ev.signal.delta();
+    let mut new_score = before.score + ev.signal.delta() * weight;
     if new_score.is_infinite() || new_score < 0.0 {
       new_score = 0.0;
     }

@@ -29,6 +29,7 @@ castellan-memory = { path = "../castellan-memory" }
 castellan-voice = { path = "../castellan-voice" }
 castellan-ledger = { path = "../castellan-ledger" }
 castellan-scan = { path = "../castellan-scan" }
+castellan-hub = { path = "../castellan-hub" }
 sha2 = "0.10"
 toml = "0.8"
 serde = { workspace = true }

@@ -1424,19 +1424,34 @@ impl Daemon {
     match castellan_ledger::commit(&project, &upper) {
       Ok(applied) => {
         let _ = castellan_ledger::discard(&upper, &work);
+        // P9.4: blast-radius weight for this session's touches. The
+        // stria index may not exist (async build, never blocks) —
+        // weight 1.0 = neutral. A hub-function edit earns more trust
+        // (and a hub regression costs more).
+        let touched: Vec<String> = applied
+          .iter()
+          .filter_map(|l| l.strip_prefix("+ ").or_else(|| l.strip_prefix("- ")))
+          .map(|p| p.to_string())
+          .collect();
+        let hub_db = castellan_hub::index_path(&project);
+        let weight = castellan_hub::session_weight(&hub_db, &touched);
         // user kept the session: positive trust signal
         let mut db = self.trust.lock().unwrap();
-        let _ = db.apply(
+        let _ = db.apply_weighted(
           &project,
           &TrustEvent {
             ts: castellan_core::now_unix(),
             session: session.to_string(),
             signal: Signal::CleanSession,
-            evidence: format!("user kept session; {} change(s) committed", applied.len()),
+            evidence: format!(
+              "user kept session; {} change(s) committed (blast-radius weight {weight:.2})",
+              applied.len()
+            ),
           },
+          weight,
         );
         if !passed.is_empty() {
-          let _ = db.apply(
+          let _ = db.apply_weighted(
             &project,
             &TrustEvent {
               ts: castellan_core::now_unix(),
@@ -1452,6 +1467,7 @@ impl Daemon {
                   .join(", ")
               ),
             },
+            weight,
           );
         }
         // Factor A: daemon re-runs the pre-existing test suite in a
@@ -1476,11 +1492,6 @@ impl Daemon {
         // as test_cmd). The scan runs in a background thread; the cert
         // is amended when done; the trust signal applies to the NEXT
         // launch — never retroactively punish after a human keep.
-        let touched: Vec<String> = applied
-          .iter()
-          .filter_map(|l| l.strip_prefix("+ ").or_else(|| l.strip_prefix("- ")))
-          .map(|p| p.to_string())
-          .collect();
         let scan_ctx = ScanCtx {
           session: session.to_string(),
           project: project.clone(),

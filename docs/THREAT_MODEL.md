@@ -159,6 +159,9 @@ An external attacker targets the agent, the harness, or the safety system.
 ### C21. Artifact-scan gaming (P9.2)
 **mitigated by design.** The scanner command is config-pinned at spawn (config_sha — the S0 mechanism); a shimmed scanner is human-visible in the cert (identity + config hash) and can never EARN trust (findings-only-negative — a fake-clean scan suppresses a negative at worst, same bounded exposure class as test_cmd). The scanner's coverage is partial (relay-vuln emits one vuln_class, genome C-biased) — the cert states non-coverage explicitly, never "0 findings". Residual: a real vuln the scanner cannot see passes (documented; the scanner is one negative input among canary/census/placebo, never a gate).
 
+### C21a. Hub-index poisoning (P9.4, found-then-fixed 2026-08-28)
+**fixed.** The blast-radius weight is read at keep from `.stria/phrases.sqlite`, which lives inside the agent's write roots — an agent could rewrite the index mid-session to make its touched files look like hubs and inflate positive trust signals. The spawn-time sha256 pin (Session::hub_index_sha, persisted in the durable session record) is the authority: on missing/mismatched pin the weight is 1.0 (neutral, not refused — weighting is advisory). Drift emits a `hub_index_drift` spine event. Bounded residual: the +1 tier/day ceiling caps any inflation even if the pin were bypassed.
+
 ### C22. Decoy mimicry (P9.5)
 **residual.** An agent that reads decoys and backdoors around them (or recognizes the shapes) is not constrained — decoys observe, not constrain. The corpus is daemon-owned (planted from CVEfixes shapes at plant time; the agent has no write path). Weaponizing a decoy is a freeze-tier event; fixing an unrequested decoy is annotation-only by design (proactive benign agents exist).
 
@@ -191,6 +194,7 @@ An external attacker targets the agent, the harness, or the safety system.
 | Acoustic residuals (C19) | residual | documented (P8.3) |
 | Tolerance erosion (C20) | residual | innate immunity not tolerance-gated (P8.1) |
 | Artifact-scan gaming (C21) | mitigated by design | config-pinned + findings-only-negative (P9.2) |
+| Hub-index poisoning (C21a) | fixed | spawn-time sha256 pin, neutral-fail (P9.4, 2026-08-28) |
 | Decoy mimicry (C22) | residual | decoys observe, not constrain (P9.5) |
 | Contact-tracing blind spots (C23) | residual | reads invisible, lower bound stated (P9.3) |
 | Policy-replay gaming (C24) | mitigated by design | hash-chained spines, advisory at release (P9.6) |

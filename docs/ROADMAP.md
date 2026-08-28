@@ -150,6 +150,7 @@ Kernel findings recorded during build:
 - 9.4 honest re-measurement: the original kill criterion (separation 1.17) passed by accident — SQLite's bitwise ops parse BLOB flags as ASCII text, so `flags & 3` only worked when the byte was an ASCII digit. Fixed by decoding flags in Rust + a keyword filter (definition-df <= 3). Re-measured: top-third avg 1.663 vs bottom-third avg 1.025, separation 0.637, sign test 225/0. Live-verified through the daemon: hub-file touch weight 1.73, leaf-file touch weight 1.00, pin held.
 - 9.6 wired: `castellan policycheck <project> <candidate>` verb + daemon op + `test/shell.d/p9-policycheck.sh` (6/6 PASS). Live-verified on scan-proj's kept sessions: narrower root → FALSE_NEW_DENIES, identical root → NO_FALSE_NEW_DENIES.
 - semgrep live-verified: 1.172.0 installed (pysemgrep entrypoint; the OCaml wrapper needs pysemgrep on PATH). Local offline rule (gets() detection), live keep → finding → vuln_introduced trust signal → evidence names scanner=semgrep.
+- **Composed-verified 2026-08-28**: `test/shell.d/p9-stack.sh` — one fresh project, one daemon, everything composed in single sessions (overlay + placebo + hub weight + artifact scan + decoys + trace + policycheck). 12/12 PASS. Session A (good) and Session B (bad: decoy weaponized → DECOY TRIP, trace exposes B) in one flow.
 
 ## Total
 

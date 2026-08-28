@@ -185,6 +185,83 @@ impl CgroupRoot {
       })
       .count()
   }
+
+  /// B2 (red-team finding R4): stop user transient units started
+  /// during the session window OUTSIDE the session scope. The census
+  /// kills the escaped process, but a unit with Restart=always
+  /// respawns it — killing processes is not enough; the UNIT must be
+  /// stopped.
+  ///
+  /// Clock-domain note: systemd's ActiveEnterTimestampMonotonic is
+  /// CLOCK_MONOTONIC, which diverges from /proc/uptime (CLOCK_BOOTTIME)
+  /// by the suspend time — comparing them directly is wrong (measured:
+  /// 3.25h offset on this machine). Instead, the unit's MainPID is
+  /// checked with the SAME /proc/<pid>/stat starttime math the census
+  /// uses (btime + start_ticks/hz), which is one proven domain.
+  pub fn stop_escaped_units(&self, session: &SessionId, session_start_unix: u64) -> usize {
+    let scope = self.session_dir(session);
+    let scope_str = scope.to_string_lossy().to_string();
+    let btime = proc_btime();
+    let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+      .ok()
+      .flatten()
+      .map(|h| h as u64)
+      .unwrap_or(100);
+    let list = std::process::Command::new("systemctl")
+      .args(["--user", "list-units", "--type=service", "--no-legend", "--plain"])
+      .output();
+    let Ok(list) = list else { return 0 };
+    let Ok(text) = String::from_utf8(list.stdout) else { return 0 };
+    let mut stopped = 0usize;
+    for line in text.lines() {
+      let unit = line.split_whitespace().next().unwrap_or("").to_string();
+      if unit.is_empty() || !unit.ends_with(".service") {
+        continue;
+      }
+      let show = std::process::Command::new("systemctl")
+        .args(["--user", "show", &unit, "-p", "MainPID", "-p", "ControlGroup"])
+        .output();
+      let Ok(show) = show else { continue };
+      let Ok(show_text) = String::from_utf8(show.stdout) else { continue };
+      let mut main_pid = 0u32;
+      let mut cgroup = String::new();
+      for kv in show_text.lines() {
+        if let Some(v) = kv.strip_prefix("MainPID=") {
+          main_pid = v.trim().parse::<u32>().unwrap_or(0);
+        } else if let Some(v) = kv.strip_prefix("ControlGroup=") {
+          cgroup = v.trim().to_string();
+        }
+      }
+      if main_pid == 0 {
+        continue;
+      }
+      if cgroup.contains(&scope_str) {
+        continue;
+      }
+      // same starttime math as orphan_census: /proc/<pid>/stat
+      let stat = match fs::read_to_string(format!("/proc/{main_pid}/stat")) {
+        Ok(s) => s,
+        Err(_) => continue,
+      };
+      let Some(rest) = stat.rsplit_once(')') else { continue };
+      let fields: Vec<&str> = rest.1.split_whitespace().collect();
+      let Some(start_ticks) = fields.get(19).and_then(|f| f.parse::<u64>().ok()) else {
+        continue;
+      };
+      let start_unix = btime + start_ticks.div_ceil(hz);
+      if start_unix < session_start_unix {
+        continue;
+      }
+      // a unit whose main process started during the session window,
+      // outside the session scope — stop it (the census's kill would
+      // be undone by Restart=always)
+      let _ = std::process::Command::new("systemctl")
+        .args(["--user", "stop", &unit])
+        .status();
+      stopped += 1;
+    }
+    stopped
+  }
 }
 
 fn proc_btime() -> u64 {

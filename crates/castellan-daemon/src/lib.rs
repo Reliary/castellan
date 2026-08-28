@@ -2159,6 +2159,14 @@ impl Daemon {
           msgs.push(format!("{id}: orphan census {}/{} killed", killed, orphans.len()));
           self.record_census(&id, orphans.len(), killed);
         }
+        // B2 (red-team R4): a transient unit with Restart=always
+        // respawns the escaped process — killing processes is not
+        // enough, the UNIT must be stopped. The census's kill would
+        // be undone by systemd within seconds.
+        let units_stopped = self.root.stop_escaped_units(&id, start);
+        if units_stopped > 0 {
+          msgs.push(format!("{id}: {units_stopped} escaped unit(s) stopped"));
+        }
       }
       let _ = self.root.destroy_session(&id);
       self.registry.lock().unwrap().remove(&id);

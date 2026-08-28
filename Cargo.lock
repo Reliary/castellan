@@ -162,6 +162,7 @@ name = "castellan-freezer"
 version = "0.1.0"
 dependencies = [
  "castellan-core",
+ "libc",
  "nix",
 ]
 

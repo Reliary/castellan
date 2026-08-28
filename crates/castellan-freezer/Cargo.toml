@@ -8,3 +8,4 @@ description = "cgroup v2 freezer ownership: freeze/thaw/kill session process tre
 [dependencies]
 castellan-core = { path = "../castellan-core" }
 nix = { workspace = true }
+libc = "0.2"

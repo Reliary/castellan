@@ -207,12 +207,62 @@ impl CgroupRoot {
       .flatten()
       .map(|h| h as u64)
       .unwrap_or(100);
+    let mut stopped = 0usize;
+    // B4 (frontier round R15): timer units have MainPID=0, so the
+    // service sweep below skips them — a timer created during the
+    // session window fires LATER, outside any envelope, unattributable.
+    // Sweep timers by their ActiveEnterTimestampMonotonic, converted
+    // into the boottime domain (CLOCK_MONOTONIC excludes suspend time;
+    // /proc/uptime and /proc/<pid>/stat starttime are boottime-based —
+    // the B2 clock-domain bug measured a 3.25h divergence).
+    let mono_offset = monotonic_to_boottime_offset();
+    let session_start_boottime = session_start_unix.saturating_sub(btime) as f64;
+    let list_timers = std::process::Command::new("systemctl")
+      .args(["--user", "list-units", "--type=timer", "--no-legend", "--plain"])
+      .output();
+    if let Ok(list_timers) = list_timers {
+      if let Ok(text) = String::from_utf8(list_timers.stdout) {
+        for line in text.lines() {
+          let unit = line.split_whitespace().next().unwrap_or("").to_string();
+          if !unit.ends_with(".timer") {
+            continue;
+          }
+          let show = std::process::Command::new("systemctl")
+            .args(["--user", "show", &unit, "-p", "ActiveEnterTimestampMonotonic", "-p", "ControlGroup"])
+            .output();
+          let Ok(show) = show else { continue };
+          let Ok(show_text) = String::from_utf8(show.stdout) else { continue };
+          let mut active_mono = 0u64;
+          let mut cgroup = String::new();
+          for kv in show_text.lines() {
+            if let Some(v) = kv.strip_prefix("ActiveEnterTimestampMonotonic=") {
+              active_mono = v.trim().parse::<u64>().unwrap_or(0);
+            } else if let Some(v) = kv.strip_prefix("ControlGroup=") {
+              cgroup = v.trim().to_string();
+            }
+          }
+          if active_mono == 0 {
+            continue;
+          }
+          if cgroup.contains(&scope_str) {
+            continue;
+          }
+          let start_boottime = active_mono as f64 / 1e6 + mono_offset;
+          if start_boottime < session_start_boottime {
+            continue;
+          }
+          let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .status();
+          stopped += 1;
+        }
+      }
+    }
     let list = std::process::Command::new("systemctl")
       .args(["--user", "list-units", "--type=service", "--no-legend", "--plain"])
       .output();
-    let Ok(list) = list else { return 0 };
-    let Ok(text) = String::from_utf8(list.stdout) else { return 0 };
-    let mut stopped = 0usize;
+    let Ok(list) = list else { return stopped };
+    let Ok(text) = String::from_utf8(list.stdout) else { return stopped };
     for line in text.lines() {
       let unit = line.split_whitespace().next().unwrap_or("").to_string();
       if unit.is_empty() || !unit.ends_with(".service") {
@@ -262,6 +312,24 @@ impl CgroupRoot {
     }
     stopped
   }
+}
+
+/// CLOCK_MONOTONIC excludes suspend time; /proc/uptime (boottime
+/// domain) includes it. The offset (uptime - monotonic, seconds) is
+/// measured at sweep time so timer timestamps can be compared against
+/// boottime-domain session starts.
+fn monotonic_to_boottime_offset() -> f64 {
+  let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+  let ok = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+  if ok != 0 {
+    return 0.0;
+  }
+  let mono_s = ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9;
+  let uptime = fs::read_to_string("/proc/uptime")
+    .ok()
+    .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+    .unwrap_or(0.0);
+  uptime - mono_s
 }
 
 fn proc_btime() -> u64 {

@@ -338,8 +338,14 @@ fn bless_req(args: &[String]) -> serde_json::Value {
       };
       serde_json::json!({"op": "bless_reject", "nonce": nonce})
     }
+    // B6 P3: the request nonce is delivered out-of-band (daemon
+    // journal). `bless show` prints the pending nonces the human can
+    // read from the journal, matching request-time hints.
+    Some("show") => {
+      serde_json::json!({"op": "bless_show"})
+    }
     _ => {
-      eprintln!("usage: castellan bless <request|approve|reject> ...");
+      eprintln!("usage: castellan bless <request|approve|reject|show> ...");
       std::process::exit(2);
     }
   }
@@ -707,29 +713,37 @@ fn render(line: &str) -> String {
           out.push_str(&format!("{}\n", a.as_str().unwrap_or("?")));
         }
       }
-      if let Some(bless) = v.get("extra").and_then(|e| e.get("bless")) {
-        if let Some(nonce) = bless.get("nonce").and_then(|n| n.as_str()) {
-          out.push_str(&format!("nonce: {nonce}\n"));
-        }
-        if let Some(want) = bless.get("want").and_then(|w| w.as_str()) {
-          out.push_str(&format!("want: {want}\n"));
-        }
-        if let Some(session) = bless.get("session").and_then(|s| s.as_str()) {
-          out.push_str(&format!("session: {session}\n"));
-        }
-        if let Some(note) = bless.get("note").and_then(|n| n.as_str()) {
-          out.push_str(&format!("note: {note}\n"));
-        }
-        if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
-          out.push_str(&format!("approved: {approved}\n"));
-        }
-        if let Some(channel) = bless.get("channel").and_then(|c| c.as_str()) {
-          out.push_str(&format!("channel: {channel}\n"));
-        }
-        if let Some(attempts) = bless.get("attempts_left").and_then(|a| a.as_u64()) {
-          out.push_str(&format!("attempts_left: {attempts}\n"));
-        }
-      }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
+        if let Some(bless) = v.get("extra").and_then(|e| e.get("bless")) {
+          if let Some(hint) = bless.get("nonce_hint").and_then(|n| n.as_str()) {
+            out.push_str(&format!("nonce_hint: {hint}\n"));
+          }
+          if let Some(want) = bless.get("want").and_then(|w| w.as_str()) {
+            out.push_str(&format!("want: {want}\n"));
+          }
+          if let Some(session) = bless.get("session").and_then(|s| s.as_str()) {
+            out.push_str(&format!("session: {session}\n"));
+          }
+          if let Some(note) = bless.get("note").and_then(|n| n.as_str()) {
+            out.push_str(&format!("note: {note}\n"));
+          }
+          if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
+            out.push_str(&format!("approved: {approved}\n"));
+          }
+          if let Some(channel) = bless.get("channel").and_then(|c| c.as_str()) {
+            out.push_str(&format!("channel: {channel}\n"));
+          }
+          if let Some(attempts) = bless.get("attempts_left").and_then(|a| a.as_u64()) {
+            out.push_str(&format!("attempts_left: {attempts}\n"));
+          }
+          if let Some(pending) = bless.get("pending").and_then(|p| p.as_array()) {
+            for p in pending {
+              let hint = p.get("nonce_hint").and_then(|x| x.as_str()).unwrap_or("?");
+              let want = p.get("want").and_then(|x| x.as_str()).unwrap_or("?");
+              let sess = p.get("session").and_then(|x| x.as_str()).unwrap_or("?");
+              out.push_str(&format!("  pending {want} for {sess} (hint {hint}) — nonce in daemon journal\n"));
+            }
+          }
+        }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
         let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
         let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
         let oob = cert.get("bounds").and_then(|b| b.get("out_of_bounds_attempts")).and_then(|x| x.as_u64()).unwrap_or(0);

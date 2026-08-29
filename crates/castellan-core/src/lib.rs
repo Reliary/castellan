@@ -177,6 +177,11 @@ pub enum Request {
   BlessReject {
     nonce: String,
   },
+  /// Bless-broker: list pending requests (hint + want + session). The
+  /// full nonce is delivered out-of-band via the daemon journal (B6
+  /// P3); this op shows what is pending so the human can match a
+  /// journal entry.
+  BlessShow,
   /// Assemble a ProofCertificate for a session (daemon-as-verifier).
   Cert {
     session: SessionId,

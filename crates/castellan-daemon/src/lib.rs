@@ -431,6 +431,7 @@ impl Daemon {
       }
       Request::BlessApprove { nonce } => self.bless_approve(&nonce),
       Request::BlessReject { nonce } => self.bless_reject(&nonce),
+      Request::BlessShow => self.bless_show(),
       Request::Cert { session } => self.cert(&session),
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
       Request::PolicyCheck { project, candidate_project } => {
@@ -1261,6 +1262,14 @@ impl Daemon {
       return Response::err("cooling-off period active (5 minutes between expansions)");
     }
     let nonce = castellan_core::new_bless_nonce();
+    // B6 P3 (D4-F1): the nonce is delivered OUT-OF-BAND — printed to
+    // the daemon's journal (stderr), never returned in the socket
+    // response. The response carries only the hint. The residual: a
+    // same-uid agent that can read the journal can recover the nonce
+    // (same-uid advisory-defender position, A3 knot — documented);
+    // what is closed is the same-connection self-grant: request and
+    // approve can no longer be completed without a second channel.
+    eprintln!("castellan-daemon: bless nonce for {session}: {nonce} (want={want})");
     let req = BlessRequest {
       session: session.to_string(),
       project: project.clone(),
@@ -1286,10 +1295,10 @@ impl Daemon {
     Response::ok().with_extra(
       "bless",
       serde_json::json!({
-        "nonce": nonce,
         "want": want,
         "session": session,
-        "note": "nonce is for the human operator only — never pass it to the agent",
+        "nonce_hint": &nonce[..8],
+        "note": "nonce issued — read it from the daemon journal (castellan bless show)",
       }),
     )
   }
@@ -1506,6 +1515,32 @@ impl Daemon {
   /// (never in practice — nonces are 32-hex, ids are s-prefixed).
   fn session_project_by_hint(&self, _nonce: &str) -> Option<PathBuf> {
     None
+  }
+
+  /// B6 P3: list pending bless requests (hint + want + session). The
+  /// human reads the full nonce from the daemon journal; this op
+  /// confirms which requests are pending so `bless approve` can be
+  /// matched against a journal entry. Nonces themselves never leave
+  /// the daemon.
+  fn bless_show(&self) -> Response {
+    let pending: Vec<serde_json::Value> = {
+      let b = self.bless.lock().unwrap();
+      let mut items: Vec<(&String, &BlessRequest)> = b.iter().collect();
+      items.sort_by_key(|(n, _)| n.clone());
+      items
+        .into_iter()
+        .map(|(nonce, req)| {
+          serde_json::json!({
+            "nonce_hint": &nonce[..nonce.len().min(8)],
+            "session": req.session,
+            "want": req.want,
+            "reason": req.reason,
+            "created_ts": req.created_ts,
+          })
+        })
+        .collect()
+    };
+    Response::ok().with_extra("bless", serde_json::json!({ "pending": pending }))
   }
 
   fn canary_register(&self, session: &str, _project: &Path, _harness: &str) -> Response {

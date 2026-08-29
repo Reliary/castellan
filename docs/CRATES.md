@@ -15,7 +15,7 @@ castellan/
 │   ├── castellan-replay/           action-stream extraction, overlayfs shadow execution, permissive-case diff
 │   ├── castellan-egress/           HTTP proxy, real-cred injection, canary honeypot listener
 │   ├── castellan-canary/           credential planting, honeypot trigger → freeze wiring
-│   ├── castellan-radar/            sensor-hdc encoding, ed25519 signing, local outlier, fleet sync
+│   ├── castellan-radar/            sensor-hdc encoding, local outlier (ed25519 signing: DESIGN-ONLY — see commitment #9)
 │   ├── castellan-drill/            P8.0 live-fire drills: nonce registry, scheduler, 5-drill suite
 │   ├── castellan-memory/           P8.1 Kanerva-immune memory: SDM (vendored from engfield), fragment recall, self/tolerance shapes
 │   ├── castellan-voice/            P8.3 acoustic channel: nonce grammar, panic phrase, protocol state machine (STT/TTS feature-gated)
@@ -45,7 +45,7 @@ castellan/
 - **zbus** (pure Rust, no libdbus) for systemd user manager `StartTransientUnit` and dbus nonce-gated bless broker.
 - **nix** crate for Landlock, seccomp, cgroup, inotify, overlayfs, user-namespace syscalls — well-maintained, idiomatic.
 - **blake3** for content-addressed before-images (matches stria/relay).
-- **ed25519-dalek** for per-machine HV signing.
+- **ed25519-dalek** for per-machine HV signing — **not currently a dependency**; listed only because commitment #9 (DESIGN-ONLY) would need it. Do not add until the signing feature is actually built.
 - **mimalloc** global allocator.
 - **rustc-hash FxHash** maps in hot paths (matches reliary-agent).
 - **ahash** where insertion-heavy and not security-sensitive (matches reliary-compress).

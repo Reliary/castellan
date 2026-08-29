@@ -1,9 +1,11 @@
 # B6 — Enforcement-first hardening plan
 
-Status: PLANNED (not built). Derived from R22b Part A2 (C29 defensive
-audits, D2/D3/D4) and the antagonism pass over the audits' converge-point
-fix ("socket auth deny-by-default with daemon-minted tokens").
-Branch: p10-b6 (to be created from quattro).
+Status: DONE (2026-08-29). Phases 1-5 built and verified; phase 6
+(validation) ran as part of each phase: P0 15/15, P1 13/13, P2 17/17,
+P3 5/5, P4 5/5, p9-stack 12/12 x3, 117 unit tests, clippy clean.
+Commits: 43c0be5 (P1), 9959d31 (P2), 50bd940 (P3), 221934b (P3b),
+19f131f (P4). Phase 5 docs done; D'-round re-audit is the remaining
+open item (optional).
 
 ## 0. Origin
 

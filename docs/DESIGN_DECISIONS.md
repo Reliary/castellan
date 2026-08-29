@@ -91,15 +91,15 @@ This document records what antagonism killed, what it hardened, and why each of 
 **Without this:** daemon downtime = agents run unobserved.
 **Commitment:** systemd watchdog restarts the daemon and freezes all agent scopes on heartbeat loss. Landlock + cgroup persist without the daemon (kernel-enforced), so enforcement survives daemon death. Fail-closed.
 
-### C8. seccomp is an allowlist, blocks chmod/chown/utime + io_uring + ptrace + process_vm_readv
+### C8. seccomp is a denylist (re-labelled 2026-08-29 — the allowlist claim was false, B6 D4-F10)
 **Attack:** Landlock doesn't cover chmod/chown/utime/ioctl; io_uring can bypass; ptrace/process_vm_readv are namespace-escape primitives.
-**Without this:** the Landlock ABI gap is a real hole; future new syscalls are unknown unknowns.
-**Commitment:** seccomp BPF allowlist. Blocks the metadata-manipulation family (Landlock gap), io_uring (GhostClaw), ptrace, process_vm_readv. Everything not on the allowlist is blocked by default, so future syscalls are denied until reviewed.
+**Without this:** the Landlock ABI gap is a real hole.
+**Commitment:** seccomp BPF **denylist, default-ALLOW**. Blocks the metadata-manipulation family (chmod/fchmod/fchmodat/chown/fchown/fchownat/lchown/utime/utimes/utimensat/futimesat — Landlock gap), io_uring (GhostClaw), ptrace, process_vm_readv. A real allowlist is deferred until a harness-scoped probe proves it survivable (B6 A5). The A3 rejection below argued allowlist; the implemented state is denylist and the docs say so truthfully.
 
-### C9. HVs are signed per-machine
+### C9. HVs are signed per-machine — DESIGN-ONLY, not implemented (B6 D4-F10)
 **Attack:** agent forges HVs to poison fleet radar; or a malicious machine ships bad HVs.
 **Without this:** fleet detection is spoofable.
-**Commitment:** the daemon signs every HV with its per-machine ed25519 key (key outside any envelope). Fleet sync verifies signatures. Agent cannot sign.
+**Commitment:** the daemon signs every HV with its per-machine ed25519 key (key outside any envelope). Fleet sync verifies signatures. Agent cannot sign. **STATUS: designed, not built.** No ed25519 code exists in the workspace; HV integrity currently rests on daemon-write-only storage. Revisit before any fleet sync.
 
 ### C10. Bless broker is nonce-gated, rate-limited, biometric for high-risk
 **Attack:** agent forges an approval to self-expand its envelope; or socially engineers the human at scale.

@@ -52,7 +52,7 @@ grep -q OUT_FAIL "$WORK/enforce.out" && ok "home write DENIED under enforce (Lan
 "$BIN/castellan" kill "$SID" >/dev/null 2>&1
 
 echo "== AUDIT: same behavior runs unrestricted but is classified =="
-"$BIN/castellan" launch --harness claude --project "$WORK/proj" -- bash -c "
+"$BIN/castellan" launch --harness claude --project "$WORK/proj" --no-enforce -- bash -c "
   echo inside > '$WORK/proj/src/inside2.txt'
   echo outside > ~/castellan-escape2.txt
   sleep 0.8

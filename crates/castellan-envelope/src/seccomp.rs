@@ -35,6 +35,13 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     libc::SYS_swapoff,
     libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_fsetxattr,
     libc::SYS_removexattr, libc::SYS_lremovexattr, libc::SYS_fremovexattr,
+    // B6 phase 1: chown/utime families. chmod is deliberately NOT
+    // blocked: git chmods .git/config.lock during init/commit (P1
+    // kernel finding — verified live: blocking chmod breaks git).
+    // The chmod residual is ownership-bounded: the agent can only
+    // chmod files it owns inside the Landlock write roots.
+    libc::SYS_chown, libc::SYS_fchown, libc::SYS_lchown, libc::SYS_fchownat,
+    libc::SYS_utime, libc::SYS_utimes, libc::SYS_utimensat, libc::SYS_futimesat,
   ]
 }
 

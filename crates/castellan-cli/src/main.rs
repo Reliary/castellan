@@ -348,7 +348,7 @@ fn bless_req(args: &[String]) -> serde_json::Value {
 fn launch(args: &[String], sock: &str) -> ! {
   let mut harness: Option<String> = None;
   let mut project = std::env::current_dir().unwrap_or_default();
-  let mut enforce = false;
+  let mut enforce = true;
   let mut undo = false;
   let mut net = false;
   let mut grants: Vec<String> = Vec::new();
@@ -365,6 +365,7 @@ fn launch(args: &[String], sock: &str) -> ! {
         i += 1;
       }
       "--enforce" => enforce = true,
+      "--no-enforce" => enforce = false,
       "--undo" => undo = true,
       "--net" => net = true,
       "--grant" if i + 1 < args.len() => {
@@ -385,7 +386,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   let cmd = match cmd {
     Some(c) if !c.is_empty() => c,
     _ => {
-      eprintln!("usage: castellan launch [--harness H] [--project P] [--enforce] [--undo] [--net] [--grant WANT] -- <command> [args...]");
+      eprintln!("usage: castellan launch [--harness H] [--project P] [--no-enforce] [--undo] [--net] [--grant WANT] -- <command> [args...]");
       std::process::exit(2);
     }
   };
@@ -499,6 +500,9 @@ fn launch(args: &[String], sock: &str) -> ! {
       eprintln!("failed to apply envelope (fail-closed): {e}");
       std::process::exit(1);
     }
+  }
+  if !enforce {
+    eprintln!("castellan: AUDIT MODE — observation only, no containment (--no-enforce)");
   }
   eprintln!(
     "castellan session {session}{}{} launched",
@@ -916,7 +920,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan thaw   [session]       thaw all sessions or one");
   eprintln!("  castellan kill   [session]       kill all sessions or one");
   eprintln!("  castellan spawn --harness H [--project P] [--pid PID]");
-  eprintln!("  castellan launch [--harness H] [--project P] [--enforce] -- CMD [args...]");
+  eprintln!("  castellan launch [--harness H] [--project P] [--no-enforce] [--undo] [--net] -- CMD [args...]");
   eprintln!("  castellan audit <session>     show envelope violations for a session");
   eprintln!("  castellan adopt <session> <pid> [pid...]   move running procs into a scope");
   eprintln!("  castellan bless request --session S --want W [--reason R]");

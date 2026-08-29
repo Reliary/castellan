@@ -123,7 +123,6 @@ impl CgroupRoot {
       return Vec::new();
     }
     let scope = self.session_dir(session);
-    let scope_str = scope.to_string_lossy().to_string();
     // the user manager is the direct parent of escaped processes; scan
     // /proc for it rather than assuming the daemon's own parent is the
     // user manager (true only when the daemon runs as a user service)
@@ -167,7 +166,13 @@ impl CgroupRoot {
           Ok(c) => c,
           Err(_) => continue,
         };
-        if cg.contains(&scope_str) {
+        // any scope under castellan.slice is a legitimate session —
+        // ours or a sibling's (the p0 suite's command substitution
+        // reparents sibling sleeps to the user manager; claiming them
+        // as orphans killed the collateral sessions). A pid in the
+        // slice ROOT without a scope, though, is the F3 direct-
+        // migration escape and must be claimed.
+        if cg.contains("castellan.slice") && cg.contains(".scope") {
           continue;
         }
         orphans.push(pid);

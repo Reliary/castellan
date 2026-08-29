@@ -534,13 +534,31 @@ impl Daemon {
     for s in &sessions {
       if let Ok(sink) = EventSink::for_session(&state, s) {
         if let Ok(events) = sink.read_all() {
+          // B6 phase 1: with enforce-by-default, the overlay substrate
+          // is actually interposed — writes land in per-session upper
+          // dirs (`<state>/castellan/sessions/<sid>/overlay/upper/...`),
+          // so raw paths never match across sessions and the exposure
+          // join is empty. Map upper paths back to the session's
+          // canonical project (durable spawn mapping); fall back to
+          // stripping the session prefix when the mapping is gone.
+          let project = Self::durable_project(s);
+          let upper_prefix = format!(
+            "{}/castellan/sessions/{s}/overlay/upper/",
+            state.display()
+          );
           let writes: Vec<castellan_trace::WriteEvent> = events
             .iter()
             .filter(|e| e.kind == "fs_write" && e.verdict == "allow")
-            .map(|e| castellan_trace::WriteEvent {
-              session: s.clone(),
-              path: e.path.clone(),
-              ts: e.ts,
+            .map(|e| {
+              let path = if let Some(p) = &project {
+                e.path
+                  .strip_prefix(&upper_prefix)
+                  .map(|rel| p.join(rel).display().to_string())
+                  .unwrap_or_else(|| e.path.clone())
+              } else {
+                e.path.clone()
+              };
+              castellan_trace::WriteEvent { session: s.clone(), path, ts: e.ts }
             })
             .collect();
           let _ = castellan_trace::index_session(&conn, &writes);

@@ -455,12 +455,11 @@ fn launch(args: &[String], sock: &str) -> ! {
       .join(&session);
     match castellan_ledger::setup(&project, &scratch) {
       Ok(o) => {
-        // B3: the note must be sent BEFORE joining the session cgroup —
-        // the daemon classifies socket callers by cgroup membership, and
-        // a caller inside a session scope is an agent (human-only ops
-        // blocked). The upper path is deterministic, so the note can
-        // precede the join.
-        rpc(sock, &serde_json::json!({ "op": "note", "session": session, "kind": "undo", "detail": o.upper.display().to_string() }));
+        // B6 P3: the undo-layer record is populated daemon-side at
+        // spawn (deterministic path) — the launcher's socket Note is
+        // gone. The daemon classifies socket callers by cgroup
+        // membership; joining happens right below, after which the
+        // CLI is an agent and human-only ops are blocked.
         if let Err(e) = std::env::set_current_dir(&o.merged) {
           eprintln!("failed to chdir into merged view: {e}");
           std::process::exit(1);

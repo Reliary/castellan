@@ -125,11 +125,6 @@ pub enum Request {
     session: Option<SessionId>,
   },
   Status,
-  Note {
-    session: SessionId,
-    kind: String,
-    detail: String,
-  },
   UndoDiff {
     session: SessionId,
   },
@@ -140,7 +135,10 @@ pub enum Request {
     session: SessionId,
   },
   /// Generate canary secrets for a session, register them with the
-  /// honeypot, and return them (plus the honeypot port) to the launcher.
+  /// honeypot, and return the HONEYPOT PORT to the launcher. The
+  /// secrets themselves are NOT returned in the response (B6 P3:
+  /// the response is visible to the agent, so returning them is a
+  /// canary oracle — R19). They persist in the canary ledger.
   CanaryRegister {
     session: SessionId,
     project: PathBuf,
@@ -152,8 +150,12 @@ pub enum Request {
   TrustScore {
     project: PathBuf,
   },
-  /// Apply a trust signal to a project.
-  TrustSignal {
+  /// TEST-ONLY (benchmark suites): apply a trust signal. The
+  /// production daemon rejects this op outright (B6 P3: the agent
+  /// must not be able to farm trust — R3/R8). Env-gated: the daemon
+  /// only accepts it when CASTELLAN_TEST_TRUST_SIGNAL is set.
+  #[serde(rename = "trust_signal")]
+  TestTrustSignal {
     project: PathBuf,
     session: SessionId,
     signal: String,

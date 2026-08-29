@@ -122,7 +122,7 @@ impl CgroupRoot {
     if std::env::var("CASTELLAN_TEST_DISABLE_CENSUS").is_ok() {
       return Vec::new();
     }
-    let scope = self.session_dir(session);
+    let _scope = self.session_dir(session);
     // the user manager is the direct parent of escaped processes; scan
     // /proc for it rather than assuming the daemon's own parent is the
     // user manager (true only when the daemon runs as a user service)

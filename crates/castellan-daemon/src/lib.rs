@@ -354,15 +354,22 @@ impl Daemon {
       | Request::Thaw { session: Some(session) }
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
-      | Request::Note { session, .. }
       | Request::CanaryRegister { session, .. }
       | Request::BlessRequest { session, .. }
-      | Request::TrustSignal { session, .. } => Some(session.clone()),
+      | Request::TestTrustSignal { session, .. } => Some(session.clone()),
       _ => None,
     };
-    let project = session
-      .as_ref()
-      .and_then(|s| self.registry.lock().unwrap().get(s).map(|r| r.project.clone()));
+        let project = session
+          .as_ref()
+          .and_then(|s| self.registry.lock().unwrap().get(s).map(|r| r.project.clone()))
+          .or_else(|| {
+            // session-less ops (Thaw{None}, Kill{None}) carry no
+            // session: no project to floor. Record unattributable
+            // rejections in the spine so the human can see them
+            // (D4 used session-less Thaw{None} precisely because
+            // unattributed ops left no trace).
+            None
+          });
     if let Some(project) = project {
       let ev = TrustEvent {
         ts: castellan_core::now_unix(),
@@ -378,6 +385,13 @@ impl Daemon {
       if let Ok(sink) = EventSink::for_session(&Self::state_dir(), s) {
         let _ = sink.emit("forged_socket_op", &format!("{:?}", req), "deny");
       }
+    } else {
+      // session-less rejections still get a spine record (B6 P3):
+      // D4's race used Thaw{None} because it left no trace. Write to
+      // the session-less channel.
+      if let Ok(sink) = EventSink::for_session(&Self::state_dir(), "system") {
+        let _ = sink.emit("forged_socket_op", &format!("{:?}", req), "deny");
+      }
     }
   }
 
@@ -391,7 +405,6 @@ impl Daemon {
       Request::Thaw { session } => self.freeze(session.as_ref(), false),
       Request::Kill { session } => self.kill(session.as_ref()),
       Request::Status => self.status(),
-      Request::Note { session, kind, detail } => self.note(&session, &kind, &detail),
       Request::UndoDiff { session } => self.undo_diff(&session),
       Request::UndoDiscard { session } => self.undo_discard(&session),
       Request::UndoCommit { session } => self.undo_commit(&session),
@@ -402,8 +415,16 @@ impl Daemon {
         Response::ok().with_extra("port", serde_json::json!(self.honeypot.port))
       }
       Request::TrustScore { project } => self.trust_score(&project),
-      Request::TrustSignal { project, session, signal, evidence } => {
-        self.trust_signal(&project, &session, &signal, &evidence)
+      Request::TestTrustSignal { project, session, signal, evidence } => {
+        // B6 P3: the trust stream is daemon-internal; an agent that
+        // can farm it (R3/R8) can buy its own egress. The op survives
+        // only for the benchmark suites (p3/p4), env-gated so a
+        // production daemon refuses it outright.
+        if std::env::var("CASTELLAN_TEST_TRUST_SIGNAL").is_err() {
+          Response::err("trust_signal is a test-only op (set CASTELLAN_TEST_TRUST_SIGNAL)")
+        } else {
+          self.trust_signal(&project, &session, &signal, &evidence)
+        }
       }
       Request::BlessRequest { session, want, reason } => {
         self.bless_request(&session, &want, &reason)
@@ -1507,8 +1528,10 @@ impl Daemon {
     let decoy_dir = scratch.join("decoy");
     let decoys = castellan_decoy::plant(&decoy_dir).unwrap_or_default();
     let decoy_count = decoys.len();
-    let secrets: Vec<serde_json::Value> =
-      planted.secrets.iter().map(|s| serde_json::Value::String(s.value.clone())).collect();
+    // B6 P3 (R19): the secrets are NOT returned in the response — the
+    // response is visible to the agent, so returning them is a canary
+    // oracle teaching the exact bytes to strip. They persist in the
+    // canary ledger (canary.jsonl, reloaded at startup).
     Response::ok()
       .with_message("canaries planted")
       .with_extra(
@@ -1516,35 +1539,9 @@ impl Daemon {
         serde_json::json!({
           "dir": planted.dir.display().to_string(),
           "port": self.honeypot.port,
-          "secrets": secrets,
           "decoys": decoy_count,
         }),
       )
-  }
-
-  fn note(&self, session: &str, kind: &str, detail: &str) -> Response {
-    // capture the project's stat manifest at undo-layer creation: the
-    // placebo proof's "before" must be the launch-time state, so
-    // external edits during the session void affected pairs
-    let manifest = if kind == "undo" {
-      let project = {
-        let reg = self.registry.lock().unwrap();
-        reg.get(&session.to_string()).map(|s| s.project.clone())
-      };
-      project.and_then(|p| castellan_proof::BaselineManifest::capture(&p).ok())
-    } else {
-      None
-    };
-    let mut notes = self.notes.lock().unwrap();
-    let entry = notes.entry(session.to_string()).or_default();
-    match kind {
-      "undo" => {
-        entry.undo_upper = Some(PathBuf::from(detail));
-        entry.baseline = manifest;
-      }
-      _ => return Response::err(format!("unknown note kind: {kind}")),
-    }
-    Response::ok().with_message(format!("noted {kind}"))
   }
 
   fn undo_diff(&self, session: &str) -> Response {
@@ -2127,6 +2124,26 @@ impl Daemon {
       started_at: castellan_core::now_unix(),
       hub_index_sha,
     });
+    // B6 P3: the undo-layer record used to arrive via a socket Note
+    // from the launcher — a socket op with a legitimate caller, but
+    // also a surface (R17 evidence poisoning). The upper path is
+    // deterministic (state_dir/castellan/sessions/<id>/overlay/upper)
+    // and the placebo baseline should be the spawn-time state, so
+    // populate the notes map here. The launcher's Note call is gone.
+    if undo {
+      let upper = Self::state_dir()
+        .join("castellan/sessions")
+        .join(&id)
+        .join("overlay/upper");
+      let baseline = castellan_proof::BaselineManifest::capture(&project).ok();
+      self.notes.lock().unwrap().insert(
+        id.clone(),
+        SessionNotes {
+          undo_upper: Some(upper),
+          baseline,
+        },
+      );
+    }
     // P9.2: capture the artifact-scan BASELINE at spawn — the
     // pre-session state. The keep-gate scan diffs against this; a
     // baseline captured at keep would see the session's own changes

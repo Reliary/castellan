@@ -142,7 +142,16 @@ fn mount_overlay(project: &Path, upper: &Path, work: &Path, merged: &Path) -> io
     MsFlags::empty(),
     Some(opts.as_str()),
   )
-  .map_err(|e| io::Error::other(format!("overlay mount: {e}")))
+  .map_err(|e| io::Error::other(format!("overlay mount: {e}")))?;
+  // B6 phase 2 interposition: real harnesses chdir to the canonical
+  // project path (`opencode run --dir <canonical>` etc), bypassing
+  // the merged view — writes landed on the real fs (D2-F5/D4-F8).
+  // Bind merged OVER the canonical path inside the agent's mount ns:
+  // the canonical path now resolves to the overlay view, the real
+  // project is covered, and `--dir canonical` writes land in upper.
+  // Only this process's mount ns sees the bind (MS_PRIVATE above).
+  mount::<Path, Path, str, str>(Some(merged), project, Some("none"), MsFlags::MS_BIND, None)
+    .map_err(|e| io::Error::other(format!("bind merged over project: {e}")))
 }
 
 #[derive(Debug, serde::Serialize)]

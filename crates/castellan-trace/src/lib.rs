@@ -44,19 +44,44 @@ pub fn open_index(state_dir: &Path) -> rusqlite::Result<Connection> {
        ts INTEGER NOT NULL
      );
      CREATE INDEX IF NOT EXISTS idx_writes_path ON writes(path);
-     CREATE INDEX IF NOT EXISTS idx_writes_session ON writes(session);",
+     CREATE INDEX IF NOT EXISTS idx_writes_session ON writes(session);
+     -- per-session high-water mark: last ts already indexed, so
+     -- re-running trace never re-reads the whole spine (the 2MB
+     -- drill corpus made every trace call spin at 29% CPU).
+     CREATE TABLE IF NOT EXISTS watermark (
+       session TEXT PRIMARY KEY,
+       max_ts INTEGER NOT NULL
+     );",
   )?;
   Ok(conn)
 }
 
+/// The per-session high-water mark: the largest ts already indexed.
+pub fn watermark(conn: &Connection, session: &str) -> rusqlite::Result<u64> {
+  conn
+    .query_row("SELECT max_ts FROM watermark WHERE session = ?1", [session], |r| r.get(0))
+    .or_else(|e| match e {
+      rusqlite::Error::QueryReturnedNoRows => Ok(0),
+      other => Err(other),
+    })
+}
+
 /// Index a session's spine write events (fs_write allow verdicts).
 /// Idempotent per (session, path, ts): re-indexing a session after
-/// rotation must not duplicate.
+/// rotation must not duplicate. Only events STRICTLY AFTER the
+/// watermark are inserted, then the watermark advances.
 pub fn index_session(conn: &Connection, events: &[WriteEvent]) -> rusqlite::Result<()> {
   for e in events {
     conn.execute(
       "INSERT OR IGNORE INTO writes (session, path, ts) VALUES (?1, ?2, ?3)",
       params![e.session, e.path, e.ts as i64],
+    )?;
+  }
+  if let Some(max) = events.iter().map(|e| e.ts).max() {
+    conn.execute(
+      "INSERT INTO watermark (session, max_ts) VALUES (?1, ?2)
+       ON CONFLICT(session) DO UPDATE SET max_ts = MAX(max_ts, excluded.max_ts)",
+      params![events[0].session, max as i64],
     )?;
   }
   Ok(())

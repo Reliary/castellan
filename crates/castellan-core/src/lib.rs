@@ -33,6 +33,14 @@ pub struct Session {
   /// (neutral, not refused — weighting is advisory).
   #[serde(default)]
   pub hub_index_sha: Option<String>,
+  /// B6 phase 4: the launcher CLI's kernel tty_nr (from /proc/<pid>/stat)
+  /// at spawn. Human-only ops on this session require the caller's
+  /// tty_nr to match — an escaped process (systemd-run unit, migrated
+  /// child) has no controlling tty (tty_nr=0) and is rejected. 0 means
+  /// a headless launch: no tty requirement (documented residual — the
+  /// C10xC25 identity flip stays for headless sessions).
+  #[serde(default)]
+  pub launcher_tty: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +118,10 @@ pub enum Request {
     /// a consumed grant overrides the tier floor (human decision).
     #[serde(default)]
     grants: Vec<String>,
+    /// B6 phase 4: the launcher's kernel tty_nr (0 = headless). Human-
+    /// only ops on the spawned session require this tty at dispatch.
+    #[serde(default)]
+    launcher_tty: u64,
   },
   Adopt {
     session: SessionId,

@@ -17,26 +17,80 @@ use std::sync::{Arc, Mutex};
 /// The cgroup membership IS the identity — the one thing the envelope
 /// cannot let a session process shed. A caller whose pid sits in any
 /// castellan session scope is an AGENT; everyone else is the human.
+///
+/// B6 phase 4 (D4-F1): identity is FAIL-CLOSED. An unreadable
+/// /proc/<pid> (the fork/reap race — connector dies before
+/// classification) yields Rejected, not Human. SO_PEERCRED returns
+/// the connect-time credentials even when the fd is inherited, so the
+/// dead connector's pid fails the /proc read and the inherited-fd
+/// holder gets nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Caller {
   Human,
   Agent,
+  Rejected,
 }
 
-fn classify_caller(stream: &UnixStream) -> Caller {
-  let pid = match getsockopt(stream, PeerCredentials) {
-    Ok(cred) => cred.pid(),
-    Err(_) => return Caller::Human,
-  };
-  let cgroup = match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
-    Ok(c) => c,
-    Err(_) => return Caller::Human,
-  };
-  if cgroup.contains("castellan.slice") {
+/// Identity snapshot taken at connection time, re-verified at
+/// dispatch (B6 phase 4): the pid must still be alive, must still
+/// have the same starttime (pid-reuse defense), and must still sit in
+/// the same cgroup (classify-then-escape TOCTOU).
+#[derive(Debug, Clone, Copy)]
+struct CallerInfo {
+  caller: Caller,
+  pid: u32,
+  start_ticks: u64,
+  tty_nr: u64,
+}
+
+fn proc_field(pid: u32, index: usize) -> Option<String> {
+  let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+  // comm may contain spaces/parens; parse from the last ')'
+  let rest = stat.rsplit_once(')')?.1;
+  rest.split_whitespace().nth(index).map(String::from)
+}
+
+/// Parse the kernel-recorded controlling tty (tty_nr) from
+/// /proc/<pid>/stat — after comm: state(0) ppid(1) pgrp(2)
+/// session(3) tty_nr(4). Index 6 is `flags`, not tty — a
+/// mis-parse there made the tty check a no-op (stable field).
+fn caller_tty_nr(pid: u32) -> Option<u64> {
+  proc_field(pid, 4).and_then(|f| f.parse().ok())
+}
+
+fn caller_start_ticks(pid: u32) -> Option<u64> {
+  // after comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4) ... starttime(19)
+  proc_field(pid, 19).and_then(|f| f.parse().ok())
+}
+
+fn probe_caller(stream: &UnixStream) -> Option<CallerInfo> {
+  let pid = getsockopt(stream, PeerCredentials).ok()?.pid() as u32;
+  let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+  let start_ticks = caller_start_ticks(pid)?;
+  let tty_nr = caller_tty_nr(pid)?;
+  let caller = if cgroup.contains("castellan.slice") {
     Caller::Agent
   } else {
     Caller::Human
-  }
+  };
+  Some(CallerInfo { caller, pid, start_ticks, tty_nr })
+}
+
+/// Dispatch-time re-verification: the identity snapshot must still
+/// hold. Reads /proc/<pid> again — any failure fails closed.
+fn caller_still_current(info: &CallerInfo) -> bool {
+  let Some(start) = caller_start_ticks(info.pid) else { return false };
+  let Some(tty) = caller_tty_nr(info.pid) else { return false };
+  let Ok(cgroup) = std::fs::read_to_string(format!("/proc/{}/cgroup", info.pid)) else {
+    return false;
+  };
+  let in_slice = cgroup.contains("castellan.slice");
+  let still_caller = if info.caller == Caller::Agent {
+    in_slice
+  } else {
+    !in_slice
+  };
+  start == info.start_ticks && tty == info.tty_nr && still_caller
 }
 
 /// Ops a session process may call over the socket. Everything else is
@@ -318,7 +372,7 @@ impl Daemon {
   }
 
   fn handle_conn(&self, stream: UnixStream) -> std::io::Result<()> {
-    let caller = classify_caller(&stream);
+    let identity = probe_caller(&stream);
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     loop {
@@ -326,21 +380,91 @@ impl Daemon {
       if reader.read_line(&mut line)? == 0 {
         return Ok(());
       }
-      let resp = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) => {
-          if caller == Caller::Agent && !agent_allowed(&req) {
-            self.forged_socket_op(&req);
-            Response::err("human-only op (agent caller)")
-          } else {
-            self.dispatch(req)
-          }
-        }
-        Err(e) => Response::err(format!("bad request: {e}")),
-      };
+          let resp = match serde_json::from_str::<Request>(line.trim()) {
+            Ok(req) => {
+              match identity {
+                // D4-F1 fail-closed: the connector could not be
+                // identified (fork/reap race, dead peer, unreadable
+                // /proc). Reject EVERYTHING, including agent-allowed
+                // ops — the identity model has no basis to trust this
+                // peer.
+                None => {
+                  self.forged_socket_op(&req);
+                  Response::err("caller identity could not be verified (rejected)")
+                }
+                Some(info) => {
+                  // B6 phase 4: dispatch-time re-verification. The
+                  // snapshot taken at connect may be stale by now
+                  // (pid reuse, or the peer escaped its cgroup after
+                  // connect). Any drift — or any /proc read failure —
+                  // fails closed.
+                  if !caller_still_current(&info) {
+                    self.forged_socket_op(&req);
+                    Response::err("caller identity changed since connect (rejected)")
+                  } else if info.caller == Caller::Agent && !agent_allowed(&req) {
+                    self.forged_socket_op(&req);
+                    Response::err("human-only op (agent caller)")
+                  } else if info.caller == Caller::Human && !self.human_tty_ok(&req, info.tty_nr) {
+                    // B6 phase 4: the human operator must hold the
+                    // session's launch tty. An escaped process
+                    // (systemd-run unit, migrated child) has no
+                    // controlling tty and is rejected here even
+                    // though its cgroup says Human — closing the
+                    // C10 x C25 identity flip for tty-launched
+                    // sessions.
+                    self.forged_socket_op(&req);
+                    Response::err("human-only op requires the session's launch tty")
+                  } else {
+                    self.dispatch(req)
+                  }
+                }
+              }
+            }
+            Err(e) => Response::err(format!("bad request: {e}")),
+          };
       let mut out = serde_json::to_string(&resp)?;
       out.push('\n');
       (&stream).write_all(out.as_bytes())?;
     }
+  }
+
+  /// B6 phase 4: a Human-classified caller may only run session-
+  /// scoped human-only ops if its tty_nr matches the session's
+  /// launcher tty (or the session was launched headless — launcher
+  /// tty 0 = no requirement; headless is a documented residual).
+  fn human_tty_ok(&self, req: &Request, caller_tty: u64) -> bool {
+    let session = match req {
+      Request::UndoCommit { session }
+      | Request::UndoDiscard { session }
+      | Request::Freeze { session: Some(session) }
+      | Request::Thaw { session: Some(session) }
+      | Request::Kill { session: Some(session) }
+      | Request::Adopt { session, .. }
+      | Request::BlessRequest { session, .. }
+      | Request::Cert { session }
+      | Request::Replay { session, .. }
+      | Request::Radar { session, .. }
+      | Request::MemoryRecall { session } => Some(session),
+      // session-less human-only ops (thaw/kill/freeze ALL): require
+      // a non-zero tty — a same-uid escaped process has none.
+      Request::Thaw { session: None }
+      | Request::Kill { session: None }
+      | Request::Freeze { session: None } => return caller_tty != 0,
+      // everything else (Spawn, Status, agent-allowed reads, the
+      // canary verb): no session tty requirement.
+      _ => return true,
+    };
+    let Some(session) = session else {
+      return true;
+    };
+    let launcher = self
+      .registry
+      .lock()
+      .unwrap()
+      .get(&session)
+      .map(|s| s.launcher_tty)
+      .unwrap_or(0);
+    launcher == 0 || caller_tty == launcher
   }
 
   /// B3: a session process called a human-only op. Record a negative
@@ -397,8 +521,8 @@ impl Daemon {
 
   fn dispatch(&self, req: Request) -> Response {
     match req {
-      Request::Spawn { harness, project, pid, command, enforce, undo, net, grants } => {
-        self.spawn(harness, project, pid, command, enforce, undo, net, grants)
+      Request::Spawn { harness, project, pid, command, enforce, undo, net, grants, launcher_tty } => {
+        self.spawn(harness, project, pid, command, enforce, undo, net, grants, launcher_tty)
       }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
       Request::Freeze { session } => self.freeze(session.as_ref(), true),
@@ -556,6 +680,18 @@ impl Daemon {
     for s in &sessions {
       if let Ok(sink) = EventSink::for_session(&state, s) {
         if let Ok(events) = sink.read_all() {
+          // B6 phase 4 (trace spin): the high-water mark — only
+          // events strictly after the last indexed ts are processed.
+          // The 2MB accumulated drill corpus made every trace call
+          // re-read and re-index everything (29% CPU spin).
+          let watermark = castellan_trace::watermark(&conn, s).unwrap_or(0);
+          let fresh: Vec<_> = events
+            .iter()
+            .filter(|e| e.ts > watermark)
+            .collect();
+          if fresh.is_empty() {
+            continue;
+          }
           // B6 phase 1: with enforce-by-default, the overlay substrate
           // is actually interposed — writes land in per-session upper
           // dirs (`<state>/castellan/sessions/<sid>/overlay/upper/...`),
@@ -568,7 +704,7 @@ impl Daemon {
             "{}/castellan/sessions/{s}/overlay/upper/",
             state.display()
           );
-          let writes: Vec<castellan_trace::WriteEvent> = events
+          let writes: Vec<castellan_trace::WriteEvent> = fresh
             .iter()
             .filter(|e| e.kind == "fs_write" && e.verdict == "allow")
             .map(|e| {
@@ -583,7 +719,9 @@ impl Daemon {
               castellan_trace::WriteEvent { session: s.clone(), path, ts: e.ts }
             })
             .collect();
-          let _ = castellan_trace::index_session(&conn, &writes);
+          if !writes.is_empty() {
+            let _ = castellan_trace::index_session(&conn, &writes);
+          }
         }
       }
     }
@@ -2104,6 +2242,7 @@ impl Daemon {
     undo: bool,
     net: bool,
     grants: Vec<String>,
+    launcher_tty: u64,
   ) -> Response {
     let id = new_session_id();
     if let Err(e) = self.root.create_session(&id) {
@@ -2158,6 +2297,7 @@ impl Daemon {
       config_sha: pinned,
       started_at: castellan_core::now_unix(),
       hub_index_sha,
+      launcher_tty,
     });
     // B6 P3: the undo-layer record used to arrive via a socket Note
     // from the launcher — a socket op with a legitimate caller, but

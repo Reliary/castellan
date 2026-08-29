@@ -42,6 +42,13 @@ stop_daemon() {
   rm -f /run/user/1000/castellan.sock
   sleep 0.3
 }
+# B6 phase 4: the suite must NOT pollute the real state dir — every
+# run used to index into the accumulated ~/.local/state (117MB
+# trace.db, 572K rows), making trace calls spin at 29% CPU and hang
+# (measured). Isolated state dir per run.
+export XDG_STATE_HOME="/tmp/castellan-p9stack-state-$PPID"
+rm -rf "$XDG_STATE_HOME"
+mkdir -p "$XDG_STATE_HOME"
 start_daemon() {
   stop_daemon
   "$BIN/castellan-daemon" > /tmp/castellan-p9stack-daemon.log 2>&1 &
@@ -67,12 +74,12 @@ echo "$OUT" | grep -q "committed" && ok "overlay committed" || bad "keep failed:
 sleep 2
 
 # placebo proof passed (the fix drops danger) — evidence in trust.db
-EVID_PROOF=$(sqlite3 ~/.local/state/castellan/trust.db "SELECT evidence_json FROM events WHERE session_uuid='$SID_A' AND signal='proof_passed' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+EVID_PROOF=$(sqlite3 $XDG_STATE_HOME/castellan/trust.db "SELECT evidence_json FROM events WHERE session_uuid='$SID_A' AND signal='proof_passed' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
 echo "$EVID_PROOF" | grep -q "placebo-controlled proof" && ok "placebo proof passed" || bad "no proof evidence: $EVID_PROOF"
 # hub weight: the mechanism is wired and reported in the evidence
 # (separation itself is verified in Step 2 on stria's repo — this
 # tiny project has no hub file, so the weight is neutral here)
-EVID=$(sqlite3 ~/.local/state/castellan/trust.db "SELECT evidence_json FROM events WHERE session_uuid='$SID_A' AND signal='clean_session' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+EVID=$(sqlite3 $XDG_STATE_HOME/castellan/trust.db "SELECT evidence_json FROM events WHERE session_uuid='$SID_A' AND signal='clean_session' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
 echo "$EVID" | grep -q "blast-radius weight" && ok "hub weight reported ($EVID)" || bad "no hub weight: $EVID"
 
 # artifact scan: baseline at spawn, delta at keep (clean here)
@@ -93,7 +100,7 @@ SID_B=$(echo "$OUT" | grep -oE "s[0-9a-f]{20}" | head -1)
 ok "session B launched ($SID_B)"
 OUT=$("$BIN/castellan" canary "$SID_B" 2>&1)
 # weaponize the decoy in session scratch
-DECOY_DIR=~/.local/state/castellan/sessions/$SID_B/decoy
+DECOY_DIR=$XDG_STATE_HOME/castellan/sessions/$SID_B/decoy
 printf 'int handle(struct item *it) {\n  return *it;\n}\n' > "$DECOY_DIR/decoy_validate.c"
 OUT=$("$BIN/castellan" keep "$SID_B" 2>&1)
 sleep 2

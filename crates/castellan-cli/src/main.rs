@@ -408,7 +408,8 @@ fn launch(args: &[String], sock: &str) -> ! {
     "enforce": enforce,
     "undo": undo,
     "net": net,
-    "grants": grants
+    "grants": grants,
+    "launcher_tty": launcher_tty()
   }));
   let session = extract_session(&resp).unwrap_or_else(|| {
     eprintln!("launch failed: {resp}");
@@ -517,6 +518,23 @@ fn launch(args: &[String], sock: &str) -> ! {
   let err = execvp(&cmd);
   eprintln!("exec failed: {err}");
   std::process::exit(127);
+}
+
+/// B6 phase 4: the launcher's kernel tty_nr, read from /proc/self/stat
+/// (field index 4 after comm). 0 = headless (no tty requirement on
+/// human-only ops for sessions launched from here).
+fn launcher_tty() -> u64 {
+  let stat = match std::fs::read_to_string("/proc/self/stat") {
+    Ok(s) => s,
+    Err(_) => return 0,
+  };
+  let Some(rest) = stat.rsplit_once(')') else { return 0 };
+  rest
+    .1
+    .split_whitespace()
+    .nth(4)
+    .and_then(|f| f.parse().ok())
+    .unwrap_or(0)
 }
 
 fn scope_procs(session: &str) -> std::path::PathBuf {

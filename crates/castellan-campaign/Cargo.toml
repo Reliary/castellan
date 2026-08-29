@@ -1,0 +1,11 @@
+[package]
+name = "castellan-campaign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "castellan campaign detector: cross-session slow-drip attack detection (N1)."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+castellan-trust = { path = "../castellan-trust" }
+serde = { workspace = true }

@@ -19,7 +19,6 @@ Every primitive we already have, with its **real-data verdict** (where one exist
 | llm-replay | llm-replay | Python | PASS | deterministic replay keyed by (model, messages_hash); forensic replay component |
 | proof-fixes | proof-fixes | Python | BUILT (BUILD verdict) | placebo-controlled fix application; the positive trust signal methodology |
 | relay-vuln | relay-vuln | Rust | BUILT (136 modules, 49GB DB) | proof-carrying vuln detection, missing-validation-path, EvidenceTuple; DB stays local |
-| seq-engine | seq-engine | Python + Rust stub | BUILT (Python 745 LOC) | completeness auditor (expected token pairs, drift/R0); proof-carrying component |
 | sift | sift | Rust | BUILT | output compression for notifications and command logs |
 | skein | skein | Rust | BUILT (203 LOC) | vocabulary fingerprint diffing; harness-state-watcher baseline |
 | spec-exec | structural-stack/spec-exec | Rust | BUILT (647 LOC) | speculative next-action prediction; forensic replay component |
@@ -31,6 +30,7 @@ Every primitive we already have, with its **real-data verdict** (where one exist
 | Primitive | Repo | Verdict | Why | Castellan role (if any) |
 |---|---|---|---|---|
 | refactor-proof | refactor-proof | KILL | 100% false-negative on Defects4J — real bugfixes change operators/args, not line shapes | NONE. Was originally the trust positive signal; replaced by placebo-controlled proof-fixes |
+| seq-engine | seq-engine | KILL (2026-08-27 probe) | completeness auditor is tautological on event-derived token sets (78% of learned expectations co-emitted by the same event); composite-only encoding learns ZERO expectations; ordered fingerprint adds no separation over radar's order-agnostic encoding (identical cosine 0.0150 on real spines); trust stream has 5 distinct tokens in 30 events — nothing to learn. Probe: /tmp/opencode/seq_probe.py on 29 real local spines | NONE. N1 campaign detector is a maximal-run scan, not seq-engine |
 | half-life | half-life | KILL | vocabulary persistence decay falsified as a signal | NONE. Trust uses cortex-rs tier-promotion (recall-based) instead. No time-decay. |
 | vuln-fix-genome | vuln-fix-genome | KILL | BLAST-for-security lookup, falsified | NONE |
 | sec-commit-label | sec-commit-label | MARGINAL | k-NN retroactive tag, not predictive | advisory hint only, off-by-default |
@@ -80,4 +80,4 @@ The DB is at `/home/john/data/cvefixes/cvefixes.db` (49.3 GB) and `/home/john/sr
 4. Output compression is sift, NOT agent-log-compress (KILLed).
 5. The daemon pattern is reused from reliary-agent (unix socket, lock-protected state), but the daemon code is new.
 6. The HTTP proxy from reliary-agent is gone — the egress proxy is built fresh, with credential injection (a different threat model than reliary's pass-through).
-7. **The daemon is pure Rust — no Python subprocess in the trusted path.** relay-vuln is already pure Rust (52K LOC, links as a crate). skein, carrion, sensor-hdc, cortex-rs, config-radar, engfield, stria are already Rust. The four Python-only primitives in the daemon's path (agent-audit-trail 109 LOC, evidence-pack 302 LOC, proof-fixes 270 LOC, seq-engine 1368 LOC) are rewritten as Rust crates (~2050 lines total, all algorithmic). cert-evals and llm-replay stay Python — they're dev/CI tooling, not shipped, not in the daemon.
+7. **The daemon is pure Rust — no Python subprocess in the trusted path.** relay-vuln is already pure Rust (52K LOC, links as a crate). skein, carrion, sensor-hdc, cortex-rs, config-radar, engfield, stria are already Rust. The three Python-only primitives in the daemon's path (agent-audit-trail 109 LOC, evidence-pack 302 LOC, proof-fixes 270 LOC) are rewritten as Rust crates (~680 lines total, all algorithmic). seq-engine was KILLed 2026-08-27 by real-data probe — not rewritten (see the KILL row above). cert-evals and llm-replay stay Python — they're dev/CI tooling, not shipped, not in the daemon.

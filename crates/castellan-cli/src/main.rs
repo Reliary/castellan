@@ -31,6 +31,14 @@ fn main() {
     "cert" => cert_req(&args[1..]),
     "replay" => replay_req(&args[1..]),
     "radar" => radar_req(&args[1..]),
+    "campaign" => campaign_req(&args[1..]),
+    "siblings" => siblings_req(),
+    "drill" => drill_req(&args[1..]),
+    "channels" => channels_req(&args[1..]),
+    "trace" => trace_req(&args[1..]),
+    "policycheck" => policycheck_req(&args[1..]),
+    "memory" => memory_req(&args[1..]),
+    "voice" => voice_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -123,6 +131,139 @@ fn radar_req(args: &[String]) -> serde_json::Value {
   serde_json::json!({"op": "radar", "session": session, "project": project})
 }
 
+fn campaign_req(args: &[String]) -> serde_json::Value {
+  let project = match args.first() {
+    Some(p) => std::path::PathBuf::from(p),
+    None => std::env::current_dir().unwrap_or_default(),
+  };
+  serde_json::json!({"op": "campaign", "project": project})
+}
+
+/// N5: sibling detector — scan for known harness processes running
+/// WITHOUT the CASTELLAN_SESSION tag. Advisory: any process not
+/// launched via castellan can read trust.db, the spine, and the
+/// signing key; this detects the boundary violation, it cannot
+/// prevent it.
+fn siblings_req() -> serde_json::Value {
+  let harnesses = ["claude", "codex", "pi", "opencode", "aider", "cursor-agent", "gemini", "crush"];
+  let mut found: Vec<serde_json::Value> = Vec::new();
+  if let Ok(entries) = std::fs::read_dir("/proc") {
+    for entry in entries.flatten() {
+      let name = entry.file_name();
+      let pid: u32 = match name.to_string_lossy().parse() {
+        Ok(p) => p,
+        Err(_) => continue,
+      };
+      let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        continue;
+      };
+      let argv: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+      let Some(prog) = argv.first() else { continue };
+      let prog = String::from_utf8_lossy(prog);
+      let base = std::path::Path::new(prog.as_ref())
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+      if !harnesses.contains(&base.as_str()) {
+        continue;
+      }
+      let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        continue;
+      };
+      let tagged = environ
+        .split(|&b| b == 0)
+        .any(|kv| kv.starts_with(b"CASTELLAN_SESSION="));
+      if !tagged {
+        found.push(serde_json::json!({
+          "pid": pid,
+          "harness": base,
+          "tagged": false,
+        }));
+      }
+    }
+  }
+  serde_json::json!({"op": "siblings", "found": found})
+}
+
+fn drill_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("run") => serde_json::json!({"op": "drill_run"}),
+    Some("status") | None => serde_json::json!({"op": "drill_status"}),
+    Some(other) => {
+      eprintln!("usage: castellan drill [run|status]");
+      std::process::exit(2);
+    }
+  }
+}
+
+fn channels_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("run") => serde_json::json!({"op": "channels_run"}),
+    Some("status") | None => serde_json::json!({"op": "channels_status"}),
+    Some(other) => {
+      eprintln!("usage: castellan channels [run|status]");
+      std::process::exit(2);
+    }
+  }
+}
+
+fn trace_req(args: &[String]) -> serde_json::Value {
+  let Some(compromised) = args.first() else {
+    eprintln!("usage: castellan trace <compromised-session>");
+    std::process::exit(2);
+  };
+  serde_json::json!({"op": "trace_expose", "compromised": compromised})
+}
+
+fn policycheck_req(args: &[String]) -> serde_json::Value {
+  let (Some(project), Some(candidate)) = (args.first(), args.get(1)) else {
+    eprintln!("usage: castellan policycheck <project> <candidate-project>");
+    std::process::exit(2);
+  };
+  serde_json::json!({
+    "op": "policy_check",
+    "project": project,
+    "candidate_project": candidate,
+  })
+}
+
+fn memory_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("recall") => {
+      let Some(session) = args.get(1) else {
+        eprintln!("usage: castellan memory recall <session>");
+        std::process::exit(2);
+      };
+      serde_json::json!({"op": "memory_recall", "session": session})
+    }
+    Some("status") | None => serde_json::json!({"op": "memory_status"}),
+    Some(other) => {
+      eprintln!("usage: castellan memory [recall <session>|status]");
+      std::process::exit(2);
+    }
+  }
+}
+
+fn voice_req(args: &[String]) -> serde_json::Value {
+  let Some(sub) = args.first().map(|s| s.as_str()) else {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  };
+  if sub != "approve" {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  }
+  let Some(session) = args.get(1) else {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  };
+  let Some(utterance) = args.get(2) else {
+    eprintln!("usage: castellan voice approve <session> <utterance>");
+    std::process::exit(2);
+  };
+  serde_json::json!({"op": "voice_approve", "session": session, "utterance": utterance})
+}
+
 fn replay_req(args: &[String]) -> serde_json::Value {
   let Some(session) = args.first() else {
     eprintln!("usage: castellan replay <session> [narrower-project]");
@@ -197,8 +338,14 @@ fn bless_req(args: &[String]) -> serde_json::Value {
       };
       serde_json::json!({"op": "bless_reject", "nonce": nonce})
     }
+    // B6 P3: the request nonce is delivered out-of-band (daemon
+    // journal). `bless show` prints the pending nonces the human can
+    // read from the journal, matching request-time hints.
+    Some("show") => {
+      serde_json::json!({"op": "bless_show"})
+    }
     _ => {
-      eprintln!("usage: castellan bless <request|approve|reject> ...");
+      eprintln!("usage: castellan bless <request|approve|reject|show> ...");
       std::process::exit(2);
     }
   }
@@ -207,7 +354,7 @@ fn bless_req(args: &[String]) -> serde_json::Value {
 fn launch(args: &[String], sock: &str) -> ! {
   let mut harness: Option<String> = None;
   let mut project = std::env::current_dir().unwrap_or_default();
-  let mut enforce = false;
+  let mut enforce = true;
   let mut undo = false;
   let mut net = false;
   let mut grants: Vec<String> = Vec::new();
@@ -224,6 +371,7 @@ fn launch(args: &[String], sock: &str) -> ! {
         i += 1;
       }
       "--enforce" => enforce = true,
+      "--no-enforce" => enforce = false,
       "--undo" => undo = true,
       "--net" => net = true,
       "--grant" if i + 1 < args.len() => {
@@ -244,7 +392,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   let cmd = match cmd {
     Some(c) if !c.is_empty() => c,
     _ => {
-      eprintln!("usage: castellan launch [--harness H] [--project P] [--enforce] [--undo] [--net] [--grant WANT] -- <command> [args...]");
+      eprintln!("usage: castellan launch [--harness H] [--project P] [--no-enforce] [--undo] [--net] [--grant WANT] -- <command> [args...]");
       std::process::exit(2);
     }
   };
@@ -260,12 +408,18 @@ fn launch(args: &[String], sock: &str) -> ! {
     "enforce": enforce,
     "undo": undo,
     "net": net,
-    "grants": grants
+    "grants": grants,
+    "launcher_tty": launcher_tty()
   }));
   let session = extract_session(&resp).unwrap_or_else(|| {
     eprintln!("launch failed: {resp}");
     std::process::exit(1);
   });
+  // N5: tag the launched process so the sibling detector can tell
+  // castellan-wrapped harnesses from unenrolled ones.
+  unsafe {
+    std::env::set_var("CASTELLAN_SESSION", &session);
+  }
   // trust floor coupling: the daemon may have forced flags regardless
   // of what the launcher requested (tiers 0-1 run fail-closed unless a
   // human grant was consumed)
@@ -291,6 +445,42 @@ fn launch(args: &[String], sock: &str) -> ! {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
   }
   let procs = scope_procs(&session);
+  // undo overlay FIRST: setup enters a user+mount namespace and mounts
+  // the overlay. The envelope's seccomp filter blocks mount(2), so
+  // applying the envelope before the overlay would break forced
+  // fail-closed sessions (tiers 0-1 force undo regardless of flags).
+  if undo {
+    // overlay setup enters a user+mount namespace; every write the agent
+    // makes lands in the session upper layer. undo/diff/commit operate
+    // on that layer from outside after exit.
+    let scratch = std::env::var("XDG_STATE_HOME")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+      })
+      .join("castellan/sessions")
+      .join(&session);
+    match castellan_ledger::setup(&project, &scratch) {
+      Ok(o) => {
+        // B6 P3: the undo-layer record is populated daemon-side at
+        // spawn (deterministic path) — the launcher's socket Note is
+        // gone. The daemon classifies socket callers by cgroup
+        // membership; joining happens right below, after which the
+        // CLI is an agent and human-only ops are blocked.
+        if let Err(e) = std::env::set_current_dir(&o.merged) {
+          eprintln!("failed to chdir into merged view: {e}");
+          std::process::exit(1);
+        }
+      }
+      Err(e) => {
+        eprintln!("failed to set up undo overlay (continuing WITHOUT undo): {e}");
+        undo = false;
+      }
+    }
+  }
+  // join the session cgroup AFTER the note: the agent inherits the
+  // cgroup at exec, and the daemon's caller classification must see
+  // the launcher as the human until the agent actually starts.
   if let Err(e) = std::fs::write(
     &procs,
     format!("{}\n", std::process::id()),
@@ -317,30 +507,8 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::process::exit(1);
     }
   }
-  if undo {
-    // overlay setup enters a user+mount namespace; every write the agent
-    // makes lands in the session upper layer. undo/diff/commit operate
-    // on that layer from outside after exit.
-    let scratch = std::env::var("XDG_STATE_HOME")
-      .map(std::path::PathBuf::from)
-      .unwrap_or_else(|_| {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
-      })
-      .join("castellan/sessions")
-      .join(&session);
-    match castellan_ledger::setup(&project, &scratch) {
-      Ok(o) => {
-        if let Err(e) = std::env::set_current_dir(&o.merged) {
-          eprintln!("failed to chdir into merged view: {e}");
-          std::process::exit(1);
-        }
-        rpc(sock, &serde_json::json!({ "op": "note", "session": session, "kind": "undo", "detail": o.upper.display().to_string() }));
-      }
-      Err(e) => {
-        eprintln!("failed to set up undo overlay (continuing WITHOUT undo): {e}");
-        undo = false;
-      }
-    }
+  if !enforce {
+    eprintln!("castellan: AUDIT MODE — observation only, no containment (--no-enforce)");
   }
   eprintln!(
     "castellan session {session}{}{} launched",
@@ -350,6 +518,23 @@ fn launch(args: &[String], sock: &str) -> ! {
   let err = execvp(&cmd);
   eprintln!("exec failed: {err}");
   std::process::exit(127);
+}
+
+/// B6 phase 4: the launcher's kernel tty_nr, read from /proc/self/stat
+/// (field index 4 after comm). 0 = headless (no tty requirement on
+/// human-only ops for sessions launched from here).
+fn launcher_tty() -> u64 {
+  let stat = match std::fs::read_to_string("/proc/self/stat") {
+    Ok(s) => s,
+    Err(_) => return 0,
+  };
+  let Some(rest) = stat.rsplit_once(')') else { return 0 };
+  rest
+    .1
+    .split_whitespace()
+    .nth(4)
+    .and_then(|f| f.parse().ok())
+    .unwrap_or(0)
 }
 
 fn scope_procs(session: &str) -> std::path::PathBuf {
@@ -546,23 +731,37 @@ fn render(line: &str) -> String {
           out.push_str(&format!("{}\n", a.as_str().unwrap_or("?")));
         }
       }
-      if let Some(bless) = v.get("extra").and_then(|e| e.get("bless")) {
-        if let Some(nonce) = bless.get("nonce").and_then(|n| n.as_str()) {
-          out.push_str(&format!("nonce: {nonce}\n"));
-        }
-        if let Some(want) = bless.get("want").and_then(|w| w.as_str()) {
-          out.push_str(&format!("want: {want}\n"));
-        }
-        if let Some(session) = bless.get("session").and_then(|s| s.as_str()) {
-          out.push_str(&format!("session: {session}\n"));
-        }
-        if let Some(note) = bless.get("note").and_then(|n| n.as_str()) {
-          out.push_str(&format!("note: {note}\n"));
-        }
-        if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
-          out.push_str(&format!("approved: {approved}\n"));
-        }
-      }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
+        if let Some(bless) = v.get("extra").and_then(|e| e.get("bless")) {
+          if let Some(hint) = bless.get("nonce_hint").and_then(|n| n.as_str()) {
+            out.push_str(&format!("nonce_hint: {hint}\n"));
+          }
+          if let Some(want) = bless.get("want").and_then(|w| w.as_str()) {
+            out.push_str(&format!("want: {want}\n"));
+          }
+          if let Some(session) = bless.get("session").and_then(|s| s.as_str()) {
+            out.push_str(&format!("session: {session}\n"));
+          }
+          if let Some(note) = bless.get("note").and_then(|n| n.as_str()) {
+            out.push_str(&format!("note: {note}\n"));
+          }
+          if let Some(approved) = bless.get("approved").and_then(|a| a.as_bool()) {
+            out.push_str(&format!("approved: {approved}\n"));
+          }
+          if let Some(channel) = bless.get("channel").and_then(|c| c.as_str()) {
+            out.push_str(&format!("channel: {channel}\n"));
+          }
+          if let Some(attempts) = bless.get("attempts_left").and_then(|a| a.as_u64()) {
+            out.push_str(&format!("attempts_left: {attempts}\n"));
+          }
+          if let Some(pending) = bless.get("pending").and_then(|p| p.as_array()) {
+            for p in pending {
+              let hint = p.get("nonce_hint").and_then(|x| x.as_str()).unwrap_or("?");
+              let want = p.get("want").and_then(|x| x.as_str()).unwrap_or("?");
+              let sess = p.get("session").and_then(|x| x.as_str()).unwrap_or("?");
+              out.push_str(&format!("  pending {want} for {sess} (hint {hint}) — nonce in daemon journal\n"));
+            }
+          }
+        }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
         let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
         let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
         let oob = cert.get("bounds").and_then(|b| b.get("out_of_bounds_attempts")).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -572,6 +771,15 @@ fn render(line: &str) -> String {
         out.push_str(&format!("quality: {label}\n"));
         out.push_str(&format!("bounds: {bounds} ({} out-of-bounds)\n", oob));
         out.push_str(&format!("placebo: {placebo} ({} proofs, tests {})\n", proofs, if tests { "pass" } else { "n/a" }));
+        if let Some(scan) = cert.get("artifact_scan") {
+          let scanner = scan.get("scanner").and_then(|x| x.as_str()).unwrap_or("?");
+          let findings = scan.get("new_findings").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+          out.push_str(&format!("artifact: {} new finding(s) (scanner={})\n", findings.len(), scanner));
+          for f in findings.iter().take(5) {
+            out.push_str(&format!("  FINDING {}\n", f.as_str().unwrap_or("?")));
+          }
+          out.push_str("  scope: session-touched files only; absence of findings is NOT evidence of safety\n");
+        }
       }
       if let Some(rp) = v.get("extra").and_then(|e| e.get("replay")) {
         let verdict = rp.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
@@ -588,6 +796,23 @@ fn render(line: &str) -> String {
           }
         }
       }
+      if let Some(pc) = v.get("extra").and_then(|e| e.get("policycheck")) {
+        let verdict = pc.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
+        let sessions = pc.get("sessions_checked").and_then(|x| x.as_u64()).unwrap_or(0);
+        let with_delta = pc.get("sessions_with_delta").and_then(|x| x.as_u64()).unwrap_or(0);
+        out.push_str(&format!(
+          "policycheck: {verdict} ({sessions} kept sessions, {with_delta} with false-new-denies)\n"
+        ));
+        if let Some(nd) = pc.get("newly_denied").and_then(|x| x.as_array()) {
+          for p in nd.iter().take(10) {
+            out.push_str(&format!("  FALSE-NEW-DENY {}\n", p.as_str().unwrap_or("?")));
+          }
+          if nd.len() > 10 {
+            out.push_str(&format!("  ... and {} more\n", nd.len() - 10));
+          }
+        }
+        out.push_str("  advisory: false-NEW-denies only; runs on the developer's machine, not the agent's runtime\n");
+      }
       if let Some(rd) = v.get("extra").and_then(|e| e.get("radar")) {
         let cosine = rd.get("cosine_to_prototype").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let anomaly = rd.get("anomaly").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -599,8 +824,103 @@ fn render(line: &str) -> String {
           if anomaly { "ANOMALY (advisory)" } else { "normal" }
         ));
       }
-      if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {
-        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
+      if let Some(cp) = v.get("extra").and_then(|e| e.get("campaign")) {
+        let scanned = cp.get("sessions_scanned").and_then(|x| x.as_u64()).unwrap_or(0);
+        let campaigns = cp.get("campaigns").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        out.push_str(&format!("campaign: {} session(s) scanned, {} campaign(s)\n", scanned, campaigns.len()));
+        for c in campaigns {
+          let start = c.get("start_ts").and_then(|x| x.as_u64()).unwrap_or(0);
+          let end = c.get("end_ts").and_then(|x| x.as_u64()).unwrap_or(0);
+          let sessions = c.get("sessions").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
+          let sig = c.get("dominant_signal").and_then(|x| x.as_str()).unwrap_or("?");
+          let sev = c.get("severity").and_then(|x| x.as_str()).unwrap_or("?");
+          out.push_str(&format!(
+            "  campaign {start}..{end}: {sessions} session(s), dominant={sig}, severity={sev}\n"
+          ));
+        }
+      }
+      if let Some(dr) = v.get("extra").and_then(|e| e.get("drill")) {
+        let results = dr.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        for r in results {
+          let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+          let pass = r.get("pass").and_then(|x| x.as_bool()).unwrap_or(false);
+          let expected = r.get("expected").and_then(|x| x.as_str()).unwrap_or("?");
+          let observed = r.get("observed").and_then(|x| x.as_str()).unwrap_or("?");
+          let lat = r.get("latency_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+          out.push_str(&format!(
+            "drill {id:<10} {}  expected: {expected}  observed: {observed}  ({lat}ms)\n",
+            if pass { "PASS" } else { "FAIL" }
+          ));
+        }
+      }
+      if let Some(ch) = v.get("extra").and_then(|e| e.get("channels")) {
+        let inventory = ch.get("inventory").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        if inventory.is_empty() {
+          out.push_str("channels: no census yet — run `castellan channels run`\n");
+        } else {
+          out.push_str("channel inventory (kernel-verified, dated):\n");
+          for c in inventory {
+            let name = c.get("channel").and_then(|x| x.as_str()).unwrap_or("?");
+            let verdict = c.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {name:<12} {verdict}\n"));
+          }
+        }
+      }
+      if let Some(mem) = v.get("extra").and_then(|e| e.get("memory")) {
+        if let Some(recall) = mem.get("recall") {
+          if recall.is_null() {
+            out.push_str("memory: no recall (cold start, self, or below gate)\n");
+          } else {
+            let response = recall.get("response").and_then(|x| x.as_str()).unwrap_or("?");
+            let confidence = recall.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let self_match = recall.get("self_match").and_then(|x| x.as_bool()).unwrap_or(false);
+            let activations = recall.get("activations").and_then(|x| x.as_u64()).unwrap_or(0);
+            out.push_str(&format!(
+              "memory: recall {} (confidence {:.2}, {} activations{})\n",
+              response,
+              confidence,
+              activations,
+              if self_match { ", SELF" } else { "" }
+            ));
+          }
+        } else {
+          let iw = mem.get("incident_writes").and_then(|x| x.as_u64()).unwrap_or(0);
+          let sw = mem.get("self_writes").and_then(|x| x.as_u64()).unwrap_or(0);
+          let ss = mem.get("self_shapes").and_then(|x| x.as_u64()).unwrap_or(0);
+          out.push_str(&format!("memory: {iw} incident(s), {sw} self write(s), {ss} self shape(s)\n"));
+        }
+      }
+      if let Some(tr) = v.get("extra").and_then(|e| e.get("trace")) {
+        let compromised = tr.get("compromised").and_then(|x| x.as_str()).unwrap_or("?");
+        let exposed = tr.get("exposed").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        out.push_str(&format!("trace: compromised {compromised}\n"));
+        if exposed.is_empty() {
+          out.push_str("  no exposed sessions\n");
+        } else {
+          for e in exposed.iter().take(10) {
+            let s = e.get("session").and_then(|x| x.as_str()).unwrap_or("?");
+            let score = e.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let files = e.get("exposed_files").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            out.push_str(&format!(
+              "  {s}: score {score:.2} — {} file(s): {}\n",
+              files.len(),
+              files
+                .iter()
+                .take(5)
+                .map(|f| f.as_str().unwrap_or("?").to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+            ));
+          }
+        }
+        out.push_str("  note: exposure is a lower bound (reads are invisible); freeze is offered, not applied\n");
+      }
+      if let Some(tr) = v.get("extra").and_then(|e| e.get("trust")) {
+        let score = tr.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let tier = tr.get("tier").and_then(|x| x.as_str()).unwrap_or("?");
+        out.push_str(&format!("trust: score {score:.1} (tier {tier})\n"));
+      }
+      if let Some(pf) = v.get("extra").and_then(|e| e.get("profile")) {        let enforce = pf.get("enforce").and_then(|x| x.as_bool()).unwrap_or(false);
         let undo = pf.get("undo").and_then(|x| x.as_bool()).unwrap_or(false);
         let net = pf.get("net").and_then(|x| x.as_bool()).unwrap_or(false);
         let forced = pf.get("forced").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -631,7 +951,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan thaw   [session]       thaw all sessions or one");
   eprintln!("  castellan kill   [session]       kill all sessions or one");
   eprintln!("  castellan spawn --harness H [--project P] [--pid PID]");
-  eprintln!("  castellan launch [--harness H] [--project P] [--enforce] -- CMD [args...]");
+  eprintln!("  castellan launch [--harness H] [--project P] [--no-enforce] [--undo] [--net] -- CMD [args...]");
   eprintln!("  castellan audit <session>     show envelope violations for a session");
   eprintln!("  castellan adopt <session> <pid> [pid...]   move running procs into a scope");
   eprintln!("  castellan bless request --session S --want W [--reason R]");
@@ -640,6 +960,12 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan cert <session>          assemble a ProofCertificate");
   eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
+  eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
+  eprintln!("  castellan channels [run|status]        exfil channel census (P9.1, report-only)");
+  eprintln!("  castellan trace <session>              contact tracing (P9.3, exposure scored)");
+  eprintln!("  castellan policycheck <proj> <cand>    policy regression replay (P9.6, advisory)");
+  eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
+  eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

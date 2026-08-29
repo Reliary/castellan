@@ -1,0 +1,11 @@
+[package]
+name = "castellan-decoy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P9.5 decoy-vulnerability edit canaries: CVEfixes-shaped decoys in session scratch, direction-sensitive tripwires."
+
+[dependencies]
+castellan-proof = { path = "../castellan-proof" }
+serde = { workspace = true }
+serde_json = { workspace = true }

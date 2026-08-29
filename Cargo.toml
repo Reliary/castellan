@@ -11,6 +11,16 @@ members = [
   "crates/castellan-proof",
   "crates/castellan-replay",
   "crates/castellan-radar",
+  "crates/castellan-campaign",
+  "crates/castellan-drill",
+  "crates/castellan-memory",
+  "crates/castellan-voice",
+  "crates/castellan-pharmaco",
+  "crates/castellan-scan",
+  "crates/castellan-hub",
+  "crates/castellan-trace",
+  "crates/castellan-decoy",
+  "crates/castellan-policycheck",
   "crates/castellan-daemon",
   "crates/castellan-cli",
 ]
@@ -35,4 +45,4 @@ opt-level = 3
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustc-hash = "2"
-nix = { version = "0.29", features = ["signal", "user", "inotify"] }
+nix = { version = "0.29", features = ["signal", "user", "inotify", "socket"] }

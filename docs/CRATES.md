@@ -11,11 +11,20 @@ castellan/
 │   ├── castellan-undo/             3-way merge, freeze-before-undo, pinned GC
 │   ├── castellan-trust/            EWMA, tier mapping, placebo-proof ingest, single-writer trust.db (rusqlite bundled)
 │   ├── castellan-proof/            ProofCertificate assembly + export (was evidence-pack), placebo pipeline (was proof-fixes), relay-vuln + config-radar wiring
-│   ├── castellan-completeness/     expected-pair + drift/R0 completeness (was seq-engine), config key audit (was config-radar)
+│   ├── castellan-completeness/     config key audit (was config-radar). seq-engine KILLed 2026-08-27 — see PRIMITIVES.md
 │   ├── castellan-replay/           action-stream extraction, overlayfs shadow execution, permissive-case diff
 │   ├── castellan-egress/           HTTP proxy, real-cred injection, canary honeypot listener
 │   ├── castellan-canary/           credential planting, honeypot trigger → freeze wiring
-│   ├── castellan-radar/            sensor-hdc encoding, ed25519 signing, local outlier, fleet sync
+│   ├── castellan-radar/            sensor-hdc encoding, local outlier (ed25519 signing: DESIGN-ONLY — see commitment #9)
+│   ├── castellan-drill/            P8.0 live-fire drills: nonce registry, scheduler, 5-drill suite
+│   ├── castellan-memory/           P8.1 Kanerva-immune memory: SDM (vendored from engfield), fragment recall, self/tolerance shapes
+│   ├── castellan-voice/            P8.3 acoustic channel: nonce grammar, panic phrase, protocol state machine (STT/TTS feature-gated)
+│   ├── castellan-pharmaco/         P8.4 pharmacovigilance: PRR/ROR/EBGM estimators (methodology only, fleet-pending)
+│   ├── castellan-scan/             P9.2 pluggable artifact scanner: findings interface, relay-vuln + semgrep adapters, baseline-delta
+│   ├── castellan-hub/              P9.4 blast-radius-weighted trust: stria phrase-index fan-out (grammar-free, pure Rust)
+│   ├── castellan-trace/            P9.3 cross-session contact tracing: spine index, exposure scoring
+│   ├── castellan-decoy/            P9.5 decoy-vulnerability edit canaries: direction-sensitive tripwires
+│   ├── castellan-policycheck/      P9.6 policy regression replay: kept-spine replay through candidate policies
 │   ├── castellan-bless/            dbus nonce-gated approval, rate limit, fp-toggle biometric integration
 │   ├── castellan-watch/            harness-state-watcher: skein + carrion baseline, skill quarantine
 │   ├── castellan-daemon/           unix socket, single-writer-per-session, watchdog, all-component orchestration
@@ -36,7 +45,7 @@ castellan/
 - **zbus** (pure Rust, no libdbus) for systemd user manager `StartTransientUnit` and dbus nonce-gated bless broker.
 - **nix** crate for Landlock, seccomp, cgroup, inotify, overlayfs, user-namespace syscalls — well-maintained, idiomatic.
 - **blake3** for content-addressed before-images (matches stria/relay).
-- **ed25519-dalek** for per-machine HV signing.
+- **ed25519-dalek** for per-machine HV signing — **not currently a dependency**; listed only because commitment #9 (DESIGN-ONLY) would need it. Do not add until the signing feature is actually built.
 - **mimalloc** global allocator.
 - **rustc-hash FxHash** maps in hot paths (matches reliary-agent).
 - **ahash** where insertion-heavy and not security-sensitive (matches reliary-compress).
@@ -50,12 +59,21 @@ castellan/
 castellan-cli → castellan-daemon → {castellan-envelope, castellan-freezer, castellan-ledger,
                                      castellan-undo, castellan-trust, castellan-proof,
                                      castellan-replay, castellan-egress, castellan-canary,
-                                     castellan-radar, castellan-bless, castellan-watch}
+                                     castellan-radar, castellan-bless, castellan-watch,
+                                     castellan-drill, castellan-memory, castellan-voice}
                                   → castellan-core
 castellan-trust → castellan-proof (positive signal), castellan-ledger (events), castellan-core
-castellan-proof → relay-vuln (Rust crate, opt-in), seq-engine (Rust crate), config-radar (Rust crate), castellan-ledger
+castellan-proof → relay-vuln (Rust crate, opt-in), config-radar (Rust crate), castellan-ledger
 castellan-radar → sensor-hdc (Rust crate, vendored), castellan-core
 castellan-watch → skein (Rust crate), carrion (Rust crate)
+castellan-memory → blake3 (SDM vendored from engfield, MIT)
+castellan-campaign → castellan-core, castellan-trust (signature module: P8.2)
+castellan-pharmaco → standalone estimators (P8.4, no daemon wiring yet)
+castellan-scan → standalone (P9.2, subprocess adapters, config-pinned)
+castellan-hub → rusqlite over the stria phrase index (P9.4)
+castellan-trace → rusqlite spine index (P9.3)
+castellan-decoy → castellan-proof (danger_signal) (P9.5)
+castellan-policycheck → castellan-replay, castellan-trust, castellan-policy (P9.6)
 ```
 
 ## Pure Rust — no Python in the daemon
@@ -76,9 +94,10 @@ This mirrors the project directive: "relay must be pure Rust (no Python runtime)
 | agent-audit-trail | 109 | castellan-audit (in castellan-ledger) | trivial — hash chain + JSON |
 | evidence-pack | 302 | castellan-proof (export module) | trivial — serde_json + quality labels |
 | proof-fixes | 270 | castellan-proof (placebo module) | small — placebo orchestration over relay-vuln |
-| seq-engine | 1368 | castellan-completeness | medium — completeness logic, algorithmic not Python-specific |
 
-~2050 lines of Python total, all small, all algorithmic, all in the proof pipeline. Rewrite as Rust crates and the daemon is pure Rust.
+~680 lines of Python total, all small, all algorithmic, all in the proof pipeline. Rewrite as Rust crates and the daemon is pure Rust.
+
+**seq-engine is NOT rewritten.** KILLed 2026-08-27 by real-data probe on 29 local spines: 78% of learned expectations are within-event tautologies (tokens co-emitted by the same event); the composite-only encoding learns zero expectations; ordered fingerprints add no separation over radar's order-agnostic encoding (identical cosine 0.0150); the trust stream has 5 distinct tokens in 30 events. The earlier claim of a 1,368-LOC Rust port was false — the Rust crate is a "Hello, world!" stub. See PRIMITIVES.md.
 
 **What stays Python** (dev/CI tooling, NOT shipped, NOT in the daemon):
 - cert-evals (319 LOC) — benchmark harness run by humans/CI, not user-facing

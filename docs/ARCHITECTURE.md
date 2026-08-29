@@ -10,7 +10,7 @@ A **session** is one invocation of one agent harness on one project. Every sessi
 
 - **systemd user scope** `castellan-<uuid>.scope` via `StartTransientUnit` on the user manager. All descendant processes inherit the scope automatically. No root required. Gives free process-tree enumeration and the cgroup v2 freezer.
 - **Landlock ruleset** self-applied at spawn. Inherited by children. Irreversible mid-session (kernel guarantee: restrictions only stack tighter). The envelope.
-- **seccomp BPF filter** allowlist applied at spawn. Blocks `io_uring` syscalls (GhostClaw bypass), `ptrace`, `process_vm_readv`, `chmod`/`chown`/`fchmod`/`fchown`/`utime`/`futimes` (Landlock ABI gap), and everything not on the allowlist (future-proofing).
+- **seccomp BPF filter** denylist (default-ALLOW — re-labelled 2026-08-29, see commitment #8) applied at spawn. Blocks `io_uring` syscalls (GhostClaw bypass), `ptrace`, `process_vm_readv`, `chmod`/`chown`/`fchmod`/`fchown`/`utime`/`utimes`/`utimensat`/`futimesat` (Landlock ABI gap). Not an allowlist; new syscalls are NOT blocked by default.
 - **`CASTELLAN_SESSION=<uuid>` env tag** for cooperative harnesses. The cgroup is enforcement truth; the env var is convenience truth.
 - **overlayfs mount** over the project directory inside a user namespace: lower = read-only real, upper = session writes, work = kernel workdir. The undo substrate and the ledger substrate in one.
 
@@ -32,12 +32,15 @@ One static Rust binary, `castellan-daemon`, owns the single-writer-per-session c
 
 - mints envelopes (Landlock + seccomp rulesets) at spawn
 - creates systemd scopes (or cgroup fallback)
-- owns cgroup.freeze files (agent cannot self-thaw — see commitment #1)
+- creates the session scope; the freezer files stay user-owned —
+  self-thaw is closed under enforce by Landlock default-deny on
+  cgroupfs (B6 probe verdict), NOT by daemon ownership (commitment
+  #1 is NOT implemented as originally stated — see DESIGN_DECISIONS)
 - runs the overlayfs mount setup in a user namespace
 - runs the inotify watchers on allowed paths (ledger)
 - ingests agent-audit-trail events (advisory) and tags them vs kernel events (truth)
 - computes trust scores (single writer to trust.db)
-- computes HV fingerprints and signs them with the per-machine ed25519 key
+- computes HV fingerprints (signed-per-machine is DESIGN-ONLY — see commitment #9)
 - runs the egress proxy (holds real credentials, injects them per-request; envelope only ever sees canaries)
 - runs the bless broker (expansion requests, nonce-gated, biometric for high-risk)
 - re-runs tests independently in a side-scope (verifier ≠ prover)
@@ -68,7 +71,7 @@ Bash `castellan-*` shims stay thin (socket queries), matching Omarchy's `omarchy
 │   harness-state drift → skein                                │
 │   edit confinement → stria guard/contract/verify-packet      │
 │   output entropy gate → gate.js / sift                       │
-│   completeness → seq-engine + config-radar                   │
+│   completeness → config-radar (seq-engine KILLed 2026-08-27)  │
 │   architecture-shift → git-archaeology                       │
 │   speculative next-action → spec-exec                        │
 ├─────────────────────────────────────────────────────────────┤
@@ -105,15 +108,15 @@ Bash `castellan-*` shims stay thin (socket queries), matching Omarchy's `omarchy
 
 These survived antagonism. Changing one requires a design-decision record.
 
-1. **Daemon owns cgroup.freeze** — agent runs as the user, user can write the freezer file, so the daemon must own it (via systemd delegate or setuid thaw helper). Without this the panic button is theater.
+1. **Session scope + Landlock default-deny on cgroupfs (replaces the original freezer-ownership claim)** — the agent runs as the user, so daemon ownership of `cgroup.freeze` was never implemented (B6 F6). Verified instead: Landlock governs cgroupfs; with no write rule on the scope, `cgroup.freeze` writes are kernel-denied under enforce. The panic button is kernel-hard in enforce mode; in audit mode it is advisory. (Changed 2026-08-29 — the original "daemon owns the freezer" claim was not implemented and overstated.)
 2. **overlayfs is the undo substrate** — not inotify. inotify loses races (agent writes+deletes faster than the watcher fires). overlayfs upper layer is atomic at FS level, no race.
 3. **Daemon re-runs tests independently** — the agent is the prover, the daemon is the verifier. Agent-reported test results are advisory. Trust and proofs use only daemon-verified results.
 4. **Real credentials never enter the envelope** — all egress proxied through the daemon, which holds real keys and injects them server-side. The envelope contains only canary credentials. Any credential the agent can read is a canary by definition.
 5. **Canary keys are wired to a localhost honeypot listener** — using OR probing the canary IS the trigger. There is no "is this key real?" step that does not trip the wire.
 6. **Trust has a ceiling and an always-on deny-list** — even a tier-0 (max-trust) agent cannot touch `~/.ssh`, `.gnupg`, systemd units, `.desktop` files, shell rc. A patient attacker gaming trust gets egress, not escape.
 7. **Daemon crash → auto-freeze** — systemd watchdog restarts the daemon and freezes all agent scopes on heartbeat loss. Fail-closed.
-8. **seccomp is an allowlist, not a denylist** — and it blocks chmod/chown/utime (Landlock ABI gap) plus io_uring, ptrace, process_vm_readv. Future new syscalls are blocked by default.
-9. **HVs are signed per-machine** — the daemon signs every HV with its ed25519 key (key outside any envelope). Fleet sync verifies signatures. Agent cannot forge HVs or poison fleet detection.
+8. **seccomp is a denylist with default-ALLOW (re-labelled 2026-08-29)** — the earlier allowlist claim was false (B6 F7/D4). It blocks chmod/chown/utime (Landlock ABI gap) plus io_uring, ptrace, process_vm_readv. New metadata syscalls are NOT blocked by default; a real allowlist is deferred until a harness-scoped probe proves it survivable.
+9. **HVs are signed per-machine — DESIGN-ONLY, not implemented (B6 D4-F10)** — the daemon computes HV fingerprints but the per-machine ed25519 signing and fleet sync described here do not exist in the code. This commitment is aspirational; until implemented, HV integrity rests on daemon-write-only storage, not signatures.
 10. **Bless broker is nonce-gated, rate-limited, biometric for high-risk** — the nonce comes from the notification UI via dbus, not from anything the agent can forge. Max 3 expansions per session, cooling-off period, fp-toggle biometric for egress or config-dir writes.
 
 ## Residual risks (documented in [THREAT_MODEL.md](THREAT_MODEL.md), not hidden here)

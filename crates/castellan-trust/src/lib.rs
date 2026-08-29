@@ -53,6 +53,13 @@ pub enum Signal {
   AuditMismatch,
   /// Bless-broker forged nonce attempt (floor 0, project frozen).
   ForgedNonce,
+  /// P9.2: artifact scan found NEW findings in session-touched files
+  /// at keep (findings-only-negative: a clean delta earns nothing).
+  VulnIntroduced,
+  /// Frontier round B3: a session process called a human-only daemon
+  /// op over the socket (self-keep/thaw/spawn, direct trust farming,
+  /// evidence poisoning, sabotage, canary oracle).
+  ForgedSocketOp,
 }
 
 impl Signal {
@@ -65,6 +72,8 @@ impl Signal {
       Signal::CanaryHit => -50.0,
       Signal::AuditMismatch => -10.0,
       Signal::ForgedNonce => f64::NEG_INFINITY,
+      Signal::VulnIntroduced => -15.0,
+      Signal::ForgedSocketOp => -25.0,
     }
   }
 
@@ -77,6 +86,8 @@ impl Signal {
       Signal::CanaryHit => "canary_hit",
       Signal::AuditMismatch => "audit_mismatch",
       Signal::ForgedNonce => "forged_nonce",
+      Signal::VulnIntroduced => "vuln_introduced",
+      Signal::ForgedSocketOp => "forged_socket_op",
     }
   }
 }
@@ -155,9 +166,21 @@ impl TrustDb {
   /// Apply a signal. Returns the new score and tier.
   /// Ceiling: a project cannot gain more than one tier per day.
   pub fn apply(&mut self, project: &Path, ev: &TrustEvent) -> rusqlite::Result<ProjectTrust> {
+    self.apply_weighted(project, ev, 1.0)
+  }
+
+  /// Apply a signal with a blast-radius weight (P9.4). The weight
+  /// scales the delta: a hub-function fix earns more, a hub-function
+  /// regression costs more. Weight 1.0 = neutral (no index).
+  pub fn apply_weighted(
+    &mut self,
+    project: &Path,
+    ev: &TrustEvent,
+    weight: f64,
+  ) -> rusqlite::Result<ProjectTrust> {
     let hash = project_hash(project);
     let before = self.score(project)?;
-    let mut new_score = before.score + ev.signal.delta();
+    let mut new_score = before.score + ev.signal.delta() * weight;
     if new_score.is_infinite() || new_score < 0.0 {
       new_score = 0.0;
     }
@@ -234,7 +257,7 @@ fn tier_floor(t: Tier) -> f64 {
   }
 }
 
-fn signal_from_str(s: &str) -> Signal {
+pub fn signal_from_str(s: &str) -> Signal {
   match s {
     "proof_passed" => Signal::ProofPassed,
     "clean_session" => Signal::CleanSession,

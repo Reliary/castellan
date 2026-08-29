@@ -19,6 +19,28 @@ pub struct Session {
   /// agent->daemon command-injection path.
   #[serde(default)]
   pub config_sha: Option<String>,
+  /// unix timestamp of spawn; the orphan census (N6) uses it to find
+  /// processes started during the session window that escaped the
+  /// session cgroup via the user manager.
+  #[serde(default)]
+  pub started_at: u64,
+  /// sha256 of the project's stria phrase index (.stria/phrases.sqlite)
+  /// at spawn time. None = no index at launch. The P9.4 blast-radius
+  /// weight is read at KEEP from this file, which lives inside the
+  /// agent's write roots — an agent could rewrite the index mid-session
+  /// to make its touched files look like hubs and inflate positive
+  /// trust signals. On missing/mismatched pin the weight is 1.0
+  /// (neutral, not refused — weighting is advisory).
+  #[serde(default)]
+  pub hub_index_sha: Option<String>,
+  /// B6 phase 4: the launcher CLI's kernel tty_nr (from /proc/<pid>/stat)
+  /// at spawn. Human-only ops on this session require the caller's
+  /// tty_nr to match — an escaped process (systemd-run unit, migrated
+  /// child) has no controlling tty (tty_nr=0) and is rejected. 0 means
+  /// a headless launch: no tty requirement (documented residual — the
+  /// C10xC25 identity flip stays for headless sessions).
+  #[serde(default)]
+  pub launcher_tty: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +70,30 @@ pub struct SessionReport {
   pub pids: usize,
 }
 
+/// N2: two-tier response routing. Low-confidence signals (radar drift,
+/// would_deny in audit mode) log silently — freezing on them would
+/// teach the attacker the detection rules (T2) and freeze legit
+/// sessions on novel-but-benign behavior. High-confidence signals
+/// (canary trip, hard-deny write, cgroup membership drift) freeze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseTier {
+  /// Log to the spine only. Never freezes.
+  Silent,
+  /// Freeze the session (kernel-enforced pause).
+  Freeze,
+}
+
+/// The routing table. Add a signal here when wiring a new detector;
+/// the default for anything not listed is Silent (fail-open on
+/// detection, fail-closed on enforcement).
+pub fn response_tier(signal: &str) -> ResponseTier {
+  match signal {
+    "canary_trip" | "hard_deny" | "membership_drift" => ResponseTier::Freeze,
+    _ => ResponseTier::Silent,
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -72,6 +118,10 @@ pub enum Request {
     /// a consumed grant overrides the tier floor (human decision).
     #[serde(default)]
     grants: Vec<String>,
+    /// B6 phase 4: the launcher's kernel tty_nr (0 = headless). Human-
+    /// only ops on the spawned session require this tty at dispatch.
+    #[serde(default)]
+    launcher_tty: u64,
   },
   Adopt {
     session: SessionId,
@@ -87,11 +137,6 @@ pub enum Request {
     session: Option<SessionId>,
   },
   Status,
-  Note {
-    session: SessionId,
-    kind: String,
-    detail: String,
-  },
   UndoDiff {
     session: SessionId,
   },
@@ -102,7 +147,10 @@ pub enum Request {
     session: SessionId,
   },
   /// Generate canary secrets for a session, register them with the
-  /// honeypot, and return them (plus the honeypot port) to the launcher.
+  /// honeypot, and return the HONEYPOT PORT to the launcher. The
+  /// secrets themselves are NOT returned in the response (B6 P3:
+  /// the response is visible to the agent, so returning them is a
+  /// canary oracle — R19). They persist in the canary ledger.
   CanaryRegister {
     session: SessionId,
     project: PathBuf,
@@ -114,8 +162,12 @@ pub enum Request {
   TrustScore {
     project: PathBuf,
   },
-  /// Apply a trust signal to a project.
-  TrustSignal {
+  /// TEST-ONLY (benchmark suites): apply a trust signal. The
+  /// production daemon rejects this op outright (B6 P3: the agent
+  /// must not be able to farm trust — R3/R8). Env-gated: the daemon
+  /// only accepts it when CASTELLAN_TEST_TRUST_SIGNAL is set.
+  #[serde(rename = "trust_signal")]
+  TestTrustSignal {
     project: PathBuf,
     session: SessionId,
     signal: String,
@@ -137,6 +189,11 @@ pub enum Request {
   BlessReject {
     nonce: String,
   },
+  /// Bless-broker: list pending requests (hint + want + session). The
+  /// full nonce is delivered out-of-band via the daemon journal (B6
+  /// P3); this op shows what is pending so the human can match a
+  /// journal entry.
+  BlessShow,
   /// Assemble a ProofCertificate for a session (daemon-as-verifier).
   Cert {
     session: SessionId,
@@ -152,6 +209,51 @@ pub enum Request {
   Radar {
     session: SessionId,
     project: PathBuf,
+  },
+  /// N5: sibling detector — report known harness processes running
+  /// without the CASTELLAN_SESSION tag (advisory).
+  Siblings,
+  /// N1: campaign detector — cross-session slow-drip attack detection
+  /// over the project's trust-event stream (advisory, silent tier).
+  Campaign {
+    project: PathBuf,
+  },
+  /// P8: run the live-fire drill suite now (manual trigger).
+  DrillRun,
+  /// P8: report the last drill results.
+  DrillStatus,
+  /// P8.1: immune memory — recall a response for a session's telemetry
+  /// window (advisory; the memory never auto-enforces).
+  MemoryRecall {
+    session: SessionId,
+  },
+  /// P8.1: immune memory — status (writes, activations, self shapes).
+  MemoryStatus,
+  /// P8.3: acoustic channel — approve a pending bless request by
+  /// spoken nonce. The utterance is the STT-transcribed human voice
+  /// (or the typed fallback); the daemon matches it against the
+  /// voice session's nonce under the constrained grammar.
+  VoiceApprove {
+    session: SessionId,
+    utterance: String,
+  },
+  /// P9.1: exfil channel census — run the D6 drill now (manual
+  /// trigger) and return the kernel-verified channel inventory.
+  ChannelsRun,
+  /// P9.1: report the last channel census results.
+  ChannelsStatus,
+  /// P9.3: cross-session contact tracing — sessions that wrote files
+  /// the compromised session wrote AFTER it did (exposure scored,
+  /// freeze offered, human decides).
+  TraceExpose {
+    compromised: SessionId,
+  },
+  /// P9.6: policy regression replay — replay kept-session spines
+  /// through a CANDIDATE policy before it lands (false-NEW-denies
+  /// only, advisory at release time).
+  PolicyCheck {
+    project: PathBuf,
+    candidate_project: PathBuf,
   },
 }
 
@@ -362,4 +464,28 @@ pub fn project_key(realpath: &Path) -> String {
   let canon = realpath.canonicalize().unwrap_or_else(|_| realpath.to_path_buf());
   let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
   digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn high_confidence_signals_freeze() {
+    assert_eq!(response_tier("canary_trip"), ResponseTier::Freeze);
+    assert_eq!(response_tier("hard_deny"), ResponseTier::Freeze);
+    assert_eq!(response_tier("membership_drift"), ResponseTier::Freeze);
+  }
+
+  #[test]
+  fn low_confidence_signals_are_silent() {
+    assert_eq!(response_tier("radar_anomaly"), ResponseTier::Silent);
+    assert_eq!(response_tier("would_deny"), ResponseTier::Silent);
+    assert_eq!(response_tier("harness_drift"), ResponseTier::Silent);
+  }
+
+  #[test]
+  fn unknown_signals_default_to_silent() {
+    assert_eq!(response_tier("something_new"), ResponseTier::Silent);
+  }
 }

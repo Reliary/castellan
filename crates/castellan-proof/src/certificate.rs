@@ -28,6 +28,18 @@ pub struct PlaceboProof {
   pub verdict: String,
 }
 
+/// P9.2: artifact-scan factor. Findings-only-negative: a clean delta
+/// is None (no claim), a finding delta is Some with the scanner
+/// identity and the finding list. The cert states what the scanner
+/// CANNOT see, never "0 findings" — absence of evidence is not
+/// evidence of absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactScan {
+  pub scanner: String,
+  pub new_findings: Vec<String>,
+  pub scope: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofCertificate {
   pub session: String,
@@ -35,6 +47,16 @@ pub struct ProofCertificate {
   pub generated_at: u64,
   pub bounds: BoundsProof,
   pub placebo: PlaceboProof,
+  /// N6: orphan census attestation. None = no census file (session
+  /// ended before the census existed, or never killed via daemon).
+  /// Some((found, killed)) = processes that escaped the session
+  /// cgroup via the user manager were found and killed at session end.
+  #[serde(default)]
+  pub census: Option<(usize, usize)>,
+  /// P9.2: artifact-scan factor. None = no scan ran (unconfigured) or
+  /// clean delta (findings-only-negative — no claim either way).
+  #[serde(default)]
+  pub artifact_scan: Option<ArtifactScan>,
   pub quality_label: String,
 }
 
@@ -77,6 +99,14 @@ pub fn assemble_certificate(
     "NO_POSITIVE_EVIDENCE"
   };
 
+  // N6 census attestation: read the census file if present.
+  let census = read_census(state_dir, session);
+
+  // P9.2 artifact-scan factor: read the scan evidence from the spine.
+  // Findings-only-negative: only a finding delta produces a factor;
+  // a clean delta or no scan = None (no claim either way).
+  let artifact_scan = read_artifact_scan(state_dir, session);
+
   let quality_label = match (bounds_verdict, proofs_passed, test_rerun_passed, spine_exists) {
     ("STAYED_IN_BOUNDS", p, t, true) if p > 0 && t => "STRONG",
     ("STAYED_IN_BOUNDS", p, _, true) if p > 0 => "MODERATE",
@@ -99,8 +129,46 @@ pub fn assemble_certificate(
       test_rerun_passed,
       verdict: placebo_verdict.to_string(),
     },
+    census,
+    artifact_scan,
     quality_label: quality_label.to_string(),
   })
+}
+
+/// Read the P9.2 artifact-scan factor from the session spine. The
+/// daemon emits `vuln_introduced` events with the finding summary;
+/// the scanner identity and scope are recorded in the event detail.
+fn read_artifact_scan(state_dir: &Path, session: &str) -> Option<ArtifactScan> {
+  let sink = EventSink::for_session(state_dir, session).ok()?;
+  let events = sink.read_all().ok()?;
+  let ev = events.iter().find(|e| e.kind == "vuln_introduced")?;
+  let detail = ev.path.clone();
+  let scanner = detail
+    .split("scanner=")
+    .nth(1)
+    .and_then(|s| s.split(')').next())
+    .unwrap_or("unknown")
+    .to_string();
+  let new_findings: Vec<String> = detail
+    .split(": ")
+    .nth(1)
+    .map(|s| s.split(';').map(|f| f.trim().to_string()).collect())
+    .unwrap_or_default();
+  Some(ArtifactScan {
+    scanner,
+    new_findings,
+    scope: "session-touched files only; scanner coverage is partial — absence of findings is NOT evidence of safety".into(),
+  })
+}
+
+/// Read the N6 census attestation file written by the daemon at kill.
+fn read_census(state_dir: &Path, session: &str) -> Option<(usize, usize)> {
+  let path = state_dir.join("castellan/sessions").join(format!("{session}.census"));
+  let raw = std::fs::read_to_string(path).ok()?;
+  let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+  let found = v.get("orphans_found")?.as_u64()? as usize;
+  let killed = v.get("orphans_killed")?.as_u64()? as usize;
+  Some((found, killed))
 }
 
 /// Pull placebo/test evidence from the trust.db events ledger for the
@@ -182,5 +250,26 @@ mod tests {
     let state = tmp_state();
     let cert = assemble_certificate("s3", Path::new("/tmp/proj"), &state).unwrap();
     assert_eq!(cert.quality_label, "NON-EVIDENTIAL");
+  }
+
+  #[test]
+  fn census_attestation_is_read_from_file() {
+    let state = tmp_state();
+    let sessions = state.join("castellan/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+      sessions.join("s4.census"),
+      r#"{"session":"s4","orphans_found":2,"orphans_killed":1,"ts":123}"#,
+    )
+    .unwrap();
+    let cert = assemble_certificate("s4", Path::new("/tmp/proj"), &state).unwrap();
+    assert_eq!(cert.census, Some((2, 1)));
+  }
+
+  #[test]
+  fn missing_census_file_is_none() {
+    let state = tmp_state();
+    let cert = assemble_certificate("s5", Path::new("/tmp/proj"), &state).unwrap();
+    assert_eq!(cert.census, None);
   }
 }

@@ -30,9 +30,7 @@ Nothing here is unbuildable by others: Landlock/cgroup plumbing is documented sy
   },
   "completeness_proof": {
     "config_scanner": "config-radar",
-    "sequence_scanner": "seq-engine",
     "missing_keys": [],
-    "expected_pairs_broken": 0,
     "verdict": "COMPLETENESS_PRESERVED"
   },
   "placebo_test_proof": {
@@ -62,7 +60,7 @@ From the kernel-witnessed event spine (overlayfs upper layer + inotify on expand
 relay-vuln scans post-edit state for missing-validation-path patterns (the `missing_space.rs`, `path_vuln.rs`, `validation_density.rs` detectors). Produces EvidenceTuples. `verdict: NO_VALIDATION_PATH_REMOVED` if zero findings. **Honest limit:** relay-vuln is grammar-free with false negatives — this proof is labeled "best-effort detection," not "proven safe." Quality label reflects this: if validation-path proof is the only positive evidence, the certificate is at most MODERATE.
 
 ### 3. Completeness proof
-config-radar checks for missing config keys (per-format extractors: YAML/TOML/JSON/HCL/INI/.env/Dockerfile/NGINX). seq-engine checks for broken expected token pairs. `verdict: COMPLETENESS_PRESERVED` if both pass. Failure → `COMPLETENESS_BROKEN` (certificate is WEAK or NON-EVIDENTIAL).
+config-radar checks for missing config keys (per-format extractors: YAML/TOML/JSON/HCL/INI/.env/Dockerfile/NGINX). `verdict: COMPLETENESS_PRESERVED` if it passes. Failure → `COMPLETENESS_BROKEN` (certificate is WEAK or NON-EVIDENTIAL). **seq-engine was KILLed 2026-08-27** — the expected-pair auditor is tautological on event-derived token sets (78% of learned expectations co-emitted by the same event), learns zero expectations on composite-only encoding, and its ordered fingerprints add no separation over radar's order-agnostic encoding on real spines. See PRIMITIVES.md.
 
 ### 4. Placebo test proof (the un-gameable positive signal)
 Two-factor, both required:
@@ -84,7 +82,7 @@ The agent does NOT generate the certificate. The daemon does, from:
 - kernel-witnessed event spine (bounds, audit chain)
 - daemon-re-run test results (placebo factor A)
 - relay-vuln scan of post-edit state (validation-path — daemon calls relay-vuln as a Rust crate; relay-vuln reads state directly, not agent-reported)
-- config-radar / seq-engine scans of post-edit state (completeness — same)
+- config-radar scan of post-edit state (completeness — same)
 - proof-fixes placebo computation (daemon invokes proof-fixes; the danger_signal comparison is done by proof-fixes reading state, not by the agent)
 
 The agent's audit-trail is cross-checked against kernel truth (mismatches decrement trust and weaken the certificate) but is never the source of truth.
@@ -128,7 +126,7 @@ HV fingerprints of verified sessions sync across machines via Omarchy's usage-sy
   - `castellan-proof` export module (was evidence-pack — rewritten as Rust, quality labels via serde)
   - `castellan-proof` placebo module (was proof-fixes — rewritten as Rust, placebo orchestration over relay-vuln)
   - `cert-evals` (benchmark methodology, SHA-256 cert — stays Python, dev/CI only, NOT in daemon)
-  - `castellan-completeness` (was seq-engine + config-radar — rewritten as Rust)
+  - `castellan-completeness` (was config-radar — rewritten as Rust; seq-engine KILLed 2026-08-27, see PRIMITIVES.md)
   - `castellan-ledger` audit chain (was agent-audit-trail — rewritten as Rust hash chain)
   - `engfield` (Phase 5 priors — already has 2183 LOC Rust, link as crate)
   - `cortex-rs` (Phase 5 consolidation — already pure Rust, link as crate)

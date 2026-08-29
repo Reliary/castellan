@@ -23,7 +23,16 @@ castellan-trust = { path = "../castellan-trust" }
 castellan-proof = { path = "../castellan-proof" }
 castellan-replay = { path = "../castellan-replay" }
 castellan-radar = { path = "../castellan-radar" }
+castellan-campaign = { path = "../castellan-campaign" }
+castellan-drill = { path = "../castellan-drill" }
+castellan-memory = { path = "../castellan-memory" }
+castellan-voice = { path = "../castellan-voice" }
 castellan-ledger = { path = "../castellan-ledger" }
+castellan-scan = { path = "../castellan-scan" }
+castellan-hub = { path = "../castellan-hub" }
+castellan-trace = { path = "../castellan-trace" }
+castellan-decoy = { path = "../castellan-decoy" }
+castellan-policycheck = { path = "../castellan-policycheck" }
 sha2 = "0.10"
 toml = "0.8"
 serde = { workspace = true }

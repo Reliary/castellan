@@ -103,11 +103,14 @@ echo "== thaw is a no-op on the killed session, others unaffected =="
 if proc_alive "$P1" && proc_alive "$P3"; then ok "P1 and P3 still running after S2 cleanup"; else bad "collateral damage to unfrozen sessions"; fi
 
 echo "== freeze all / thaw all =="
-"$BIN/castellan" freeze >/dev/null
+# B6 phase 4: global (session-less) human-only ops require a
+# controlling tty — an escaped process has none. The suite models
+# the human operator with a pty (script).
+script -qec "$BIN/castellan freeze" /dev/null >/dev/null 2>&1
 sleep 0.3
 f=$(timeout 5 "$BIN/castellan" status 2>/dev/null | grep ' pids  ' | grep -c frozen || true)
 [[ "$f" == "2" ]] && ok "freeze-all froze remaining 2" || bad "freeze-all failed (got $f frozen)"
-"$BIN/castellan" thaw >/dev/null
+script -qec "$BIN/castellan thaw" /dev/null >/dev/null 2>&1
 sleep 0.3
 t=$(timeout 5 "$BIN/castellan" status 2>/dev/null | grep ' pids  ' | grep -c thawed || true)
 [[ "$t" == "2" ]] && ok "thaw-all restored 2" || bad "thaw-all failed"

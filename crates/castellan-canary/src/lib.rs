@@ -102,6 +102,11 @@ impl Honeypot {
   }
 
   pub fn start_with_callback(state_home: &Path, on_trip: TripCallback) -> io::Result<Self> {
+    // P8 fault injection: the D2 drill must fail loudly when the
+    // honeypot is down. Test-only, env-gated.
+    if std::env::var("CASTELLAN_TEST_DISABLE_HONEYPOT").is_ok() {
+      return Self::detached_ok();
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let secrets: Registry = Arc::new(Mutex::new(HashMap::new()));
@@ -153,6 +158,12 @@ impl Honeypot {
       ledger: None,
       on_trip: Arc::new(|_| {}),
     }
+  }
+
+  /// P8 fault injection: a honeypot that is *successfully* detached
+  /// (port 0, no listener) so the D2 drill can observe the failure.
+  fn detached_ok() -> io::Result<Self> {
+    Ok(Self::detached())
   }
 
   pub fn register(&self, secret: &CanarySecret) {

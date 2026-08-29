@@ -37,7 +37,8 @@ export XDG_STATE_HOME="$WORK/state"
 mkdir -p "$WORK/state"
 
 echo "== start daemon =="
-"$BIN/castellan-daemon" > "$WORK/daemon.log" 2>&1 &
+# B6 P3: trust_signal is test-only, env-gated on the daemon
+CASTELLAN_TEST_TRUST_SIGNAL=1 "$BIN/castellan-daemon" > "$WORK/daemon.log" 2>&1 &
 DAPID=$!
 sleep 0.5
 grep -q listening "$WORK/daemon.log" && ok "daemon started" || { bad "daemon failed to start"; exit 1; }

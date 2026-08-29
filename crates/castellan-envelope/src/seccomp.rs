@@ -35,6 +35,13 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     libc::SYS_swapoff,
     libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_fsetxattr,
     libc::SYS_removexattr, libc::SYS_lremovexattr, libc::SYS_fremovexattr,
+    // B6 phase 1: chown/utime families. chmod is deliberately NOT
+    // blocked: git chmods .git/config.lock during init/commit (P1
+    // kernel finding — verified live: blocking chmod breaks git).
+    // The chmod residual is ownership-bounded: the agent can only
+    // chmod files it owns inside the Landlock write roots.
+    libc::SYS_chown, libc::SYS_fchown, libc::SYS_lchown, libc::SYS_fchownat,
+    libc::SYS_utime, libc::SYS_utimes, libc::SYS_utimensat, libc::SYS_futimesat,
   ]
 }
 
@@ -69,6 +76,11 @@ pub fn seccomp_program() -> Vec<libc::sock_filter> {
 }
 
 pub fn seccomp_apply() -> io::Result<()> {
+  // P8 fault injection: the D4 drill must fail loudly when seccomp is
+  // dropped. Test-only, env-gated — the daemon's env is not agent-set.
+  if std::env::var("CASTELLAN_TEST_DISABLE_SECCOMP").is_ok() {
+    return Ok(());
+  }
   let prog = seccomp_program();
   unsafe {
     if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {

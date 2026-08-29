@@ -1,0 +1,11 @@
+[package]
+name = "castellan-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P8.1 Kanerva-immune memory: SDM-based incident memory with fragment recall."
+
+[dependencies]
+blake3 = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }

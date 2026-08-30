@@ -32,6 +32,24 @@ Designed, not built yet:
 9. **HV fleet sync** — ed25519-signed cross-machine prototype exchange via Omarchy's usage-sync-folder (local outlier detection is shipped and live-verified; see `castellan radar`).
 10. **Mid-session expansion restart** — a bless approval currently grants the *next* launch; re-minting the envelope of a *live* session (kill → relaunch same session id in a wider domain) is designed, not built. Landlock cannot be loosened mid-session, so this needs daemon-side re-fork orchestration.
 
+## Quickstart
+
+Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified kernels: 7.0.3 and 7.1.8 (x86_64).
+
+```sh
+cargo build --release --workspace          # or download the release binary
+castellan preflight                        # check your kernel: all 6 checks must pass
+castellan daemon &                         # or run as a systemd user unit (recommended)
+castellan launch -- claude                 # enforced by default: workspace-only writes
+castellan status                           # see the session
+castellan freeze && castellan thaw         # the panic button
+castellan launch --undo -- claude          # every write lands in a discardable overlay
+castellan diff <session>                    # what did it change?
+castellan keep <session>                   # commit it, or `undo` to throw it away
+```
+
+`--harness` is auto-detected from the command (claude, codex, pi, opencode, aider, cursor-agent, gemini, crush); unknown harnesses still get the envelope, just no harness-state protection. `--no-enforce` opts out loudly (audit mode) — for debugging only.
+
 ## Why this fits Omarchy
 
 Omarchy already treats agents as first-class (launchers, agents panel, crash diagnosis) but ships no safety story — its manual says "be ready to rollback if the agent makes a mess." Castellan slots onto existing motifs: channels ↔ trust tiers, migrations ↔ session migrations, snapshots ↔ surgical undo, agents panel ↔ freeze toggle. The core is reusable on any systemd + Landlock Linux regardless of whether Omarchy takes it.

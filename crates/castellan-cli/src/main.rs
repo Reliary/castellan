@@ -15,6 +15,7 @@ fn main() {
   match args[0].as_str() {
     "launch" => launch(&args[1..], &path),
     "audit" => audit_report(&args[1..]),
+    "preflight" => preflight(),
     _ => {}
   }
   let request = match args[0].as_str() {
@@ -82,6 +83,78 @@ fn main() {
       eprintln!("read failed: {e}");
       std::process::exit(1);
     }
+  }
+}
+
+/// Kernel-feature preflight. Runs WITHOUT the daemon (stranger-runnable):
+/// verifies every kernel mechanism castellan depends on on THIS machine
+/// and exits nonzero if any is missing. Nothing here mutates state
+/// beyond a scratch dir. The enforcement check runs LAST because it
+/// locks this process down (Landlock is irreversible).
+fn preflight() -> ! {
+  let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+    .unwrap_or_default()
+    .trim()
+    .to_string();
+  println!("castellan preflight — kernel {kernel} ({})", std::env::consts::ARCH);
+  let mut failures = 0u32;
+  macro_rules! check {
+    ($name:expr, $ok:expr, $detail:expr) => {{
+      let ok: bool = $ok;
+      if !ok {
+        failures += 1;
+      }
+      println!("{}  {:<22} {}", if ok { "PASS" } else { "FAIL" }, $name, $detail);
+    }};
+  }
+
+  let abi = castellan_envelope::landlock_abi().unwrap_or(0);
+  check!("landlock", abi >= 1, format!("ABI v{abi} ({})", if abi >= 4 { "fs+net" } else { "fs only" }));
+
+  let cgv2 = std::fs::metadata("/sys/fs/cgroup/cgroup.controllers").map(|m| m.is_file()).unwrap_or(false);
+  check!("cgroup-v2", cgv2, "/sys/fs/cgroup unified");
+
+  let uid = nix::unistd::Uid::current().as_raw();
+  let user_dir = format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service");
+  let freeze = std::fs::metadata(format!("{user_dir}/cgroup.freeze")).map(|m| m.is_file()).unwrap_or(false);
+  check!("cgroup-freeze", freeze, format!("user@{uid}.service cgroup.freeze {}", if freeze { "present" } else { "missing" }));
+
+  check!("userns-mountns", userns_probe(), "unshare(CLONE_NEWUSER|CLONE_NEWNS) unprivileged");
+
+  let inotify = nix::sys::inotify::Inotify::init(nix::sys::inotify::InitFlags::empty()).is_ok();
+  check!("inotify", inotify, "init works");
+
+  let scratch = std::env::temp_dir().join("castellan-preflight");
+  let _ = std::fs::create_dir_all(&scratch);
+  let policy = castellan_policy::Policy::new("preflight-probe", "preflight", scratch.clone());
+  let enforced = castellan_envelope::apply_envelope(&policy).is_ok()
+    && std::fs::write("/tmp/castellan-preflight-deny", b"x").is_err()
+    && std::fs::write(scratch.join("probe"), b"x").is_ok();
+  let _ = std::fs::remove_file(scratch.join("probe"));
+  check!("landlock-enforcement", enforced, "scratch write allowed, /tmp write denied");
+
+  println!(
+    "\n{} of 6 checks passed{}",
+    6 - failures,
+    if failures == 0 { " — castellan should work here" } else { " — castellan will be degraded" }
+  );
+  std::process::exit(if failures == 0 { 0 } else { 1 })
+}
+
+fn userns_probe() -> bool {
+  use nix::sys::wait::WaitStatus;
+  match unsafe { nix::unistd::fork() } {
+    Ok(nix::unistd::ForkResult::Child) => {
+      let ok = nix::sched::unshare(
+        nix::sched::CloneFlags::CLONE_NEWUSER | nix::sched::CloneFlags::CLONE_NEWNS,
+      )
+      .is_ok();
+      std::process::exit(if ok { 0 } else { 1 });
+    }
+    Ok(nix::unistd::ForkResult::Parent { child, .. }) => {
+      matches!(nix::sys::wait::waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
+    }
+    Err(_) => false,
   }
 }
 
@@ -399,6 +472,17 @@ fn launch(args: &[String], sock: &str) -> ! {
   let harness = harness.unwrap_or_else(|| {
     castellan_policy::detect_harness(&cmd[0]).unwrap_or("unknown").to_string()
   });
+  // B6 portability: kernel 7.1.x denies cgroup.procs migration when the
+  // migrated process sits outside the delegated subtree (session-*.scope),
+  // even for an inside-writer like the daemon. A launcher on an
+  // interactive login (ssh, desktop terminal) lives in session-*.scope,
+  // so launch would fail there. Fix: hop into user@.service via a
+  // transient systemd scope first — the hop preserves the controlling
+  // tty (verified), stdio, and exit status; on kernels that don't need
+  // it (7.0.x) the hop is semantically a no-op.
+  if outside_user_service() {
+    hop_into_user_service();
+  }
   let resp = rpc(sock, &serde_json::json!({
     "op": "spawn",
     "harness": harness,
@@ -444,7 +528,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   if !consumed.is_empty() {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
   }
-  let procs = scope_procs(&session);
+  let _ = &session;
   // undo overlay FIRST: setup enters a user+mount namespace and mounts
   // the overlay. The envelope's seccomp filter blocks mount(2), so
   // applying the envelope before the overlay would break forced
@@ -481,12 +565,21 @@ fn launch(args: &[String], sock: &str) -> ! {
   // join the session cgroup AFTER the note: the agent inherits the
   // cgroup at exec, and the daemon's caller classification must see
   // the launcher as the human until the agent actually starts.
-  if let Err(e) = std::fs::write(
-    &procs,
-    format!("{}\n", std::process::id()),
-  ) {
-    eprintln!("failed to join session cgroup: {e}");
-    std::process::exit(1);
+  // B6 portability: the join is daemon-side — kernel 7.1.x denies
+  // cgroup.procs writes from callers outside the delegated subtree
+  // (session-*.scope), while the daemon (a user unit inside
+  // user@1000.service) may migrate any pid.
+  {
+    let resp = rpc(sock, &serde_json::json!({"op": "join_session", "session": session, "pid": std::process::id()}));
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
+      let why = v["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .unwrap_or("unknown error");
+      eprintln!("failed to join session cgroup: {why}");
+      std::process::exit(1);
+    }
   }
   if enforce {
     let mut policy = castellan_policy::Policy::new(&session, &harness, project.clone());
@@ -537,11 +630,37 @@ fn launcher_tty() -> u64 {
     .unwrap_or(0)
 }
 
-fn scope_procs(session: &str) -> std::path::PathBuf {
-  castellan_freezer::CgroupRoot::detect()
-    .expect("cgroup v2 user slice not found")
-    .session_dir(&session.to_string())
-    .join("cgroup.procs")
+fn outside_user_service() -> bool {
+  let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+  match cgroup.lines().find(|l| l.starts_with("0::")) {
+    Some(l) => !l.trim().contains("user@"),
+    None => true,
+  }
+}
+
+fn hop_into_user_service() -> ! {
+  let argv: Vec<String> = std::env::args().skip(1).collect();
+  let unit = format!("castellan-hop-{}", std::process::id());
+  let exe = std::env::current_exe()
+    .map(|p| p.to_string_lossy().into_owned())
+    .unwrap_or_else(|_| "castellan".to_string());
+  eprintln!("castellan: launcher outside user@.service — hopping into a transient scope for cgroup migration");
+  match std::process::Command::new("systemd-run")
+    .arg("--user")
+    .arg("--scope")
+    .arg("--unit")
+    .arg(&unit)
+    .arg(&exe)
+    .args(argv)
+    .status()
+  {
+    Ok(st) => std::process::exit(st.code().unwrap_or(1)),
+    Err(e) => {
+      eprintln!("castellan: systemd-run hop unavailable: {e}");
+      eprintln!("castellan: launch may fail on kernels restricting cgroup migration (7.1.x)");
+      std::process::exit(1);
+    }
+  }
 }
 
 fn rpc(sock: &str, req: &serde_json::Value) -> String {

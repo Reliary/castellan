@@ -45,9 +45,12 @@ impl CgroupRoot {
     let mut file = OpenOptions::new().append(true).open(&procs)?;
     let mut moved = 0usize;
     for pid in pids {
-      if file.write_all(format!("{pid}\n").as_bytes()).is_ok() {
-        moved += 1;
-      }
+      // a failed cgroup.procs write must propagate: swallow-or-count
+      // made daemon-side joins report success while moving nobody
+      // (seen live on the kernel-7.1 portability pass, session showed
+      // 0 pids while the agent ran)
+      file.write_all(format!("{pid}\n").as_bytes())?;
+      moved += 1;
     }
     file.flush()?;
     Ok(moved)
@@ -204,6 +207,11 @@ impl CgroupRoot {
   /// checked with the SAME /proc/<pid>/stat starttime math the census
   /// uses (btime + start_ticks/hz), which is one proven domain.
   pub fn stop_escaped_units(&self, session: &SessionId, session_start_unix: u64) -> usize {
+    // exempt our own cgroup: a daemon (re)started mid-session would
+    // otherwise be classified as an escaped unit and stopped, killing
+    // the caller (verified live on 7.1.8 — the census stopped its own
+    // daemon during a kill op and dropped the socket connection)
+    let own_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let scope = self.session_dir(session);
     let scope_str = scope.to_string_lossy().to_string();
     let btime = proc_btime();
@@ -295,6 +303,20 @@ impl CgroupRoot {
         continue;
       }
       if cgroup.contains(&scope_str) {
+        continue;
+      }
+      // never stop the daemon's own unit (see comment above)
+      let unit_cgroup_short = cgroup
+        .rsplit_once("user@")
+        .map(|(_, rest)| rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '@'))
+        .unwrap_or("");
+      let own_short = own_cgroup
+        .lines()
+        .find(|l| l.starts_with("0::"))
+        .and_then(|l| l.rsplit_once("user@"))
+        .map(|(_, rest)| rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '@'))
+        .unwrap_or("");
+      if !own_short.is_empty() && unit_cgroup_short == own_short {
         continue;
       }
       // same starttime math as orphan_census: /proc/<pid>/stat

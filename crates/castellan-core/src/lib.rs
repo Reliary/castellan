@@ -127,6 +127,15 @@ pub enum Request {
     session: SessionId,
     pids: Vec<u32>,
   },
+  /// B6 portability: kernel 7.1.x denies cgroup.procs writes from
+  /// callers outside the delegated subtree (session-*.scope), while
+  /// the daemon — a user unit inside user@1000.service — may migrate
+  /// any pid. The launcher asks the daemon to join its own session
+  /// scope instead of writing cgroup.procs itself.
+  JoinSession {
+    session: SessionId,
+    pid: u32,
+  },
   Freeze {
     session: Option<SessionId>,
   },

@@ -525,6 +525,7 @@ impl Daemon {
         self.spawn(harness, project, pid, command, enforce, undo, net, grants, launcher_tty)
       }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
+      Request::JoinSession { session, pid } => self.join_session(&session, pid),
       Request::Freeze { session } => self.freeze(session.as_ref(), true),
       Request::Thaw { session } => self.freeze(session.as_ref(), false),
       Request::Kill { session } => self.kill(session.as_ref()),
@@ -2427,6 +2428,25 @@ impl Daemon {
     match self.root.write_procs(session, &pids) {
       Ok(n) => Response::ok().with_message(format!("adopted {n} pids into {session}")),
       Err(e) => Response::err(format!("adopt failed: {e}")),
+    }
+  }
+
+  /// B6 portability: the launcher's pid joins its own session scope,
+  /// performed daemon-side. Kernel 7.1.x denies cgroup.procs writes
+  /// from outside the delegated subtree (the launcher often sits in
+  /// session-*.scope); the daemon lives inside user@1000.service where
+  /// migration is permitted. Entering a session only constrains the
+  /// caller, so any non-agent identity may join its own session.
+  fn join_session(&self, session: &SessionId, pid: u32) -> Response {
+    {
+      let reg = self.registry.lock().unwrap();
+      if !reg.contains(session) {
+        return Response::err(format!("unknown session {session}"));
+      }
+    }
+    match self.root.write_procs(session, &[pid]) {
+      Ok(_) => Response::ok().with_message(format!("pid {pid} joined {session}")),
+      Err(e) => Response::err(format!("join failed: {e}")),
     }
   }
 

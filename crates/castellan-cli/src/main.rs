@@ -529,9 +529,8 @@ fn launch(args: &[String], sock: &str) -> ! {
     undo = true;
     net = true;
   } else if cold_forced_undo {
-    eprintln!("castellan: no trust history — forcing undo+net for this first session (keep or undo to earn the default)");
+    eprintln!("castellan: no trust history — forcing undo for this first session (keep or undo to earn the default)");
     undo = true;
-    net = true;
   }
   if !consumed.is_empty() {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));

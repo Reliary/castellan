@@ -2297,12 +2297,15 @@ impl Daemon {
       (low, cold, tier, granted)
     };
     // tiers 0-1: enforce+undo+net regardless of flags (trust was
-    // earned down). Cold: undo+net forced; enforce forced only when
-    // the launcher did not explicitly opt out.
-    let (enforce, undo, net) = if (low_trust || (cold_trust && enforce)) && granted.is_empty() {
+    // earned down — full fail-closed containment). Cold: undo forced
+    // only; net is NOT forced — Landlock ABI4 net rules are port-
+    // scoped, so allowing the LLM API (443) also allows 443 exfil,
+    // and forcing net would break every LLM harness cold start. The
+    // canary honeypot remains the exfil detector (C10a posture).
+    let (enforce, undo, net) = if low_trust && granted.is_empty() {
       (true, true, true)
     } else if cold_trust && granted.is_empty() {
-      (enforce, true, true)
+      (enforce, true, net)
     } else {
       (enforce, undo, net)
     };

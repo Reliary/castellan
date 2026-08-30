@@ -67,6 +67,7 @@ Trust can sync across machines via Omarchy's existing usage-sync-folder mechanis
 - A8 (slow-drip): residual, mitigated by ceiling + deny-list + egress proxy.
 - D2 (half-life killed): closed — no time-decay, cortex-rs tier-promotion if needed.
 - D5 (cold-start punishes): closed — floor always on, trust gates only ceiling.
+- Cold-start posture (decision 2026-08-30, C11): a project with NO trust history runs its first session with undo+net forced (enforce is the post-B6 default; an explicit --no-enforce is honored). One clean keep earns the tier-2 default. Verified live; see docs/DESIGN_DECISIONS.md C11.
 
 ## Kill criterion (Phase 3)
 

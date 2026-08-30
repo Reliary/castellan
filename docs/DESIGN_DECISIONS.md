@@ -106,6 +106,12 @@ This document records what antagonism killed, what it hardened, and why each of 
 **Without this:** expansion is the bypass path.
 **Commitment:** nonce comes from the notification UI via dbus (not from the agent's environment). Max 3 expansions per session, cooling-off period. fp-toggle biometric required for egress or config-dir writes. Risk card (quale) shown for every request.
 
+### C11. Cold-start fail-closed (option B, decided 2026-08-30)
+**Decision:** a project with no trust history (last_event_ts == 0) runs its first session with undo+net forced, regardless of launcher flags; an explicit human `--no-enforce` is still honored (audit mode is a labeled debug opt-out — an informed human decision is not softened by the floor). After one clean keep the project is off cold and tier-2 defaults apply.
+**Why:** the pre-B6 posture was an inversion — the least-trusted session (a fresh project's first agent) got the widest write surface (direct writes to the real project, no overlay, no canary lockdown), while a project with earned trust got more confinement. B6 made enforce the default for everyone; this closes the remaining first-session gap: writes land in the discardable overlay from session zero, and the human decides with `keep`/`undo`.
+**Alternatives rejected:** (a) keep tier-2 cold permissive — adoption-friendly but preserves the inversion; decided against. (b) cold floor overriding `--no-enforce` too — maximum safety but blocks the labeled debug mode on every new project and broke the p1 audit suite; the explicit human flag is the boundary the floor respects.
+**Verified:** cold+default forces undo+net (banner, session record); cold+`--no-enforce` runs audit with undo+net still forced (enforce:false in the record); keep moves 50.0→51.0 and off cold; warm tier-2 launches force nothing. All suites green (p0-p4, p9-stack).
+
 ## Alternatives considered and rejected
 
 ### A1. bubblewrap instead of Landlock

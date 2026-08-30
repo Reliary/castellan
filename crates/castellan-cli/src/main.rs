@@ -505,14 +505,18 @@ fn launch(args: &[String], sock: &str) -> ! {
     std::env::set_var("CASTELLAN_SESSION", &session);
   }
   // trust floor coupling: the daemon may have forced flags regardless
-  // of what the launcher requested (tiers 0-1 run fail-closed unless a
-  // human grant was consumed)
+  // of what the launcher requested (tiers 0-1 fail-closed unless a
+  // human grant was consumed; cold projects force undo+net)
   let profile = serde_json::from_str::<serde_json::Value>(&resp)
     .ok()
     .and_then(|v| v.get("extra").and_then(|e| e.get("profile")).cloned());
   let forced = profile
     .as_ref()
     .and_then(|p| p.get("forced").and_then(|f| f.as_bool()))
+    .unwrap_or(false);
+  let cold_forced_undo = profile
+    .as_ref()
+    .and_then(|p| p.get("cold_forced_undo").and_then(|f| f.as_bool()))
     .unwrap_or(false);
   let consumed: Vec<String> = profile
     .as_ref()
@@ -522,6 +526,10 @@ fn launch(args: &[String], sock: &str) -> ! {
   if forced {
     eprintln!("castellan: trust tier <= 1 — forcing enforce+undo+net (fail-closed)");
     enforce = true;
+    undo = true;
+    net = true;
+  } else if cold_forced_undo {
+    eprintln!("castellan: no trust history — forcing undo+net for this first session (keep or undo to earn the default)");
     undo = true;
     net = true;
   }

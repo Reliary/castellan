@@ -2259,11 +2259,30 @@ impl Daemon {
     // The daemon consults the trust tier at spawn; the launcher's
     // flags are a request, not a grant. A consumed grant (human
     // blessing) overrides the floor for that expansion.
-    let (low_trust, tier_str, granted) = {
+    // Cold start (decision 2026-08-30, option B): a project with NO
+    // trust record runs fail-closed too — the least-trusted session
+    // must not get the widest write surface. The cold floor forces
+    // undo+net but honors an explicit human --no-enforce (audit mode,
+    // labeled debug-only): an informed opt-out is not softened. The
+    // first keep/proof cycle earns the looser default.
+    let (low_trust, cold_trust, tier_str, granted) = {
       let db = self.trust.lock().unwrap();
       let t = db.score(&project).ok();
-      let low = t.as_ref().map(|t| t.tier <= castellan_trust::Tier::One).unwrap_or(false);
-      let tier = t.map(|t| t.tier.as_str().to_string()).unwrap_or("?".into());
+      // cold = no trust record (score() synthesizes tier-2 with
+      // last_event_ts 0 for unknown projects; see COLD_START_SCORE)
+      let cold = t
+        .as_ref()
+        .map(|t| t.last_event_ts == 0)
+        .unwrap_or(true);
+      let low = t
+        .as_ref()
+        .map(|t| t.tier <= castellan_trust::Tier::One)
+        .unwrap_or(false);
+      let tier = match (&t, cold) {
+        (Some(t), false) => t.tier.as_str().to_string(),
+        (_, true) => "cold".into(),
+        (None, false) => "cold".into(),
+      };
       let granted: Vec<String> = grants
         .iter()
         .filter_map(|want| {
@@ -2275,10 +2294,15 @@ impl Daemon {
             .map(|g| g.want)
         })
         .collect();
-      (low, tier, granted)
+      (low, cold, tier, granted)
     };
-    let (enforce, undo, net) = if low_trust && granted.is_empty() {
+    // tiers 0-1: enforce+undo+net regardless of flags (trust was
+    // earned down). Cold: undo+net forced; enforce forced only when
+    // the launcher did not explicitly opt out.
+    let (enforce, undo, net) = if (low_trust || (cold_trust && enforce)) && granted.is_empty() {
       (true, true, true)
+    } else if cold_trust && granted.is_empty() {
+      (enforce, true, true)
     } else {
       (enforce, undo, net)
     };
@@ -2347,6 +2371,7 @@ impl Daemon {
           "undo": undo,
           "net": net,
           "forced": low_trust && granted.is_empty(),
+          "cold_forced_undo": cold_trust && granted.is_empty() && !low_trust,
           "tier": tier_str,
           "grants": granted,
         }),

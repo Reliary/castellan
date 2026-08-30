@@ -161,6 +161,13 @@ impl CgroupRoot {
         if ppid as u32 != user_mgr {
           continue;
         }
+        // never claim ourselves: a daemon (re)started mid-session is a
+        // child of the user manager started during the window, outside
+        // any scope — the census SIGKILLed its own daemon on 7.1.8
+        // (verified: status=9/KILL, restart counter 1)
+        if pid == std::process::id() {
+          continue;
+        }
         let start_unix = btime + start_ticks.div_ceil(hz);
         if start_unix < session_start_unix {
           continue;

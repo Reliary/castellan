@@ -19,7 +19,11 @@ ok "stale state cleaned"
 echo "== start daemon =="
 "$DAEMON" >/tmp/cast-p2/daemon.log 2>&1 &
 DPID=$!
-sleep 0.4
+# wait for the socket, not a fixed sleep (startup >1s on real state dir)
+for _ in $(seq 1 50); do
+  [ -S /run/user/1000/castellan.sock ] && break
+  sleep 0.1
+done
 "$BIN" status >/dev/null 2>&1 && ok "daemon started" || { bad "daemon not responding"; exit 1; }
 
 W=$(mktemp -d /tmp/cast-p2/proj.XXXX)

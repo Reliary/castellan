@@ -39,7 +39,12 @@ ok "stale state cleaned"
 echo "== start daemon =="
 "$BIN/castellan-daemon" &
 DAPID=$!
-sleep 0.4
+# wait for the socket, not a fixed sleep: startup loads the memory
+# log-replay + trust/canary ledgers and takes >1s on the real state dir
+for _ in $(seq 1 50); do
+  [ -S /run/user/1000/castellan.sock ] && break
+  sleep 0.1
+done
 if kill -0 "$DAPID" 2>/dev/null; then ok "daemon started"; else bad "daemon died at startup"; exit 1; fi
 
 echo "== spawn three sessions with real processes =="

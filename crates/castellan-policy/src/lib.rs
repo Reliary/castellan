@@ -58,7 +58,7 @@ const KNOWN_HARNESSES: &[(&str, &[&str])] = &[
   ("claude", &[".claude"]),
   ("codex", &[".codex"]),
   ("pi", &[".pi"]),
-  ("opencode", &[".config/opencode", ".local/share/opencode"]),
+  ("opencode", &[".config/opencode", ".local/share/opencode", ".local/state/opencode"]),
   ("aider", &[".aider"]),
   ("cursor-agent", &[".cursor", ".config/Cursor"]),
   ("gemini", &[".gemini"]),

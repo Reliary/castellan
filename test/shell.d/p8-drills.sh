@@ -35,7 +35,11 @@ start_daemon() {
   # shellcheck disable=SC2086
   env $envs "$BIN/castellan-daemon" > /tmp/castellan-drill-daemon.log 2>&1 &
   DAPID=$!
-  sleep 0.6
+  # wait for the socket, not a fixed sleep (bind can exceed 1s)
+  for _ in $(seq 1 50); do
+    [ -S /run/user/1000/castellan.sock ] && break
+    sleep 0.1
+  done
   if ! kill -0 "$DAPID" 2>/dev/null; then bad "daemon failed to start"; exit 1; fi
 }
 

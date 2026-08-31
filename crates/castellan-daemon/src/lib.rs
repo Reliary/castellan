@@ -112,6 +112,11 @@ fn agent_allowed(req: &Request) -> bool {
       | Request::HoneypotPort
       | Request::UndoDiff { .. }
       | Request::Campaign { .. }
+      // C32: the request is the agent ASKING for an expansion — an
+      // unprivileged, rate-limited, ledgered ask. Only the APPROVE is
+      // privileged (tty-gated in human_tty_ok). Blocking requests for
+      // agents inverted the flow: the agent could never ask.
+      | Request::BlessRequest { .. }
   )
 }
 
@@ -434,13 +439,15 @@ impl Daemon {
   /// tty 0 = no requirement; headless is a documented residual).
   fn human_tty_ok(&self, req: &Request, caller_tty: u64) -> bool {
     let session = match req {
+      // session-scoped human-only ops: launcher tty. BlessRequest is
+      // deliberately absent — agents may ask (C32); only the approve
+      // is human-only (see BlessApprove below).
       Request::UndoCommit { session }
       | Request::UndoDiscard { session }
       | Request::Freeze { session: Some(session) }
       | Request::Thaw { session: Some(session) }
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
-      | Request::BlessRequest { session, .. }
       | Request::Cert { session }
       | Request::Replay { session, .. }
       | Request::Radar { session, .. }
@@ -450,6 +457,40 @@ impl Daemon {
       Request::Thaw { session: None }
       | Request::Kill { session: None }
       | Request::Freeze { session: None } => return caller_tty != 0,
+      // C32: approve must come from the LAUNCHER'S terminal, not just
+      // any terminal. The nonce is fishable from the daemon journal
+      // (same-user-readable, found by the D'-round probe), so secret
+      // knowledge proves nothing — terminal ownership does (TIOCSCTTY
+      // is kernel-enforced; an escaped process cannot acquire the
+      // human's controlling tty).
+      Request::BlessApprove { nonce } => {
+        // resolve like bless_approve does: exact key or unique >=8-char
+        // prefix (the full nonce is delivered nowhere, C32)
+        let launcher = {
+          let b = self.bless.lock().unwrap();
+          let full = if b.contains_key(nonce) {
+            Some(nonce.to_string())
+          } else {
+            let hits: Vec<String> = b
+              .keys()
+              .filter(|k| k.starts_with(nonce) && nonce.len() >= 8)
+              .cloned()
+              .collect();
+            if hits.len() == 1 {
+              Some(hits[0].clone())
+            } else {
+              None
+            }
+          };
+          full
+            .and_then(|k| {
+              let session = &b.get(&k).unwrap().session;
+              self.registry.lock().unwrap().get(session).map(|s| s.launcher_tty)
+            })
+            .unwrap_or(0)
+        };
+        return launcher != 0 && caller_tty == launcher;
+      }
       // everything else (Spawn, Status, agent-allowed reads, the
       // canary verb): no session tty requirement.
       _ => return true,
@@ -479,7 +520,6 @@ impl Daemon {
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
       | Request::CanaryRegister { session, .. }
-      | Request::BlessRequest { session, .. }
       | Request::TestTrustSignal { session, .. } => Some(session.clone()),
       _ => None,
     };
@@ -1401,14 +1441,15 @@ impl Daemon {
       return Response::err("cooling-off period active (5 minutes between expansions)");
     }
     let nonce = castellan_core::new_bless_nonce();
-    // B6 P3 (D4-F1): the nonce is delivered OUT-OF-BAND — printed to
-    // the daemon's journal (stderr), never returned in the socket
-    // response. The response carries only the hint. The residual: a
-    // same-uid agent that can read the journal can recover the nonce
-    // (same-uid advisory-defender position, A3 knot — documented);
-    // what is closed is the same-connection self-grant: request and
-    // approve can no longer be completed without a second channel.
-    eprintln!("castellan-daemon: bless nonce for {session}: {nonce} (want={want})");
+    // C32 (D'-round probe finding): the nonce is NOT delivered anywhere
+    // the same user can read — not the socket response, and NOT the
+    // daemon journal either (journalctl is same-user-readable and the
+    // agent IS the same user; the probe recovered it that way and
+    // self-approved). The nonce now proves nothing: approval requires
+    // the caller's controlling tty to match the session's launcher
+    // tty (see human_tty_ok), which is kernel-enforced and cannot be
+    // fished from any file. The nonce survives only as a handle to
+    // identify WHICH request is being approved.
     let req = BlessRequest {
       session: session.to_string(),
       project: project.clone(),
@@ -1437,7 +1478,7 @@ impl Daemon {
         "want": want,
         "session": session,
         "nonce_hint": &nonce[..8],
-        "note": "nonce issued — read it from the daemon journal (castellan bless show)",
+        "note": "request pending — approve from the launcher's terminal: castellan bless approve <nonce_hint>…",
       }),
     )
   }
@@ -1534,7 +1575,9 @@ impl Daemon {
     }
   }
 
-  /// Bless-broker: approve by nonce. Unknown nonce = forged attempt:
+  /// Bless-broker: approve by nonce (full or 8-char hint — the tty
+  /// gate in human_tty_ok is the actual authentication; the nonce is
+  /// only a request selector, C32). Unknown nonce = forged attempt:
   /// floor the project's trust at 0 (forged_nonce signal).
   fn bless_approve(&self, nonce: &str) -> Response {
     // P8 fault injection: the D3 drill must fail loudly when the bless
@@ -1544,7 +1587,25 @@ impl Daemon {
     }
     let req = {
       let mut b = self.bless.lock().unwrap();
-      match b.remove(nonce) {
+      // exact match, or unique 8-char-hint prefix (C32: the full nonce
+      // is no longer delivered anywhere — the human approves from
+      // the launcher terminal using the hint shown by bless_request/
+      // bless_show; terminal ownership is the proof)
+      let matched = if b.contains_key(nonce) {
+        b.remove(nonce)
+      } else {
+        let hits: Vec<String> = b
+          .keys()
+          .filter(|k| k.starts_with(nonce) && nonce.len() >= 8)
+          .cloned()
+          .collect();
+        if hits.len() == 1 {
+          b.remove(&hits[0])
+        } else {
+          None
+        }
+      };
+      match matched {
         Some(r) => r,
         None => {
           // Forged nonce. Attribution: an unknown nonce carries no

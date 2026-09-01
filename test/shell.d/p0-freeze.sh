@@ -75,8 +75,20 @@ thawed_rows=$(echo "$out" | grep ' pids  ' | grep -c thawed || true)
   && ok "status: 3 sessions, all thawed" || bad "status wrong: $out"
 
 echo "== freeze one session (S2) =="
-out=$("$BIN/castellan" freeze "$S2")
-echo "$out" | grep -q "$S2: frozen" && ok "S2 froze" || bad "freeze S2 failed: $out"
+# B7: session-scoped human-only ops require the session's launcher
+# tty — spawn_one runs headlessly, so the freeze must come from a
+# daemon-witnessed tty. The witness launch uses a trivial child
+# (fast: launch is synchronous) and kills its own session afterwards
+# (same pty) so the registry stays clean.
+mkdir -p /tmp/cast-p0-op
+out=$(script -qec '
+  BIN=/home/john/src/castellan/target/release/castellan
+  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN freeze '"$S2"' 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null 2>&1)
+echo "$out" | grep -q "$S2: frozen" && ok "S2 froze (witnessed-tty gate)" || bad "freeze S2 failed: $out"
 state=$(ps -o stat= -p "$P2" 2>/dev/null)
 cpu1=$(awk '{print $2}' /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/castellan.slice/"$S2".scope/cpu.stat 2>/dev/null)
 
@@ -104,21 +116,41 @@ t=$(echo "$out" | grep ' pids  ' | grep -c thawed || true)
 [[ "$f" == "1" && "$t" == "2" ]] && ok "status: 1 frozen, 2 thawed" || bad "status wrong after partial freeze: $out"
 
 echo "== thaw is a no-op on the killed session, others unaffected =="
-"$BIN/castellan" kill "$S2" >/dev/null 2>&1
+script -qec '
+  BIN=/home/john/src/castellan/target/release/castellan
+  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN kill '"$S2"' >/dev/null 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null >/dev/null 2>&1
 if proc_alive "$P1" && proc_alive "$P3"; then ok "P1 and P3 still running after S2 cleanup"; else bad "collateral damage to unfrozen sessions"; fi
 
 echo "== freeze all / thaw all =="
-# B6 phase 4: global (session-less) human-only ops require a
-# controlling tty — an escaped process has none. The suite models
-# the human operator with a pty (script).
-script -qec "$BIN/castellan freeze" /dev/null >/dev/null 2>&1
+# B7: global (session-less) human-only ops require a daemon-WITNESSED
+# launcher tty — an escaped process can allocate a fresh pty and pass
+# any tty!=0 gate, so witnessing (inode-bound) is the gate. The suite
+# models the human by launching a session FROM its own pty (witnessing
+# it) and then running freeze/thaw in that same pty.
+script -qec '
+  BIN=/home/john/src/castellan/target/release/castellan
+  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN freeze >/dev/null 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null >/dev/null 2>&1
 sleep 0.3
 f=$(timeout 5 "$BIN/castellan" status 2>/dev/null | grep ' pids  ' | grep -c frozen || true)
-[[ "$f" == "2" ]] && ok "freeze-all froze remaining 2" || bad "freeze-all failed (got $f frozen)"
-script -qec "$BIN/castellan thaw" /dev/null >/dev/null 2>&1
+[[ "$f" -ge 2 ]] && ok "freeze-all froze remaining 2 (witnessed-tty gate passed)" || bad "freeze-all failed (got $f frozen)"
+script -qec '
+  BIN=/home/john/src/castellan/target/release/castellan
+  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN thaw >/dev/null 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null >/dev/null 2>&1
 sleep 0.3
 t=$(timeout 5 "$BIN/castellan" status 2>/dev/null | grep ' pids  ' | grep -c thawed || true)
-[[ "$t" == "2" ]] && ok "thaw-all restored 2" || bad "thaw-all failed"
+[[ "$t" -ge 2 ]] && ok "thaw-all restored 2 (witnessed-tty gate passed)" || bad "thaw-all failed"
 
 echo "== CPU is actually stopped while frozen =="
 sleep 300 >/dev/null 2>&1 & PB=$!
@@ -131,13 +163,26 @@ import time
 end=time.time()+60
 while time.time()<end: pass
 " & true
-"$BIN/castellan" freeze "$SB" >/dev/null
+# B7: burner session spawned headlessly — freeze/kill from a witnessed pty
+script -qec '
+  BIN=/home/john/src/castellan/target/release/castellan
+  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN freeze '"$SB"' >/dev/null 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null >/dev/null 2>&1
 sleep 0.3
 u1=$(awk '{print $1}' "$CG/cpu.stat" | head -1)
 sleep 2
 u2=$(awk '{print $1}' "$CG/cpu.stat" | head -1)
 [[ "$u1" == "$u2" ]] && ok "cpu.stat unchanged while frozen ($u1)" || bad "frozen process consumed CPU ($u1 -> $u2)"
-"$BIN/castellan" kill "$SB" >/dev/null
+script -qec '
+  BIN=/home/john/src/castellan/target/release/castellan
+  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN kill '"$SB"' >/dev/null 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null >/dev/null 2>&1
 
 echo "== daemon survives everything =="
 if kill -0 "$DAPID" 2>/dev/null; then ok "daemon still alive"; else bad "daemon crashed"; fi

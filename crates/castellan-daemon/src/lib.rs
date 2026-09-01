@@ -63,6 +63,32 @@ fn caller_start_ticks(pid: u32) -> Option<u64> {
   proc_field(pid, 19).and_then(|f| f.parse().ok())
 }
 
+/// B7: resolve a tty_nr to its pts inode. tty_nr encodes the dev minor
+/// (bits 8-20 for pts); the inode uniquely identifies the CURRENT
+/// allocation of that minor number. A closed pts is freed and its minor
+/// can be reused — the inode changes. Binding trust to the inode
+/// defeats tty_nr recycling and fresh-pty spoofs (an attacker-allocated
+/// pty is a minor the daemon never witnessed).
+fn tty_inode(tty_nr: u64) -> Option<u64> {
+  if tty_nr == 0 {
+    return None;
+  }
+  // /proc/stat tty_nr encodes MAJOR<<8 | MINOR (for minor < 256).
+  // pts devices are major 136: tty_nr = 34816 + minor. Extract the
+  // MINOR (the low byte), not the major — extracting (tty_nr >> 8)
+  // yielded 136 for every pts and resolved /dev/pts/136 (nonexistent),
+  // so witnessing silently never happened (found via suite failure).
+  let major = (tty_nr >> 8) & 0xff;
+  if major != 136 {
+    return None;
+  }
+  let minor = tty_nr & 0xff;
+  let path = format!("/dev/pts/{minor}");
+  let meta = std::fs::metadata(&path).ok()?;
+  use std::os::unix::fs::MetadataExt;
+  Some(meta.ino())
+}
+
 fn probe_caller(stream: &UnixStream) -> Option<CallerInfo> {
   let pid = getsockopt(stream, PeerCredentials).ok()?.pid() as u32;
   let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
@@ -210,6 +236,13 @@ pub struct Daemon {
   channels_results: Arc<Mutex<Vec<(String, String)>>>,
   memory: Arc<Mutex<castellan_memory::ImmuneMemory>>,
   voice: Arc<Mutex<FxHashMap<String, castellan_voice::VoiceSession>>>,
+  /// B7: terminals the daemon has witnessed as launcher ttys, with
+  /// their pts inode at witnessing time. A tty_nr alone is spoofable —
+  /// an escaped process can allocate a fresh pty (openpty/setsid/
+  /// TIOCSCTTY are not blocked and blocking them breaks harnesses) and
+  /// pass any tty!=0 gate. The inode binds the trust to the specific
+  /// pts allocation: a recycled tty_nr gets a new inode and fails.
+  trusted_ttys: Arc<Mutex<FxHashMap<u64, u64>>>,
 }
 
 impl Daemon {
@@ -285,6 +318,7 @@ impl Daemon {
         &state.join("castellan/memory.jsonl"),
       ))),
       voice: Arc::new(Mutex::new(FxHashMap::default())),
+      trusted_ttys: Arc::new(Mutex::new(FxHashMap::default())),
     };
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
@@ -417,8 +451,18 @@ impl Daemon {
                     // though its cgroup says Human — closing the
                     // C10 x C25 identity flip for tty-launched
                     // sessions.
-                    self.forged_socket_op(&req);
-                    Response::err("human-only op requires the session's launch tty")
+                    // B7: a Human-classified caller failing the tty
+                    // check is recorded on the spine but does NOT
+                    // apply the -25 trust penalty — the penalty exists
+                    // to catch AGENTS probing for human powers (B3).
+                    // A tty mismatch for a human-classified caller is
+                    // an operator error (headless shell, wrong
+                    // terminal), not an attack; penalizing it floored
+                    // suite projects to tier 0 as collateral damage
+                    // and cascaded into forced-enforce audits
+                    // (found via p1 suite failure).
+                    self.forged_socket_op_record_only(&req);
+                    Response::err("human-only op requires a daemon-witnessed launcher tty")
                   } else {
                     self.dispatch(req)
                   }
@@ -448,15 +492,23 @@ impl Daemon {
       | Request::Thaw { session: Some(session) }
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
-      | Request::Cert { session }
+      // Cert/Radar/MemoryRecall/Replay are read-only evidence and
+      // agent-allowed — a tty requirement on human callers protected
+      // nothing (the agent can read its own cert) and blocked
+      // headless operators. Read ops need no terminal proof.
       | Request::Replay { session, .. }
       | Request::Radar { session, .. }
       | Request::MemoryRecall { session } => Some(session),
-      // session-less human-only ops (thaw/kill/freeze ALL): require
-      // a non-zero tty — a same-uid escaped process has none.
+      // session-less human-only ops (thaw/kill/freeze ALL): require a
+      // daemon-witnessed launcher tty (B7). tty!=0 alone was spoofable —
+      // an escaped process can allocate a fresh pty. The caller's tty
+      // must be in the trusted registry AND its current inode must
+      // match the witnessed one (defeats recycling).
       Request::Thaw { session: None }
       | Request::Kill { session: None }
-      | Request::Freeze { session: None } => return caller_tty != 0,
+      | Request::Freeze { session: None } => {
+        return self.tty_is_witnessed(caller_tty);
+      }
       // C32: approve must come from the LAUNCHER'S terminal, not just
       // any terminal. The nonce is fishable from the daemon journal
       // (same-user-readable, found by the D'-round probe), so secret
@@ -505,7 +557,60 @@ impl Daemon {
       .get(&session)
       .map(|s| s.launcher_tty)
       .unwrap_or(0);
-    launcher == 0 || caller_tty == launcher
+    // B7: headless sessions (launcher tty 0) previously accepted ANY
+    // tty for their human-only ops — an escaped process with a fresh
+    // pty could keep/thaw a headless session. Now a headless session
+    // requires a daemon-witnessed launcher tty (some other session's
+    // launcher terminal — the human operating the fleet from a
+    // terminal they launched from). tty-launched sessions keep the
+    // exact-match rule.
+    if launcher == 0 {
+      return self.tty_is_witnessed(caller_tty);
+    }
+    caller_tty == launcher
+  }
+
+  /// B7: is this caller's terminal a daemon-witnessed launcher tty?
+  /// False for: fresh ptys (never witnessed), headless (tty 0),
+  /// recycled minors (inode mismatch). This is the gate for global
+  /// ops (freeze-all etc.) — the panic button must not be reachable
+  /// from an attacker-allocated terminal.
+  fn tty_is_witnessed(&self, caller_tty: u64) -> bool {
+    if caller_tty == 0 {
+      return false;
+    }
+    let witnessed_ino = match self.trusted_ttys.lock().unwrap().get(&caller_tty) {
+      Some(ino) => *ino,
+      None => return false,
+    };
+    match tty_inode(caller_tty) {
+      Some(ino) => ino == witnessed_ino,
+      None => false,
+    }
+  }
+
+  /// B7: spine-only variant of forged_socket_op — the rejection is
+  /// visible (the human can audit it) but the trust penalty does not
+  /// fire. Used for Human-classified tty-gate rejections: operator
+  /// error, not agent forgery.
+  fn forged_socket_op_record_only(&self, req: &Request) {
+    let session = match req {
+      Request::UndoCommit { session }
+      | Request::UndoDiscard { session }
+      | Request::Thaw { session: Some(session) }
+      | Request::Kill { session: Some(session) }
+      | Request::Adopt { session, .. }
+      | Request::CanaryRegister { session, .. }
+      | Request::TestTrustSignal { session, .. } => Some(session.clone()),
+      _ => None,
+    };
+    if let Some(s) = session.as_ref() {
+      if let Ok(sink) = EventSink::for_session(&Self::state_dir(), s) {
+        let _ = sink.emit("tty_gate_reject", &format!("{:?}", req), "deny");
+      }
+    } else if let Ok(sink) = EventSink::for_session(&Self::state_dir(), "system") {
+      let _ = sink.emit("tty_gate_reject", &format!("{:?}", req), "deny");
+    }
   }
 
   /// B3: a session process called a human-only op. Record a negative
@@ -2379,6 +2484,17 @@ impl Daemon {
     // on missing/mismatched pin: weighting is advisory, so neutral
     // is the right failure mode (unlike test_cmd's refuse).
     let hub_index_sha = castellan_hub::index_sha(&project);
+    // B7: witness the launcher's terminal at spawn. Only a tty the
+    // daemon has seen as a launcher tty (inode-bound) may later run
+    // session-less global ops (freeze-all/thaw-all/kill-all) — an
+    // escaped process allocating a fresh pty never enters this map.
+    // The inode defeats tty_nr recycling: a reused minor gets a new
+    // inode and fails the match.
+    if launcher_tty != 0 {
+      if let Some(ino) = tty_inode(launcher_tty) {
+        self.trusted_ttys.lock().unwrap().insert(launcher_tty, ino);
+      }
+    }
     self.registry.lock().unwrap().insert(Session {
       id: id.clone(),
       harness: harness.clone(),

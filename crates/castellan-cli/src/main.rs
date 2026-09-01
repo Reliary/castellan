@@ -799,7 +799,7 @@ fn spawn_req(args: &[String]) -> serde_json::Value {
     }
     i += 1;
   }
-  serde_json::json!({"op": "spawn", "harness": harness, "project": project, "pid": pid})
+  serde_json::json!({"op": "spawn", "harness": harness, "project": project, "pid": pid, "launcher_tty": launcher_tty()})
 }
 
 fn adopt_req(args: &[String]) -> serde_json::Value {

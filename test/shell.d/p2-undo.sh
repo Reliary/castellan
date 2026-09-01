@@ -51,7 +51,14 @@ N=$(grep -c "^[+-d]" <<<"$DIFF_OUT")
 [ "$N" -ge 3 ] && ok "diff lists >=3 changes ($N)" || bad "diff too few changes ($N)"
 
 echo "== UNDO DISCARD: upper wiped, project still pristine =="
-"$BIN" undo "$S" >/dev/null 2>&1
+# B7: headless session — undo/keep need a daemon-witnessed tty
+script -qec '
+  BIN='"$BIN"'
+  OUT=$($BIN launch --project /tmp/cast-p2-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN undo '"$S"' >/dev/null 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null >/dev/null 2>&1
 U="$XDG_STATE_HOME/castellan/sessions/$S/overlay/upper"
 [ -z "$(ls -A "$U" 2>/dev/null)" ] && ok "upper layer emptied by discard" || bad "discard left files in upper"
 check "project intact after discard" "original" "$(cat "$W/keep.txt")"
@@ -63,7 +70,13 @@ OUT=$("$BIN" launch --project "$W" --undo -- bash -c "
 " 2>&1)
 S2=$(grep -o 's[0-9a-f]\{20\}' <<<"$OUT" | head -1)
 [ -n "$S2" ] && ok "second session launched" || bad "no second session id"
-KEEP_OUT=$("$BIN" keep "$S2")
+KEEP_OUT=$(script -qec '
+  BIN='"$BIN"'
+  OUT=$($BIN launch --project /tmp/cast-p2-op -- true 2>&1)
+  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+  $BIN keep '"$S2"' 2>&1
+  $BIN kill $WSID >/dev/null 2>&1
+' /dev/null 2>&1)
 grep -q "committed" <<<"$KEEP_OUT" && ok "commit reported success" || bad "commit failed: $KEEP_OUT"
 check "committed.txt materialized" "committed-line" "$(cat "$W/committed.txt")"
 [ ! -e "$W/edit.txt" ] && ok "deletion materialized (edit.txt gone)" || bad "edit.txt should be gone"

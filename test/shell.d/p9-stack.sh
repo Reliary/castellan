@@ -63,6 +63,19 @@ start_daemon() {
 
 start_daemon
 
+mkdir -p /tmp/cast-p9-witness
+witness_keep() { # witness_keep <sid> — keep via a daemon-witnessed tty (B7)
+  local sid="$1"
+  script -qec '
+    BIN=/home/john/src/castellan/target/release/castellan
+    OUT=$($BIN launch --project /tmp/cast-p9-witness -- true 2>&1)
+    WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
+    $BIN keep '"$sid"' 2>&1
+    $BIN kill $WSID >/dev/null 2>&1
+  ' /dev/null 2>&1
+}
+
+
 echo "== Session A (good): fix the bug in the hub file =="
 T0=$(date +%s%N)
 OUT=$("$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c 'printf "int process(struct item *it) {\n  if (it == NULL) return -1;\n  return *it;\n}\n" > src/bug.c' 2>&1)
@@ -73,7 +86,7 @@ ok "session A launched ($SID_A)"
 OUT=$("$BIN/castellan" canary "$SID_A" 2>&1)
 echo "$OUT" | grep -q "canaries planted" && ok "canaries + decoys planted" || bad "canary plant failed: $OUT"
 
-OUT=$("$BIN/castellan" keep "$SID_A" 2>&1)
+OUT=$(witness_keep "$SID_A")
 echo "$OUT" | grep -q "committed" && ok "overlay committed" || bad "keep failed: $OUT"
 sleep 2
 
@@ -106,7 +119,7 @@ OUT=$("$BIN/castellan" canary "$SID_B" 2>&1)
 # weaponize the decoy in session scratch
 DECOY_DIR=$XDG_STATE_HOME/castellan/sessions/$SID_B/decoy
 printf 'int handle(struct item *it) {\n  return *it;\n}\n' > "$DECOY_DIR/decoy_validate.c"
-OUT=$("$BIN/castellan" keep "$SID_B" 2>&1)
+OUT=$(witness_keep "$SID_B")
 sleep 2
 grep -q "DECOY TRIP" /tmp/castellan-p9stack-daemon.log && ok "decoy weaponized -> DECOY TRIP" || bad "no decoy trip: $(tail -3 /tmp/castellan-p9stack-daemon.log)"
 

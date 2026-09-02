@@ -569,6 +569,16 @@ fn launch(args: &[String], sock: &str) -> ! {
       }
     }
   }
+  if !undo {
+    // audit/enforce-only sessions: chdir into the project. Without the
+    // overlay there is no merged view to land in, and a relative-path
+    // task would write into whatever cwd the launcher had (found via
+    // the V3 corpus: `touch x` from the castellan repo EACCES'd).
+    if let Err(e) = std::env::set_current_dir(&project) {
+      eprintln!("failed to chdir into project: {e}");
+      std::process::exit(1);
+    }
+  }
   // join the session cgroup AFTER the note: the agent inherits the
   // cgroup at exec, and the daemon's caller classification must see
   // the launcher as the human until the agent actually starts.

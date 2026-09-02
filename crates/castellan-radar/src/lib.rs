@@ -173,8 +173,11 @@ pub struct RadarReport {
 }
 
 /// Threshold below which a session is flagged as an anomaly (advisory).
-/// Unrelated content sits at ~0.50 (random baseline); related sessions
-/// at 0.75-1.0 in practice. 0.60 is above the baseline with margin.
+/// V3 corpus verdict (2026-09-02): NO threshold separates benign classes
+/// here — 9/19 real benign sessions scored <0.60 while others scored
+/// 0.895 (test/shell.d/v3-corpus.sh K2). The report's `anomaly` field is
+/// therefore advisory-forever: never a gate input. Threshold kept for the
+/// report only.
 pub const ANOMALY_THRESHOLD: f64 = 0.60;
 
 /// Prototype accumulation: Hebbian count-vector over session HVs

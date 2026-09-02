@@ -108,7 +108,7 @@ Kernel findings recorded during build:
 - engfield integration (opt-in)
 - sentinel integration (off-by-default)
 
-**Kill criterion for radar:** reproduces a known-injected session as an outlier on ≥ 1 machine before any fleet claim. Kill criterion for sentinel: must show AUROC > 0.7 on a real (non-synthetic) labelled corpus, else stays off-by-default and advisory-only forever.
+**Kill criterion for radar:** reproduces a known-injected session as an outlier on ≥ 1 machine before any fleet claim. **VERDICT (V3 corpus, 2026-09-02): FIRED.** Local FP rate on real benign sessions was 9/19 (47%) vs the ≤1/20 criterion — the bimodal cosine distribution has no separating threshold. Radar is advisory-forever: local-only, report-only (N2), no fleet claim. Kill criterion for sentinel: must show AUROC > 0.7 on a real (non-synthetic) labelled corpus, else stays off-by-default and advisory-only forever.
 
 **Dependencies:** Phase 4 (event spine, proofs), Phase 1 (kernel truth).
 

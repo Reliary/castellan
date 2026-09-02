@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -218,6 +218,27 @@ fn rel(root: &Path, p: &Path) -> String {
 pub fn discard(upper: &Path, work: &Path) -> io::Result<()> {
   for d in [upper, work] {
     if d.exists() {
+      // overlayfs drops a mode-000 work/work/ subdir while the mount is
+      // live; after session exit it blocks remove_dir_all with EACCES
+      // (owner john, no +x on the dir — found via the V3 corpus: every
+      // undo (discard) failed). Restore traversal perms first.
+      let _ = std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+      let mut stack = vec![d.to_path_buf()];
+      while let Some(p) = stack.pop() {
+        if let Ok(rd) = fs::read_dir(&p) {
+          for e in rd.flatten() {
+            let c = e.path();
+            if c.is_dir() {
+              let _ = std::fs::set_permissions(
+                &c,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+              );
+              stack.push(c);
+            }
+          }
+        }
+        let _ = std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+      }
       fs::remove_dir_all(d)?;
     }
     fs::create_dir_all(d)?;

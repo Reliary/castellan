@@ -65,4 +65,17 @@ Radar must reproduce a known-injected session as an outlier on ≥ 1 machine bef
 
 ## Status
 
-Greenfield wiring; owned HV stack. Phase 5, opt-in.
+Built (P5) and measured (V3, 2026-09-02): the kill criterion fired. On the V3
+real-session corpus (20 benign sessions through the real launch path), radar's
+local FP rate was **9/19 benign sessions flagged (47%)** against the
+pre-registered ≤1/20 criterion — test/v3-corpus.sh, K2. The distribution is
+bimodal: sparse sessions (1–2 spine events) whose token mix matches the
+prototype score ~0.895; equally benign sessions with slightly different event
+mixes score 0.478–0.614, below the 0.60 threshold. The threshold cannot be
+fixed by tuning: the overlap between benign classes is intrinsic to
+order-agnostic bundling of tiny event streams.
+
+**Verdict: advisory-forever.** Radar stays local-only, report-only (N2: radar
+anomaly logs silently, never freezes), and its anomaly output must not be
+used as a gating signal anywhere. No fleet claim. The pre-registered ROADMAP
+kill criterion is met in the honest direction.

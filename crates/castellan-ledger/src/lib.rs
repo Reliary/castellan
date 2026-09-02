@@ -130,6 +130,13 @@ fn mount_overlay(project: &Path, upper: &Path, work: &Path, merged: &Path) -> io
   mount::<str, Path, str, str>(None, merged, None, MsFlags::MS_PRIVATE, None)
     .map_err(|e| io::Error::other(format!("bind private: {e}")))?;
   let opts = format!(
+    // NOTE (2026-09-02): redirect_dir=on CANNOT be requested — rootless
+    // userns mounts force it off (mount EPERM, verified live on
+    // 7.0.3-1-cachyos with CONFIG_OVERLAY_FS_REDIRECT_ALWAYS_FOLLOW
+    // unset). Directory rename(2) inside the overlay therefore fails
+    // EXDEV; the CLI redirects CARGO_TARGET_DIR into the session
+    // scratch when undo is active so toolchains never rename dirs in
+    // the merged view.
     "lowerdir={},upperdir={},workdir={}",
     project.display(),
     upper.display(),

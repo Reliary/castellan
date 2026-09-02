@@ -606,6 +606,43 @@ fn launch(args: &[String], sock: &str) -> ! {
       eprintln!("failed to apply envelope (fail-closed): {e}");
       std::process::exit(1);
     }
+    // V3 autophagy friction fix: toolchains (cargo/cc/ld) use TMPDIR
+    // for temp artifacts; /tmp is not a write root, so the linker
+    // failed with "Cannot create temporary file in /tmp" under
+    // enforce. Redirect TMPDIR/TEMP/TMP into the session scratch (a
+    // write root) instead of widening the envelope to shared /tmp.
+    let scratch = std::env::var("XDG_STATE_HOME")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+      })
+      .join("castellan/sessions")
+      .join(&session)
+      .join("tmp");
+    match std::fs::create_dir_all(&scratch) {
+      Ok(()) => {
+        eprintln!("castellan: TMPDIR -> {}", scratch.display());
+        let s = scratch.to_string_lossy().into_owned();
+        unsafe {
+          std::env::set_var("TMPDIR", &s);
+          std::env::set_var("TEMP", &s);
+          std::env::set_var("TMP", &s);
+          if undo {
+            // C34 (V3 friction): dir rename(2) fails EXDEV in the
+            // rootless overlay (redirect_dir is kernel-forced off for
+            // unprivileged mounts). Toolchains that rename dirs
+            // atomically (cargo's target-dir bootstrap) must build
+            // OUTSIDE the merged view — target goes to the session
+            // scratch, which is discarded with the session unless
+            // kept (fresh rebuild per session; honest trade).
+            unsafe {
+              std::env::set_var("CARGO_TARGET_DIR", &format!("{s}/cargo-target"));
+            }
+          }
+        }
+      }
+      Err(e) => eprintln!("castellan: TMPDIR scratch unavailable: {e}"),
+    }
   }
   if !enforce {
     eprintln!("castellan: AUDIT MODE — observation only, no containment (--no-enforce)");

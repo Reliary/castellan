@@ -41,7 +41,12 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     // The chmod residual is ownership-bounded: the agent can only
     // chmod files it owns inside the Landlock write roots.
     libc::SYS_chown, libc::SYS_fchown, libc::SYS_lchown, libc::SYS_fchownat,
-    libc::SYS_utime, libc::SYS_utimes, libc::SYS_utimensat, libc::SYS_futimesat,
+    // V3 (2026-09-02): utime family UNBLOCKED. Blocking it broke every
+    // compiled workflow: cargo/cc/touch set mtimes for fingerprints
+    // and build artifacts (verified live: "touch: setting times ...
+    // Operation not permitted", cargo build fails). The original
+    // rationale (ownership-bounded timestamp abuse) is preserved by
+    // Landlock: utime only works on files inside write roots.
   ]
 }
 

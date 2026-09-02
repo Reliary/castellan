@@ -2484,6 +2484,14 @@ impl Daemon {
     // on missing/mismatched pin: weighting is advisory, so neutral
     // is the right failure mode (unlike test_cmd's refuse).
     let hub_index_sha = castellan_hub::index_sha(&project);
+    // V3 friction fix: create the session scratch BEFORE the launcher
+    // applies the envelope. Landlock path-beneath rules need an
+    // existing parent; a grant on the not-yet-created session dir left
+    // the launcher's TMPDIR mkdir EACCES (found via cargo build failure
+    // under enforce). The daemon is unconfined, so it creates the root.
+    let _ = std::fs::create_dir_all(
+      Self::state_dir().join("castellan/sessions").join(&id),
+    );
     // B7: witness the launcher's terminal at spawn. Only a tty the
     // daemon has seen as a launcher tty (inode-bound) may later run
     // session-less global ops (freeze-all/thaw-all/kill-all) — an

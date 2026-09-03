@@ -11,8 +11,8 @@ The obvious design: "trust gates how much the agent can do." Killed by D5 — co
 Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spine and the daemon-verified proof pipeline. **No time-decay** — half-life is KILLed (D2). Cortex-rs tier-promotion (recall-based: 10+ recalls promote episodic → semantic → consolidated) is the decay substitute if one is needed; v0 ships without decay.
 
 ### Positive signals (hard to game)
-- **+10** placebo-controlled proof passed: a real fix dropped danger_signal more than a neutral placeholder, AND the daemon independently re-ran the pre-existing test suite and it still passes. Two-factor. This is the only positive signal that raises tier. See proof-carrying.md. (Prior art: AWS graduated autonomy uses honeypot-injection → demotion and rollback, but no placebo control; no placebo-controlled agent-fix methodology was found in the Aug 2026 survey — see PRIOR_ART.md.)
-- **+1** clean session (no reverts, no envelope-escape attempts, no canary hits, non-empty ledger).
+- **+10** placebo-controlled proof passed: a real fix dropped danger_signal more than a neutral placeholder (Factor B, row-level evidence — one row per passing file, `evidence` names the strength). The daemon independently re-running the pre-existing test suite (Factor A) earns its OWN +10 row. Row-level OR, cert-level AND: STRONG certificates require both factors; see C12 in DESIGN_DECISIONS.md. This is the only positive signal that raises tier. See proof-carrying.md. (Prior art: AWS graduated autonomy uses honeypot-injection → demotion and rollback, but no placebo control; no placebo-controlled agent-fix methodology was found in the Aug 2026 survey — see PRIOR_ART.md.)
+- **+1** clean session (no reverts, no envelope-escape attempts, no canary hits, non-empty ledger). The `keep` gate awards this unconditionally on commit — the kernel-witnessed spine is advisory here, not a gate; see the C13 erratum below.
 
 ### Negative signals (dominant — trust is negative-dominant)
 - **−30** user reverted the session (`castellan undo <session>` invoked).
@@ -25,6 +25,7 @@ Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spi
 - Tests added or modified by the session don't count toward the positive signal (only pre-existing tests, daemon-re-run).
 - Sybil defense: trust is per-project; sessions must have a non-empty kernel-witnessed ledger; ceiling per time-window (cannot jump tiers in one day).
 - Slow-drip: residual (D7/A8) — ceiling + deny-list means worst-case = egress unlock, not escape. Egress proxy restricts reach even when unlocked.
+- **R3-lite verdict (2026-09-03, V3 corpus): 30 rapid keep-shaped sessions on a fresh project moved score 50.0 → 80.0, tier 2 → 3.** The per-apply ceiling caps each jump at +1 tier but nothing rate-limits applies: +1/keep × 30 keeps = a bought tier in minutes. `TIER_CEILING_WINDOW_SECS` (86_400) is DECLARED but UNENFORCED — no timestamp check exists in `apply_weighted`. Farming buys the tier-3 expansion surface (broader egress allowlist, auto-approved config writes) with zero adversarial skill. Mitigations available (not yet built): enforce the window (max +1 tier per 24h of wall-clock), require ledger non-triviality for +1 (empty/trivial commits earn nothing), or make tier 3 require a Factor-B proof row. Until one lands, tier 3 MUST be read as "30 keeps happened", not "30 keeps were earned".
 
 ## Tier → envelope profile mapping
 
@@ -85,3 +86,6 @@ Monotonic relationship between trust tier and user-revert outcomes on a labelled
 ## Status
 
 Greenfield scoring engine; owned positive-signal pipeline. Phase 3, ~2 weeks.
+
+### C13 erratum (2026-09-03): keep-gate trust rows are witness-graded, not spine-gated
+**Found by V3 antagonism:** `undo_commit` awards `clean_session` (+1) unconditionally — it checks neither `applied.is_empty()` (an empty commit still earns +1) nor the session's spine for `envelope_escape`/`decoy_trip`/`vuln_introduced` kinds. The "(no reverts, no escape attempts, no canary hits)" line above describes the INTENT, not the code: revert sessions never reach `undo_commit` (they take the `undo_discard` path, −30), but a session that committed clean file changes AND tripped the honeypot mid-run still earns +1 alongside its −50. The net (−49) preserves negative-dominance, so this is a grading imprecision, not a gaming hole — but the doc must not claim a gate the code does not enforce. Candidates for a real gate (spine check before awarding, empty-commit earns nothing) are deferred to the V3 corpus tightening pass; this erratum records the gap honestly until then.

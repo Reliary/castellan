@@ -265,6 +265,9 @@ pub fn signal_from_str(s: &str) -> Signal {
     "envelope_escape" => Signal::EnvelopeEscape,
     "canary_hit" => Signal::CanaryHit,
     "audit_mismatch" => Signal::AuditMismatch,
+    "forged_nonce" => Signal::ForgedNonce,
+    "vuln_introduced" => Signal::VulnIntroduced,
+    "forged_socket_op" => Signal::ForgedSocketOp,
     _ => Signal::ForgedNonce,
   }
 }
@@ -317,6 +320,27 @@ mod tests {
     let t = db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::UserRevert)).unwrap();
     assert_eq!(t.score, 20.0);
     assert_eq!(t.tier, Tier::One);
+  }
+
+  #[test]
+  fn signal_names_round_trip() {
+    // every Signal must survive a ledger write + read without aliasing
+    // to another signal (V3 antagonism: forged_socket_op and
+    // vuln_introduced previously fell through to ForgedNonce).
+    let signals = [
+      Signal::ProofPassed,
+      Signal::CleanSession,
+      Signal::UserRevert,
+      Signal::EnvelopeEscape,
+      Signal::CanaryHit,
+      Signal::AuditMismatch,
+      Signal::ForgedNonce,
+      Signal::VulnIntroduced,
+      Signal::ForgedSocketOp,
+    ];
+    for sig in signals {
+      assert_eq!(signal_from_str(sig.as_str()), sig, "round-trip for {}", sig.as_str());
+    }
   }
 
   #[test]

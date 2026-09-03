@@ -1475,7 +1475,7 @@ impl Daemon {
       "canary_hit" => Signal::CanaryHit,
       "audit_mismatch" => Signal::AuditMismatch,
       "forged_nonce" => Signal::ForgedNonce,
-      "vuln_introduced" => Signal::VulnIntroduced,
+      "forged_socket_op" => Signal::ForgedSocketOp,
       "vuln_introduced" => Signal::VulnIntroduced,
       other => return Response::err(format!("unknown signal: {other}")),
     };
@@ -2042,13 +2042,16 @@ impl Daemon {
               session: session.to_string(),
               signal: Signal::ProofPassed,
               evidence: format!(
-                "{} placebo-controlled proof(s) passed; strengths: {}",
+                "{} placebo-controlled proof(s) passed; strengths: {}; baseline_manifest={}",
                 passed.len(),
                 passed
                   .iter()
                   .map(|p| format!("{:.2}", p.strength()))
                   .collect::<Vec<_>>()
-                  .join(", ")
+                  .join(", "),
+                // V3 corpus K5 asserts this: a pass without a launch-
+                // time baseline is unanchored (S1 external-edit guard).
+                if baseline.is_some() { "present" } else { "absent" },
               ),
             },
             weight,

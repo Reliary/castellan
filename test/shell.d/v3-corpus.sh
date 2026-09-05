@@ -334,12 +334,11 @@ TIER_AFTER=$("$BIN/castellan" trust "$FARM_PROJ" 2>/dev/null | grep -oE "tier [0
 SCORE_AFTER=$(trust_score "$FARM_PROJ")
 echo "  farming (fresh project): score $SCORE_BEFORE -> $SCORE_AFTER, tier $TIER_BEFORE -> $TIER_AFTER (30 keeps)"
 # R3-lite verdict hook: the probe MEASURES the wall; the kill criterion
-# is tier-after <= tier-before. A bought tier = the farming hole is REAL
-# (currently EXPECTED — TIER_CEILING_WINDOW_SECS unenforced; see the
-# trust.md R3-lite verdict). Recorded as bad() so the suite stays red
-# until a mitigation lands — a green suite must never coexist with a
-# farmable tier-3.
-python3 -c "import sys; sys.exit(0 if int('$TIER_AFTER' or 0) <= int('$TIER_BEFORE' or 0) else 1)" && ok "R3-lite: 30 farmed keeps bought no tier ($TIER_BEFORE -> $TIER_AFTER)" || bad "R3-lite: farming bought a tier ($TIER_BEFORE -> $TIER_AFTER, score $SCORE_BEFORE -> $SCORE_AFTER) — EXPECTED until the ceiling window is enforced (see trust.md)"
+# is tier-after <= tier-before. C14 (2026-09-05) enforces the window +
+# tier-3 proof gate, so 30 proof-less keeps on a fresh project must hold
+# tier 2 while the score still climbs honestly. A bought tier = the fix
+# regressed — recorded as bad() so the suite stays red until fixed.
+python3 -c "import sys; sys.exit(0 if int('$TIER_AFTER' or 0) <= int('$TIER_BEFORE' or 0) else 1)" && ok "R3-lite: 30 farmed keeps bought no tier ($TIER_BEFORE -> $TIER_AFTER)" || bad "R3-lite: farming bought a tier ($TIER_BEFORE -> $TIER_AFTER, score $SCORE_BEFORE -> $SCORE_AFTER) — C14 REGRESSION (see DESIGN_DECISIONS C14)"
 
 echo "===== K5: placebo proof on a real fix ====="
 # restore the vulnerable file, fix it in a session, keep: Factor B must

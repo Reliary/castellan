@@ -23,9 +23,9 @@ Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spi
 
 ### Anti-gaming
 - Tests added or modified by the session don't count toward the positive signal (only pre-existing tests, daemon-re-run).
-- Sybil defense: trust is per-project; sessions must have a non-empty kernel-witnessed ledger; ceiling per time-window (cannot jump tiers in one day).
+- Sybil defense: trust is per-project; tier follows upward at most once per 86_400s wall-clock (`last_tier_up_ts`; C14a — score is never clamped, only the tier is held); tier-3 entry requires a `proof_passed` ledger row (C14b — farmed keeps buy score, not the expansion surface). Downgrades always land immediately.
 - Slow-drip: residual (D7/A8) — ceiling + deny-list means worst-case = egress unlock, not escape. Egress proxy restricts reach even when unlocked.
-- **R3-lite verdict (2026-09-03, V3 corpus): 30 rapid keep-shaped sessions on a fresh project moved score 50.0 → 80.0, tier 2 → 3.** The per-apply ceiling caps each jump at +1 tier but nothing rate-limits applies: +1/keep × 30 keeps = a bought tier in minutes. `TIER_CEILING_WINDOW_SECS` (86_400) is DECLARED but UNENFORCED — no timestamp check exists in `apply_weighted`. Farming buys the tier-3 expansion surface (broader egress allowlist, auto-approved config writes) with zero adversarial skill. Mitigations available (not yet built): enforce the window (max +1 tier per 24h of wall-clock), require ledger non-triviality for +1 (empty/trivial commits earn nothing), or make tier 3 require a Factor-B proof row. Until one lands, tier 3 MUST be read as "30 keeps happened", not "30 keeps were earned".
+- **R3-lite verdict (2026-09-03, V3 corpus): 30 rapid keep-shaped sessions on a fresh project moved score 50.0 → 80.0, tier 2 → 3.** Was OPEN (A7); **CLOSED by C14, 2026-09-05** — the same probe now holds tier at 2 (score still climbs honestly; tier follows only after the window opens AND a proof row exists).
 
 ## Tier → envelope profile mapping
 

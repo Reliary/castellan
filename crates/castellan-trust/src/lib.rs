@@ -138,11 +138,19 @@ impl TrustDb {
          evidence_json TEXT NOT NULL
        );",
     )?;
+    // C14: wall-clock tier-up throttle. Best-effort migration for
+    // pre-C14 databases (ALTER fails if the column already exists).
+    let _ = conn.execute(
+      "ALTER TABLE projects ADD COLUMN last_tier_up_ts INT NOT NULL DEFAULT 0",
+      [],
+    );
     Ok(Self { conn })
   }
 
   pub fn score(&self, project: &Path) -> rusqlite::Result<ProjectTrust> {
     let hash = project_hash(project);
+    // last_tier_up_ts may be absent on pre-C14 databases opened
+    // read-only paths; fall back to 0 (window open) on schema mismatch.
     let row = self.conn.query_row(
       "SELECT score, tier, last_event_ts FROM projects WHERE realpath_hash = ?1",
       params![hash],
@@ -180,6 +188,27 @@ impl TrustDb {
   ) -> rusqlite::Result<ProjectTrust> {
     let hash = project_hash(project);
     let before = self.score(project)?;
+    // C14: wall-clock tier-up throttle + tier-3 proof gate need the
+    // project's tier-up history and proof ledger. Both are best-effort
+    // reads (pre-C14 schemas fall back to open window / no proof).
+    let last_up: u64 = self
+      .conn
+      .query_row(
+        "SELECT last_tier_up_ts FROM projects WHERE realpath_hash = ?1",
+        params![hash],
+        |r| r.get::<_, i64>(0),
+      )
+      .map(|v| v as u64)
+      .unwrap_or(0);
+    let has_proof: bool = self
+      .conn
+      .query_row(
+        "SELECT COUNT(*) FROM events WHERE realpath_hash = ?1 AND signal = 'proof_passed'",
+        params![hash],
+        |r| r.get::<_, i64>(0),
+      )
+      .map(|n| n > 0)
+      .unwrap_or(false);
     let mut new_score = before.score + ev.signal.delta() * weight;
     if new_score.is_infinite() || new_score < 0.0 {
       new_score = 0.0;
@@ -194,14 +223,40 @@ impl TrustDb {
       new_tier = tier_from_i64(capped);
       new_score = tier_floor(new_tier);
     }
+    // C14a: wall-clock window. Score is NEVER clamped: the ledger is
+    // honest about what happened. The TIER does not follow upward until
+    // TIER_CEILING_WINDOW_SECS have passed since the last tier-up — the
+    // stored tier stays, and last_tier_up_ts is untouched, so the
+    // tier-up lands on the first apply after the window opens. The
+    // window binds on UPGRADES only: downgrades (tier_gain <= 0) always
+    // land immediately — a canary trip floors the project the same
+    // second, never deferred.
+    let mut new_last_up = last_up;
+    if new_tier as i64 > before.tier as i64 {
+      if ev.ts.saturating_sub(last_up) < TIER_CEILING_WINDOW_SECS {
+        new_tier = before.tier;
+      } else {
+        new_last_up = ev.ts;
+      }
+    }
+    // C14b: tier-3 evidentiary gate. Tier 3 is the first tier that
+    // widens the expansion surface beyond the tier-2 default, so entry
+    // requires a Factor-B proof row in the project's ledger — 30 farmed
+    // keeps (R3-lite) buy score but not the tier. The tier stays at 2
+    // (score untouched); entry lands on the first apply after a proof
+    // row exists. Downgrades are unaffected.
+    if new_tier == Tier::Three && before.tier as i64 <= Tier::Two as i64 && !has_proof {
+      new_tier = Tier::Two;
+    }
     self.conn.execute(
-      "INSERT INTO projects (realpath_hash, score, tier, last_event_ts)
-       VALUES (?1, ?2, ?3, ?4)
+      "INSERT INTO projects (realpath_hash, score, tier, last_event_ts, last_tier_up_ts)
+       VALUES (?1, ?2, ?3, ?4, ?5)
        ON CONFLICT(realpath_hash) DO UPDATE SET
          score = excluded.score,
          tier = excluded.tier,
-         last_event_ts = excluded.last_event_ts",
-      params![hash, new_score, new_tier as i64, ev.ts],
+         last_event_ts = excluded.last_event_ts,
+         last_tier_up_ts = excluded.last_tier_up_ts",
+      params![hash, new_score, new_tier as i64, ev.ts, new_last_up as i64],
     )?;
     self.conn.execute(
       "INSERT INTO events (realpath_hash, ts, session_uuid, signal, delta, evidence_json)
@@ -253,6 +308,20 @@ fn tier_floor(t: Tier) -> f64 {
     Tier::One => 20.0,
     Tier::Two => 50.0,
     Tier::Three => 80.0,
+    Tier::Four => 100.0,
+  }
+}
+
+/// Highest score that still maps to `t` (exclusive upper bound minus
+/// epsilon). Kept for the K1-style marginal analysis; C14 no longer
+/// clamps score (only the tier is held), so this is test/doc support.
+#[allow(dead_code)]
+fn tier_ceiling(t: Tier) -> f64 {
+  match t {
+    Tier::Zero => 20.0 - 0.1,
+    Tier::One => 50.0 - 0.1,
+    Tier::Two => 80.0 - 0.1,
+    Tier::Three => 100.0 - 0.1,
     Tier::Four => 100.0,
   }
 }
@@ -380,6 +449,95 @@ mod tests {
     let t = db.apply(Path::new("/tmp/foo"), &ev("s6", Signal::ProofPassed)).unwrap();
     assert_eq!(t.tier, Tier::Two);
     assert_eq!(t.score, 65.0);
+  }
+
+  fn ev_at(ts: u64, session: &str, signal: Signal) -> TrustEvent {
+    TrustEvent { ts, session: session.into(), signal, evidence: "test".into() }
+  }
+
+  #[test]
+  fn c14_window_blocks_rapid_second_tier_up() {
+    // C14a: the wall-clock window throttles tier-ups to one per
+    // TIER_CEILING_WINDOW_SECS. Tier 1 -> 2 lands (first tier-up from a
+    // zero last_tier_up_ts is outside the window); a further climb
+    // holds the TIER at 2 while the score keeps its honest earned
+    // position. Fixed iteration count (no `while score < 80` — the
+    // held tier no longer stops score growth, but fixed counts
+    // terminate regardless).
+    let mut db = tmp_db();
+    let p = Path::new("/tmp/c14window");
+    db.apply(p, &ev_at(1_000_000, "s0", Signal::UserRevert)).unwrap();
+    db.apply(p, &ev_at(1_000_001, "s1", Signal::ProofPassed)).unwrap();
+    let mut t = db.score(p).unwrap();
+    for i in 2..42u64 {
+      t = db.apply(p, &ev_at(1_000_000 + i, &format!("k{i}"), Signal::CleanSession)).unwrap();
+    }
+    assert_eq!(t.tier, Tier::Two, "window must hold tier at 2");
+    assert!(t.score >= 70.0, "score keeps its honest position, got {}", t.score);
+  }
+
+  #[test]
+  fn c14_window_opens_after_24h() {
+    // C14a, second half: once TIER_CEILING_WINDOW_SECS have passed
+    // since the last tier-up, the tier follows the score.
+    let mut db = tmp_db();
+    let p = Path::new("/tmp/c14open");
+    db.apply(p, &ev_at(1_000_000, "s0", Signal::UserRevert)).unwrap();
+    db.apply(p, &ev_at(1_000_001, "s1", Signal::ProofPassed)).unwrap();
+    let mut t = db.score(p).unwrap();
+    for i in 2..42u64 {
+      t = db.apply(p, &ev_at(1_000_000 + i, &format!("k{i}"), Signal::CleanSession)).unwrap();
+    }
+    assert_eq!(t.tier, Tier::Two);
+    assert!(t.score >= 70.0, "honest score position, got {}", t.score);
+    // two more windows of keeps push the honest score past 80; the
+    // tier follows on the window-open apply (proof row from s1 keeps
+    // C14b open).
+    let mut t2 = t;
+    for i in 42..72u64 {
+      t2 = db.apply(
+        p,
+        &ev_at(1_000_001 + TIER_CEILING_WINDOW_SECS + i, &format!("w{i}"), Signal::CleanSession),
+      ).unwrap();
+    }
+    assert!(t2.score >= 80.0, "honest score past 80, got {}", t2.score);
+    assert_eq!(t2.tier, Tier::Three, "window open + proof present must enter tier 3");
+  }
+
+  #[test]
+  fn c14_tier3_needs_proof() {
+    // C14b: 30 farmed keeps (R3-lite shape) buy score but NOT tier 3
+    // without a proof_passed row in the ledger. Score is unclamped
+    // (honest position 80.0); only the tier is held.
+    let mut db = tmp_db();
+    let p = Path::new("/tmp/c14farm");
+    // spread applies over 3 windows so C14a never binds; only C14b can.
+    let mut t = db.score(p).unwrap();
+    for i in 0..30u64 {
+      t = db.apply(
+        p,
+        &ev_at(1_000_000 + i * (TIER_CEILING_WINDOW_SECS + 10), &format!("f{i}"), Signal::CleanSession),
+      ).unwrap();
+    }
+    assert!(t.score >= 80.0, "farmed score keeps honest position, got {}", t.score);
+    assert_eq!(t.tier, Tier::Two, "farmed score without proof must not enter tier 3");
+  }
+
+  #[test]
+  fn c14_tier3_opens_with_proof() {
+    // C14b, second half: the same farm WITH a proof row enters tier 3
+    // once the window is open.
+    let mut db = tmp_db();
+    let p = Path::new("/tmp/c14proof");
+    db.apply(p, &ev_at(1_000_000, "p0", Signal::ProofPassed)).unwrap();
+    let mut t = db.score(p).unwrap();
+    for i in 1..30u64 {
+      t = db.apply(
+        p,
+        &ev_at(1_000_000 + i * (TIER_CEILING_WINDOW_SECS + 10), &format!("f{i}"), Signal::CleanSession),
+      ).unwrap();
+    }
+    assert_eq!(t.tier, Tier::Three, "proof present + window open must enter tier 3");
   }
 
   #[test]

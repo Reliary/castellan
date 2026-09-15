@@ -1,0 +1,13 @@
+[package]
+name = "castellan-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Seccomp user-notification syscall broker: per-destination egress policy and systemd-socket denial for agent sessions."
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+libc = "0.2"
+serde_json = { workspace = true }
+
+[dev-dependencies]

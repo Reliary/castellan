@@ -55,6 +55,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "castellan-broker"
+version = "0.1.0"
+dependencies = [
+ "castellan-core",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "castellan-campaign"
 version = "0.1.0"
 dependencies = [

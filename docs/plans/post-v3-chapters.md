@@ -44,23 +44,82 @@ Canary bytes in outbound buffers still trip the honeypot wire (unchanged).
 query, and direct-443; `git`/`npm`/`cargo`/LLM API survive a full dogfood hour
 under enforce with zero false blocks.
 
-### B8.2 — systemd socket block (T4 structural close)
-Deny `connect` to the user manager's private socket
-(`$XDG_RUNTIME_DIR/systemd/private`, `/run/systemd/private`) and the user bus
-where it routes to systemd. Harness notification traffic that legitimately uses
-the bus must be measured before denying — false-block data decides scope.
+### B8.1 RESULTS (2026-09-05) — plan revised by measurement
 
-**Kill criterion:** `systemd-run --user` fails EPERM from inside an enforced
-session; census confirms zero escaped units; the harness still functions
-(measured false-block count reported honestly).
+The ADDFD connect shape above is **falsified**. `SECCOMP_IOCTL_NOTIF_ADDFD` with
+`ADDFD_FLAG_SEND` returns the injected fd *number* as the tracee's `connect()`
+return value and leaves the tracee's **own** socket fd unconnected. Any program
+that ignores `connect`'s return and keeps writing to its fd then gets `ENOTCONN`
+— i.e. essentially all of them. Reproduced in
+`crates/castellan-broker/examples/broker_fd_identity.rs` (result:
+`FD-IDENTITY-BROKEN` before the fix). ADDFD suits open-style syscalls that
+*return* a new fd; `connect` is not one.
 
-### B8.3 — Periodic live census
-Today the orphan census runs only at kill. Sweep every N seconds during active
-sessions; escaped processes → freeze + spine event immediately.
+Revised allow path: **`CONTINUE`**. The kernel re-reads arguments from tracee
+memory, so a racing thread that rewrites the `sockaddr` after our check can
+redirect an allowed connect. This is the kernel's documented limitation and it
+is stated plainly in the crate docs: the broker is a **detection and denial
+layer against a non-racing agent, not a hard boundary against a malicious actor
+with a racing-thread exploit.** The hard boundary remains Landlock + classic
+seccomp.
 
-**Kill criterion:** an injected escape is caught mid-session within 2 sweeps;
-zero false positives across the dogfood hour (short-lived subprocesses are the
-false-positive risk).
+Consequence: **no helper process is needed.** The supervisor performs no network
+I/O (allowed hostnames are resolved before the filter is installed), so it never
+notifies itself. `castellan-broker` is now ~400 lines lighter.
+
+### B8.2 — systemd socket block (T4 structural close) — SHIPPED, claim corrected
+Deny `connect` to BOTH routes to the systemd user manager: the private
+socket (`$XDG_RUNTIME_DIR/systemd/private`, `/run/systemd/private`, the cgroup
+socket) AND the session bus (`$XDG_RUNTIME_DIR/bus`).
+
+The first B8.2 cut denied only the private socket and claimed T4 was closed.
+**That was false.** `org.freedesktop.systemd1` is also exported on the session
+bus, and `StartTransientUnit` over the bus launches an arbitrary command as a
+transient unit outside the session cgroup and the envelope. `systemd-run` falls
+back to the bus when the private socket is denied — so denying only the private
+socket closed nothing. Verified live 2026-09-15: a `busctl StartTransientUnit`
+call from inside an enforced session wrote a marker file on the host. After
+denying the bus: no job, no marker, on both kernels.
+
+**Result (2026-09-15):** `castellan-broker` wired into `castellan launch`; the
+supervisor installs the notif filter and forks the agent, which then applies the
+envelope. `test/shell.d/b8-broker.sh` → **9/9 on kernel 7.0.3** (both manager
+routes denied, ordinary unix + loopback + git survive); cross-kernel
+verification on **7.1.8** (.227) matches. With `--net`, public TCP `1.2.3.4:443`
+→ `PUB_DENIED` by destination. The B8.1 kill criterion's UDP/DNS clause is
+**open**: `restrict_ip` denies UDP to a public resolver as a connect target, but
+the original criterion (a full D6 rerun under a dogfood hour) has not been run;
+recorded here rather than claimed.
+
+**Residual:** a harness that legitimately needs the desktop session bus
+(portal dialogs, tray integration) is denied it under enforce. Recorded, not
+hidden; re-allowable per session with `deny_user_bus=false`. False-block cost
+against real harnesses is the B8.4 measurement.
+
+MET (2026-09-15): both routes to the manager fail from inside an enforced
+session. Census-observability is moot for the broker-denied path — the escape
+never launches a unit — and is kept as defense in depth. Harness false-block
+measurement is folded into B8.4.
+
+### B8.3 — Periodic live census — SHAPE REVISED (auto-kill rejected)
+Today the orphan census runs only at kill. The plan was to sweep every N
+seconds and freeze/kill on a hit.
+
+**Gate probe first** (`crates/castellan-freezer/examples/census_fp.rs`,
+2026-09-15): the census predicate is *ppid == user manager AND cgroup not under
+castellan.slice AND starttime >= session_start*. At kill time the agent is the
+only such process, so the blast radius is moot. Run the SAME predicate during a
+live session and it matches every legitimate user app opened since spawn —
+konsole (`app-org.kde.konsole-*.scope`), firefox (`app-*.service`), pipewire,
+kwin all live under `/user.slice` with the user manager as parent. A periodic
+auto-kill census would kill the user's own applications. **The auto-kill shape
+fails the zero-FP bar as specified and is rejected.**
+
+What is FP-safe: the escape shape is a *transient `run-*.service`* (or a timer),
+not an `app-*.scope`. B8.3's detection is narrowed to that shape and is
+report/freeze, not blanket kill. `systemd-run` is also now denied at the source
+by the B8.2 broker bus+socket denial, so B8.3 is defense in depth, not the
+primary bound.
 
 ### B8.4 — Composed validation
 Full acceptance sweep (p0–p4, p9-stack, v3-corpus) + D6 rerun + THREAT_MODEL

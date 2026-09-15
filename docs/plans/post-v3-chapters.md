@@ -121,9 +121,35 @@ report/freeze, not blanket kill. `systemd-run` is also now denied at the source
 by the B8.2 broker bus+socket denial, so B8.3 is defense in depth, not the
 primary bound.
 
-### B8.4 — Composed validation
-Full acceptance sweep (p0–p4, p9-stack, v3-corpus) + D6 rerun + THREAT_MODEL
-C10/C10a/C25/C26 updates with dated results. Honest residuals recorded.
+### B8.4 — Composed validation — SWEEP RUN (2026-09-15)
+Full acceptance sweep on kernel 7.0.3 after the broker landed in the launch
+path:
+
+| Suite | Result |
+|---|---|
+| p0-freeze | 15/15 |
+| p1-envelope | 13/13 |
+| p2-undo | 17/17 |
+| p3-trust | 5/5 |
+| p4-certificates | 5/5 |
+| p8-drills | 7/7 |
+| p9-stack | pass |
+| b8-broker | 9/9 |
+| unit tests | 131 |
+
+Cross-kernel (7.1.8 on .227): b8-broker route blocking verified
+(T4_BLOCKED, bus blocked, no over-block), matching 7.0.3.
+
+**Not run / open:** the D6 channel-census rerun under a full dogfood hour
+(the B8.1 UDP/DNS kill criterion), and `v3-corpus.sh` (its pre-registered
+criteria were already evaluated 2026-09-02; re-running after a broker change is
+a real-session-program task, not a B8 gate). `p9-policycheck.sh` fails 1/6
+without its `/tmp/opencode/scan-proj` fixture (missing fixture, not a broker
+regression — verified: 5/6 with the fixture, and policycheck runs clean against
+the live repo).
+
+THREAT_MODEL C35/C36 added; C10a remains the honest egress inventory (the broker
+narrows it under `--net`, but the full census rerun is pending).
 
 ---
 

@@ -598,8 +598,14 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::process::exit(1);
     }
   }
-  if enforce {
-    let mut policy = castellan_policy::Policy::new(&session, &harness, project.clone());
+  // B8.2: build the egress policy and apply the envelope in a helper
+  // (called in the AGENT branch only — the broker supervisor must keep
+  // process_vm_readv, which the envelope's seccomp blocks).
+  let apply_envelope = |enforce: bool, net: bool, session: &str, harness: &str, project: &std::path::Path| {
+    if !enforce {
+      return;
+    }
+    let mut policy = castellan_policy::Policy::new(session, harness, project.to_path_buf());
     if net {
       let port = rpc(sock, &serde_json::json!({ "op": "honeypot_port" }));
       let port: u16 = serde_json::from_str(&port)
@@ -616,6 +622,8 @@ fn launch(args: &[String], sock: &str) -> ! {
       eprintln!("failed to apply envelope (fail-closed): {e}");
       std::process::exit(1);
     }
+  };
+  if enforce {
     // V3 autophagy friction fix: toolchains (cargo/cc/ld) use TMPDIR
     // for temp artifacts; /tmp is not a write root, so the linker
     // failed with "Cannot create temporary file in /tmp" under
@@ -645,9 +653,7 @@ fn launch(args: &[String], sock: &str) -> ! {
             // OUTSIDE the merged view — target goes to the session
             // scratch, which is discarded with the session unless
             // kept (fresh rebuild per session; honest trade).
-            unsafe {
-              std::env::set_var("CARGO_TARGET_DIR", &format!("{s}/cargo-target"));
-            }
+            std::env::set_var("CARGO_TARGET_DIR", &format!("{s}/cargo-target"));
           }
         }
       }
@@ -662,9 +668,44 @@ fn launch(args: &[String], sock: &str) -> ! {
     if enforce { ", enforced" } else { "" },
     if undo { ", undoable" } else { "" }
   );
-  let err = execvp(&cmd);
-  eprintln!("exec failed: {err}");
-  std::process::exit(127);
+  // B8.2: install the seccomp user-notification broker. It closes the
+  // T4 escape (unix sockaddr_un paths no filesystem rule covers) and,
+  // with --net, restricts egress by destination. The supervisor forks
+  // the agent; the agent inherits the notif filter and then applies the
+  // envelope. On spawn failure we fall through to a plain exec (honest
+  // degradation — the envelope still applies).
+  let broker = castellan_broker::spawn_broker();
+  match broker {
+    Ok(castellan_broker::Spawn::Supervisor(mut sup)) => {
+      let mut bpolicy = castellan_broker::EgressPolicy::new();
+      bpolicy.restrict_ip = net;
+      if net {
+        // Under --net, allow the daemon honeypot port's loopback and the
+        // provider hosts resolved at launch time (LLM API survival).
+        let hosts: Vec<String> = std::env::var("CASTELLAN_EGRESS_ALLOW_HOSTS")
+          .ok()
+          .map(|h| h.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+          .unwrap_or_default();
+        bpolicy = bpolicy.with_hosts(&hosts);
+      }
+      let (btx, _brx) = castellan_broker::broker_log();
+      let _ = sup.run(&mut bpolicy, &btx);
+      std::process::exit(sup.finish());
+    }
+    Ok(castellan_broker::Spawn::Agent) => {
+      apply_envelope(enforce, net, &session, &harness, &project);
+      let err = execvp(&cmd);
+      eprintln!("exec failed: {err}");
+      std::process::exit(127);
+    }
+    Err(e) => {
+      eprintln!("castellan: broker unavailable ({e}); continuing without egress broker");
+      apply_envelope(enforce, net, &session, &harness, &project);
+      let err = execvp(&cmd);
+      eprintln!("exec failed: {err}");
+      std::process::exit(127);
+    }
+  }
 }
 
 /// B6 phase 4: the launcher's kernel tty_nr, read from /proc/self/stat

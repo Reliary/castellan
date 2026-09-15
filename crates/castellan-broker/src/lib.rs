@@ -11,18 +11,27 @@
 //!   socket no filesystem rule covers. The broker reads
 //!   `sockaddr_un` paths and denies the manager sockets.
 //!
-//! Safety shape (validated in B8.0):
-//! - **connect allow** — the broker performs the connect itself and
-//!   injects the connected fd with `ADDFD_FLAG_SEND`. No argument
-//!   forwarding, no TOCTOU.
-//! - **connect deny** — `-errno`, no fd.
-//! - **sendto/sendmsg with an explicit destination** — the kernel has
-//!   no fd-injection equivalent (the send happens on an existing fd),
-//!   so the allow path uses `CONTINUE`. That is TOCTOU-soft by kernel
-//!   design and documented as such: a racing thread can rewrite the
-//!   destination between the check and the syscall. Deny is hard.
-//! - **sendto/sendmsg with no destination** (connected socket) — the
-//!   destination was already vetted at connect time; allow.
+//! Safety shape (validated in B8.0, revised in B8.2):
+//! - **deny** — `-errno`, the kernel never executes the syscall. Robust:
+//!   a racing thread cannot turn a deny into an execution.
+//! - **allow** — `CONTINUE`. The kernel re-reads the syscall arguments
+//!   from tracee memory, so a racing thread that rewrites the sockaddr
+//!   after our check can redirect an allowed connect to a denied
+//!   destination. This is the kernel's documented limitation and it is
+//!   honest to state it: **the broker is a best-effort detection and
+//!   denial layer against a non-racing agent, not a hard boundary
+//!   against a malicious actor with a racing-thread exploit.** The hard
+//!   boundary remains Landlock + classic seccomp; the broker closes the
+//!   holes those cannot see (unix `sockaddr_un` paths, UDP, DNS) for
+//!   the realistic LLM-agent threat model.
+//!
+//! Why not the supervisor-performs-connect + ADDFD pattern (the B8.0
+//! plan)? Empirically falsified in B8.2: `ADDFD_FLAG_SEND` returns the
+//! injected fd *number* as connect's return value and leaves the
+//! tracee's original socket fd unconnected. Every program that ignores
+//! connect's return and keeps writing to its own fd then gets
+//! `ENOTCONN` — see examples/broker_fd_identity.rs. ADDFD suits
+//! open-style syscalls that return a new fd; `connect` is not one.
 //!
 //! Residual: an fd connected *before* the filter was installed cannot
 //! be revoked (documented C10a). The broker never sees it.
@@ -40,8 +49,6 @@ pub const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xC050_2100;
 pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
-pub const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
-pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -70,16 +77,6 @@ pub struct SeccompNotifResp {
   pub flags: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SeccompNotifAddfd {
-  pub id: u64,
-  pub flags: u32,
-  pub srcfd: u32,
-  pub newfd: u32,
-  pub newfd_flags: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
   Allow,
@@ -90,14 +87,18 @@ pub enum Verdict {
 #[derive(Debug, Clone, Default)]
 pub struct EgressPolicy {
   /// Extra hosts/IPs allowed beyond loopback (bless grants, provider).
+  /// Hostnames are resolved ONCE at construction (before the filter is
+  /// installed) — the supervisor must never perform DNS itself, because
+  /// its own connect/sendto would notify itself and deadlock.
   pub extra_ips: Vec<IpAddr>,
-  /// Hostnames re-resolved by the supervisor when an unknown IP is
-  /// denied (rate-limited). Keeps CDN-rotated providers reachable.
-  pub allow_hosts: Vec<String>,
   /// Resolver IPs parsed from /etc/resolv.conf — DNS must survive.
   pub resolver_ips: Vec<IpAddr>,
   /// Deny the systemd user-manager sockets (T4). Default true.
   pub deny_systemd_sockets: bool,
+  /// When false (default), non-loopback IPs are allowed — the broker
+  /// only closes the unix/systemd-socket hole and leaves egress alone.
+  /// When true, only loopback + extra_ips + resolver_ips are allowed.
+  pub restrict_ip: bool,
 }
 
 impl EgressPolicy {
@@ -105,8 +106,25 @@ impl EgressPolicy {
     Self { deny_systemd_sockets: true, resolver_ips: resolver_ips(), ..Default::default() }
   }
 
+  /// Resolve hostnames into extra_ips now, before any filter exists.
+  pub fn with_hosts(mut self, hosts: &[String]) -> Self {
+    for h in hosts {
+      if let Ok(addrs) = (h.as_str(), 0u16).to_socket_addrs() {
+        for a in addrs {
+          if !self.extra_ips.contains(&a.ip()) {
+            self.extra_ips.push(a.ip());
+          }
+        }
+      }
+    }
+    self
+  }
+
   fn ip_allowed(&self, ip: &IpAddr) -> bool {
     if ip.is_loopback() {
+      return true;
+    }
+    if !self.restrict_ip {
       return true;
     }
     if self.extra_ips.contains(ip) || self.resolver_ips.contains(ip) {
@@ -137,12 +155,23 @@ pub fn resolver_ips() -> Vec<IpAddr> {
 /// The unix paths that let a process escape the session scope by asking
 /// the user manager to act. C25/T4: `systemd-run` needs no cgroup write
 /// and no unit-file write — it talks to the manager over these sockets.
+///
+/// Scope note (B8.2): only the manager's private control socket and the
+/// cgroup socket are denied by default. The general session bus
+/// (`/run/user/N/bus`) is deliberately NOT denied — it carries ordinary
+/// desktop/harness traffic and denying it is a high false-block risk;
+/// `systemd-run --user` reaches the manager directly, not via the bus.
 pub fn is_manager_socket(path: &[u8]) -> bool {
   let s = String::from_utf8_lossy(path);
   s.starts_with("/run/systemd/private")
     || s.contains("/systemd/private")
-    || s.ends_with("/bus")
     || s.contains("/systemd/cgroup")
+}
+
+/// The session bus path class, kept separate for opt-in denial.
+pub fn is_user_bus(path: &[u8]) -> bool {
+  let s = String::from_utf8_lossy(path);
+  s.ends_with("/bus") && s.contains("/run/user/")
 }
 
 pub fn evaluate_v4(ip: Ipv4Addr, policy: &EgressPolicy) -> Verdict {
@@ -240,19 +269,6 @@ pub fn broker_log() -> BrokerLog {
   std::sync::mpsc::channel()
 }
 
-fn refresh_hosts(policy: &mut EgressPolicy) {
-  let hosts = policy.allow_hosts.clone();
-  for h in hosts {
-    if let Ok(addrs) = (h.as_str(), 0u16).to_socket_addrs() {
-      for a in addrs {
-        if !policy.extra_ips.contains(&a.ip()) {
-          policy.extra_ips.push(a.ip());
-        }
-      }
-    }
-  }
-}
-
 fn read_tracee(pid: u32, ptr: u64, len: usize) -> Option<Vec<u8>> {
   if ptr == 0 || len == 0 {
     return None;
@@ -334,70 +350,13 @@ fn send_response(listener: RawFd, id: u64, error: i32, flags: u32) -> io::Result
   Ok(())
 }
 
-fn respond(listener: RawFd, helper_sock: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<()> {
+fn respond(listener: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<()> {
   if verdict == Verdict::Deny {
     return send_response(listener, req.id, -libc::EPERM, 0);
   }
-  if req.data.nr as i64 != libc::SYS_connect {
-    // sendto/sendmsg allow: CONTINUE is the only mechanism (no fd to
-    // inject). TOCTOU-soft, documented at the crate level.
-    return send_response(listener, req.id, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE);
-  }
-  // connect allow: an unfiltered helper performs the syscall and we
-  // inject the connected fd — no argument forwarding, no TOCTOU, and
-  // the supervisor itself never calls connect (it is filtered too).
-  let Some(sa) = notification_dest(req) else {
-    return send_response(listener, req.id, -libc::EPERM, 0);
-  };
-  let (family, buf) = sockaddr_bytes(&sa);
-  let sfd = match helper_connect(helper_sock, family, &buf) {
-    Ok(fd) => fd,
-    Err(err) => return send_response(listener, req.id, -err, 0),
-  };
-  let mut add = SeccompNotifAddfd {
-    id: req.id,
-    flags: SECCOMP_ADDFD_FLAG_SEND,
-    srcfd: sfd as u32,
-    newfd: 0,
-    newfd_flags: libc::O_CLOEXEC as u32,
-  };
-  let injected = unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_ADDFD, &mut add) };
-  unsafe { libc::close(sfd) };
-  if injected < 0 {
-    let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
-    return send_response(listener, req.id, -err, 0);
-  }
-  Ok(())
-}
-
-fn sockaddr_bytes(sa: &Sockaddr) -> (i32, Vec<u8>) {
-  match sa {
-    Sockaddr::V4(ip, port) => {
-      let mut b = vec![0u8; 16];
-      b[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
-      b[2..4].copy_from_slice(&port.to_be_bytes());
-      b[4..8].copy_from_slice(&ip.octets());
-      (libc::AF_INET, b)
-    }
-    Sockaddr::V6(ip, port) => {
-      let mut b = vec![0u8; 28];
-      b[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
-      b[2..4].copy_from_slice(&port.to_be_bytes());
-      b[8..24].copy_from_slice(&ip.octets());
-      (libc::AF_INET6, b)
-    }
-    Sockaddr::Unix(path) => {
-      let mut b = vec![0u8; 2 + path.len() + 1];
-      b[0..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
-      b[2..2 + path.len()].copy_from_slice(path);
-      (libc::AF_UNIX, b)
-    }
-    Sockaddr::Other(f) => {
-      let mut b = vec![0u8; 2];
-      b[0..2].copy_from_slice(&(*f as u16).to_ne_bytes());
-      (*f, b)
-    }
-  }
+  // Allow: CONTINUE re-reads arguments from tracee memory. The kernel
+  // documents this as TOCTOU-soft; see the crate-level note.
+  send_response(listener, req.id, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE)
 }
 
 /// Install the notification filter on the current process and return
@@ -444,34 +403,28 @@ fn bpf(code: u32, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 
 /// The supervisor/agent fork result. The supervisor installs the
 /// notif filter FIRST, then forks: the agent inherits the filter at
-/// exec; the supervisor keeps the listener and the unfiltered helper.
+/// exec; the supervisor keeps the listener.
 pub enum Spawn {
   /// Child: apply the envelope, then exec the agent command.
   Agent,
-  /// Parent: run `broker.supervise()`, reap the agent, exit its code.
+  /// Parent: run `broker.run()`, reap the agent, exit its code.
   Supervisor(Broker),
 }
 
 pub struct Broker {
   pub listener: RawFd,
   pub agent_pid: libc::pid_t,
-  helper_sock: RawFd,
-  helper_pid: libc::pid_t,
   agent_status: Option<i32>,
 }
 
 impl Broker {
-  /// Run the decision loop until the agent tree exits, delegating
-  /// allow-path connects to the unfiltered helper (the supervisor
-  /// itself is filtered, so it must not call connect).
+  /// Run the decision loop until the agent tree exits.
   ///
-  /// The listener is set non-blocking: NOTIF_RECV blocks forever while
-  /// the supervisor holds the listener open, even after the agent is
-  /// gone (ENOENT only fires when every listener fd closes — found
-  /// live, 2026-09-05). EAGAIN + waitpid(WNOHANG) is the exit signal.
+  /// NOTIF_RECV never returns ENOENT while the supervisor (itself a
+  /// tracee) holds the listener open, even after the agent is gone.
+  /// Exit detection is therefore poll(200ms) + waitpid(WNOHANG).
   pub fn run(&mut self, policy: &mut EgressPolicy, log: &Sender<BrokerEvent>) -> io::Result<u64> {
     let mut count = 0u64;
-    let mut last_refresh = std::time::Instant::now();
     loop {
       let mut pfd = libc::pollfd { fd: self.listener, events: libc::POLLIN, revents: 0 };
       let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
@@ -501,37 +454,17 @@ impl Broker {
       }
       count += 1;
       let (verdict, reason, detail) = decide_notification(&req, policy);
-      let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail: detail.clone() });
-      let (verdict, _reason) = if verdict == Verdict::Deny
-        && !policy.allow_hosts.is_empty()
-        && last_refresh.elapsed().as_secs() >= 30
-      {
-        last_refresh = std::time::Instant::now();
-        refresh_hosts(policy);
-        let (v2, r2, _) = decide_notification(&req, policy);
-        (v2, if v2 == Verdict::Allow { "host-refresh" } else { r2 })
-      } else {
-        (verdict, reason)
-      };
-      respond(self.listener, self.helper_sock, &req, verdict)?;
+      let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
+      respond(self.listener, &req, verdict)?;
     }
   }
 
-  /// Reap the agent and the helper; returns the agent's exit code.
+  /// Reap the agent; returns its exit code.
   pub fn finish(self) -> i32 {
-    let code = match self.agent_status {
+    match self.agent_status {
       Some(c) => c,
       None => reap(self.agent_pid),
-    };
-    unsafe {
-      libc::close(self.helper_sock);
     }
-    // The helper exits when its socketpair closes; reap it best-effort.
-    let mut status = 0;
-    unsafe {
-      libc::waitpid(self.helper_pid, &mut status, libc::WNOHANG);
-    }
-    code
   }
 }
 
@@ -552,154 +485,25 @@ fn try_reap(child: libc::pid_t) -> Option<i32> {
   }
 }
 
-/// Install the filter in the supervisor, fork an unfiltered connect
-/// helper and the agent. The caller must branch immediately:
-/// `Spawn::Agent` -> apply envelope + exec; `Spawn::Supervisor` -> run.
+/// Install the filter in the supervisor, then fork the agent. The
+/// caller must branch immediately: `Spawn::Agent` -> apply envelope +
+/// exec; `Spawn::Supervisor` -> run.
+///
+/// No helper process is needed: the supervisor performs no network I/O
+/// (hostnames are resolved before the filter is installed), so it never
+/// notifies itself.
 pub fn spawn_broker() -> io::Result<Spawn> {
-  let mut sv = [0 as RawFd; 2];
-  let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) };
-  if rc != 0 {
-    return Err(io::Error::last_os_error());
-  }
-  let helper_pid = unsafe { libc::fork() };
-  if helper_pid < 0 {
-    return Err(io::Error::last_os_error());
-  }
-  if helper_pid == 0 {
-    // Helper: unfiltered (forked before the filter is installed).
-    unsafe { libc::close(sv[0]) };
-    helper_loop(sv[1]);
-    unsafe { libc::_exit(0) };
-  }
-  unsafe { libc::close(sv[1]) };
   let listener = install_listener()?;
   let agent_pid = unsafe { libc::fork() };
   if agent_pid < 0 {
     return Err(io::Error::last_os_error());
   }
   if agent_pid == 0 {
-    // Agent: inherits the filter. Drop the listener and helper socket.
-    unsafe {
-      libc::close(listener);
-      libc::close(sv[0]);
-    }
+    // Agent: inherits the filter. Drop the listener.
+    unsafe { libc::close(listener) };
     return Ok(Spawn::Agent);
   }
-  Ok(Spawn::Supervisor(Broker { listener, agent_pid, helper_sock: sv[0], helper_pid, agent_status: None }))
-}
-
-/// Unfiltered helper: performs connects on behalf of the supervisor
-/// and returns the connected fd via SCM_RIGHTS. Message format:
-/// [family u32][len u32][sockaddr bytes] -> [ok u8][errno i32] (+fd).
-fn helper_loop(sock: RawFd) {
-  loop {
-    let mut buf = [0u8; 260];
-    let n = unsafe { libc::recv(sock, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
-    if n <= 0 {
-      return;
-    }
-    let n = n as usize;
-    if n < 8 {
-      continue;
-    }
-    let family = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as i32;
-    let len = u32::from_ne_bytes(buf[4..8].try_into().unwrap()) as usize;
-    if 8 + len > n {
-      continue;
-    }
-    let sa = &buf[8..8 + len];
-    let sfd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if sfd < 0 {
-      let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
-      reply_err(sock, err);
-      continue;
-    }
-    let rc = unsafe { libc::connect(sfd, sa.as_ptr() as *const libc::sockaddr, len as u32) };
-    if rc < 0 {
-      let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
-      unsafe { libc::close(sfd) };
-      reply_err(sock, err);
-      continue;
-    }
-    if send_fd(sock, sfd).is_err() {
-      unsafe { libc::close(sfd) };
-    }
-    unsafe { libc::close(sfd) };
-  }
-}
-
-fn reply_err(sock: RawFd, err: i32) {
-  let msg = [0u8; 5];
-  let mut m = msg;
-  m[1..5].copy_from_slice(&err.to_ne_bytes());
-  unsafe {
-    libc::send(sock, m.as_ptr() as *const _, m.len(), 0);
-  }
-}
-
-/// Ask the helper for a connected fd. Returns Ok(fd) or Err(errno).
-/// NOTE: the request uses `write(2)`, not `send(2)` — glibc's `send`
-/// is a `sendto` wrapper, and `sendto` is in the notif filter, so the
-/// supervisor would deadlock against its own notification (found live,
-/// 2026-09-05).
-fn helper_connect(sock: RawFd, family: i32, sa: &[u8]) -> Result<RawFd, i32> {
-  let mut req = Vec::with_capacity(8 + sa.len());
-  req.extend_from_slice(&(family as u32).to_ne_bytes());
-  req.extend_from_slice(&(sa.len() as u32).to_ne_bytes());
-  req.extend_from_slice(sa);
-  let n = unsafe { libc::write(sock, req.as_ptr() as *const _, req.len()) };
-  if n < 0 {
-    return Err(libc::EPERM);
-  }
-  let mut buf = [0u8; 8];
-  let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
-  let mut cmsg_buf = [0u8; 64];
-  let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-  msg.msg_iov = &mut iov;
-  msg.msg_iovlen = 1;
-  msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-  msg.msg_controllen = cmsg_buf.len();
-  let rc = unsafe { libc::recvmsg(sock, &mut msg, 0) };
-  if rc < 0 {
-    return Err(libc::EPERM);
-  }
-  let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-  if !cmsg.is_null() && unsafe { (*cmsg).cmsg_type } == libc::SCM_RIGHTS {
-    let mut fd: RawFd = -1;
-    unsafe {
-      std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg), &mut fd as *mut RawFd as *mut u8, 4);
-    }
-    Ok(fd)
-  } else {
-    Err(i32::from_ne_bytes(buf[1..5].try_into().unwrap_or([libc::EPERM as u8; 4])))
-  }
-}
-
-pub fn send_fd(sock: RawFd, fd: RawFd) -> io::Result<()> {
-  // The helper is unfiltered so sendmsg is safe here; the supervisor
-  // must never call this (sendmsg is in its filter).
-  let mut byte = [1u8; 1];
-  let iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut _, iov_len: 1 };
-  let mut cmsg_buf = [0u8; 64];
-  let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-  msg.msg_iov = &iov as *const _ as *mut _;
-  msg.msg_iovlen = 1;
-  msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-  msg.msg_controllen = cmsg_buf.len();
-  let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-  unsafe {
-    (*cmsg).cmsg_level = libc::SOL_SOCKET;
-    (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-    (*cmsg).cmsg_len = libc::CMSG_LEN(4) as usize;
-    std::ptr::copy_nonoverlapping(&fd as *const RawFd as *const u8, libc::CMSG_DATA(cmsg), 4);
-  }
-  msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) as usize };
-  let rc = unsafe { libc::sendmsg(sock, &msg, 0) };
-  if rc < 0 {
-    Err(io::Error::last_os_error())
-  } else {
-    Ok(())
-  }
+  Ok(Spawn::Supervisor(Broker { listener, agent_pid, agent_status: None }))
 }
 
 /// Wait for the agent child and return its exit code (128+sig on signal).
@@ -721,22 +525,30 @@ mod tests {
 
   #[test]
   fn loopback_allowed_public_denied() {
-    let p = EgressPolicy::new();
+    let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
     assert_eq!(evaluate_v4(Ipv4Addr::new(127, 0, 0, 1), &p), Verdict::Allow);
     assert_eq!(evaluate_v4(Ipv4Addr::new(8, 8, 8, 8), &p), Verdict::Deny);
     assert_eq!(evaluate_v4(Ipv4Addr::new(192, 168, 1, 227), &p), Verdict::Deny);
   }
 
   #[test]
+  fn open_egress_allows_public_by_default() {
+    // Default posture: the broker only closes the systemd-socket hole;
+    // IP egress is unrestricted unless restrict_ip is set.
+    let p = EgressPolicy::new();
+    assert_eq!(evaluate_v4(Ipv4Addr::new(8, 8, 8, 8), &p), Verdict::Allow);
+  }
+
+  #[test]
   fn resolver_allowed() {
-    let mut p = EgressPolicy::new();
+    let mut p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
     p.resolver_ips.push(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
     assert_eq!(evaluate_v4(Ipv4Addr::new(9, 9, 9, 9), &p), Verdict::Allow);
   }
 
   #[test]
   fn extra_ip_allowed() {
-    let mut p = EgressPolicy::new();
+    let mut p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
     p.extra_ips.push(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 5)));
     assert_eq!(evaluate_v4(Ipv4Addr::new(140, 82, 112, 5), &p), Verdict::Allow);
   }
@@ -746,8 +558,10 @@ mod tests {
     let p = EgressPolicy::new();
     let sa = Sockaddr::Unix(b"/run/user/1000/systemd/private".to_vec());
     assert_eq!(decide(&sa, &p).0, Verdict::Deny);
+    // B8.2: the general session bus is NOT denied by default (high
+    // false-block risk; systemd-run does not use it).
     let sa = Sockaddr::Unix(b"/run/user/1000/bus".to_vec());
-    assert_eq!(decide(&sa, &p).0, Verdict::Deny);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
     let sa = Sockaddr::Unix(b"/run/user/1000/wayland-0".to_vec());
     assert_eq!(decide(&sa, &p).0, Verdict::Allow);
   }

@@ -23,7 +23,7 @@ fn main() {
       unsafe { libc::_exit(rc) };
     }
     Spawn::Supervisor(mut broker) => {
-      let mut policy = EgressPolicy::new();
+      let mut policy = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
       // Resolvers are allowed by default (DNS survival); empty here to
       // keep the probe deterministic on machines with unusual resolvers.
       policy.resolver_ips.clear();

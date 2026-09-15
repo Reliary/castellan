@@ -86,6 +86,7 @@ dependencies = [
 name = "castellan-cli"
 version = "0.1.0"
 dependencies = [
+ "castellan-broker",
  "castellan-core",
  "castellan-envelope",
  "castellan-freezer",

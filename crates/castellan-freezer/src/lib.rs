@@ -292,6 +292,18 @@ impl CgroupRoot {
       if unit.is_empty() || !unit.ends_with(".service") {
         continue;
       }
+      // B8.3 (C36): a legitimate desktop app launched during the session
+      // window is parented to the user manager and started after
+      // session_start — the same shape as an escape. But its unit is
+      // `app-<desktop-id>.service` (firefox, konsole via the desktop
+      // entry), NOT the `run-<pid>-i<invocation>.service` that
+      // `systemd-run` creates. Stopping app services is collateral
+      // damage on the user's own applications; the escape shape is
+      // `run-*`. Measured live 2026-09-15: firefox is `app-*.service`,
+      // the systemd-run escape is `run-*.service`.
+      if unit.starts_with("app-") {
+        continue;
+      }
       let show = std::process::Command::new("systemctl")
         .args(["--user", "show", &unit, "-p", "MainPID", "-p", "ControlGroup"])
         .output();
@@ -349,6 +361,84 @@ impl CgroupRoot {
       stopped += 1;
     }
     stopped
+  }
+
+  /// B8.3 (C36): a NON-DESTRUCTIVE periodic detector. Returns the
+  /// transient `run-*.service` units and timers created during the
+  /// session window outside the session scope — the shape `systemd-run`
+  /// produces and nothing legitimate does (`app-*.service` is the
+  /// desktop-app shape; see `stop_escaped_units`). The caller decides
+  /// the response: the daemon emits a spine event and may freeze. This
+  /// is deliberately report-only: the C36 probe showed the broad
+  /// predicate (all user-manager-parented procs) would claim the user's
+  /// own terminals, so the periodic path never blanket-kills.
+  pub fn run_units_since(&self, session: &SessionId, session_start_unix: u64) -> Vec<String> {
+    let scope = self.session_dir(session);
+    let scope_str = scope.to_string_lossy().to_string();
+    let mut hits = Vec::new();
+    let list = std::process::Command::new("systemctl")
+      .args(["--user", "list-units", "--type=service", "--type=timer", "--no-legend", "--plain"])
+      .output();
+    let Ok(list) = list else { return hits };
+    let Ok(text) = String::from_utf8(list.stdout) else { return hits };
+    let btime = proc_btime();
+    let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+      .ok()
+      .flatten()
+      .map(|h| h as u64)
+      .unwrap_or(100);
+    let mono_offset = monotonic_to_boottime_offset();
+    let session_start_boottime = session_start_unix.saturating_sub(btime) as f64;
+    for line in text.lines() {
+      let unit = line.split_whitespace().next().unwrap_or("").to_string();
+      if !unit.starts_with("run-") || !(unit.ends_with(".service") || unit.ends_with(".timer")) {
+        continue;
+      }
+      let show = std::process::Command::new("systemctl")
+        .args(["--user", "show", &unit, "-p", "MainPID", "-p", "ControlGroup", "-p", "ActiveEnterTimestampMonotonic"])
+        .output();
+      let Ok(show) = show else { continue };
+      let Ok(show_text) = String::from_utf8(show.stdout) else { continue };
+      let mut main_pid = 0u32;
+      let mut cgroup = String::new();
+      let mut active_mono = 0u64;
+      for kv in show_text.lines() {
+        if let Some(v) = kv.strip_prefix("MainPID=") {
+          main_pid = v.trim().parse::<u32>().unwrap_or(0);
+        } else if let Some(v) = kv.strip_prefix("ControlGroup=") {
+          cgroup = v.trim().to_string();
+        } else if let Some(v) = kv.strip_prefix("ActiveEnterTimestampMonotonic=") {
+          active_mono = v.trim().parse::<u64>().unwrap_or(0);
+        }
+      }
+      if cgroup.contains(&scope_str) {
+        continue;
+      }
+      // prefer the process starttime; timers have MainPID=0 and use
+      // their activation timestamp in the boottime domain.
+      let start_boottime = if main_pid != 0 {
+        match fs::read_to_string(format!("/proc/{main_pid}/stat")) {
+          Ok(s) => {
+            let Some(rest) = s.rsplit_once(')') else { continue };
+            let fields: Vec<&str> = rest.1.split_whitespace().collect();
+            match fields.get(19).and_then(|f| f.parse::<u64>().ok()) {
+              Some(t) => (btime + t.div_ceil(hz)).saturating_sub(btime) as f64,
+              None => continue,
+            }
+          }
+          Err(_) => continue,
+        }
+      } else if active_mono != 0 {
+        active_mono as f64 / 1e6 + mono_offset
+      } else {
+        continue;
+      };
+      if start_boottime < session_start_boottime - 1.0 {
+        continue;
+      }
+      hits.push(unit);
+    }
+    hits
   }
 }
 

@@ -7,7 +7,7 @@ use castellan_freezer::CgroupRoot;
 use castellan_policy::Policy;
 use castellan_trust::{Signal, TrustDb, TrustEvent};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -243,6 +243,10 @@ pub struct Daemon {
   /// pass any tty!=0 gate. The inode binds the trust to the specific
   /// pts allocation: a recycled tty_nr gets a new inode and fails.
   trusted_ttys: Arc<Mutex<FxHashMap<u64, u64>>>,
+  /// B8.3: dedup set for the periodic escape-shape sweep, keyed
+  /// "session:unit" so a persistent unit is reported once, not every
+  /// sweep.
+  swept: Arc<Mutex<FxHashSet<String>>>,
 }
 
 impl Daemon {
@@ -319,6 +323,7 @@ impl Daemon {
       ))),
       voice: Arc::new(Mutex::new(FxHashMap::default())),
       trusted_ttys: Arc::new(Mutex::new(FxHashMap::default())),
+      swept: Arc::new(Mutex::new(FxHashSet::default())),
     };
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
@@ -330,6 +335,24 @@ impl Daemon {
       .unwrap_or(60);
     let drill_daemon = daemon.clone();
     let _ = castellan_drill::spawn_scheduler(interval_min, move || drill_daemon.run_drills());
+    // B8.3 (C36): periodic escape-shape sweep. Report-only — it looks
+    // for transient `run-*.service`/`run-*.timer` units created during a
+    // live session window (the systemd-run escape shape) and emits a
+    // spine event. It does NOT blanket-kill: the C36 probe showed the
+    // broad predicate claims the user's own apps (konsole/firefox);
+    // B8.2's broker denies systemd-run at the source, so this is
+    // defense in depth, not the primary bound.
+    let sweep_daemon = daemon.clone();
+    let sweep_secs = std::env::var("CASTELLAN_SWEEP_SECS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(15);
+    if std::env::var("CASTELLAN_DISABLE_SWEEP").is_err() {
+      let _ = std::thread::Builder::new().name("sweep".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(sweep_secs.max(1)));
+        sweep_daemon.run_sweep();
+      });
+    }
     Ok(daemon)
   }
 
@@ -2780,6 +2803,39 @@ impl Daemon {
         pids: self.root.populate_count(&s.id),
       })
       .collect()
+  }
+
+  /// B8.3 (C36): periodic escape-shape sweep. For each live session,
+  /// look for transient `run-*.service`/`run-*.timer` units created
+  /// during its window. Report-only: emit an `escape_unit` spine event
+  /// (deduped per (session, unit)). No blanket kill — see the C36 probe.
+  fn run_sweep(&self) {
+    let sessions: Vec<(SessionId, u64)> = {
+      let reg = self.registry.lock().unwrap();
+      reg.values().map(|s| (s.id.clone(), s.started_at)).collect()
+    };
+    for (id, start) in sessions {
+      let hits = self.root.run_units_since(&id, start);
+      for unit in hits {
+        let key = format!("{id}:{unit}");
+        {
+          let mut seen = self.swept.lock().unwrap();
+          if !seen.insert(key) {
+            continue;
+          }
+          // keep the dedup set bounded — sessions are short-lived and
+          // sweep intervals are seconds; 4096 covers any realistic run.
+          if seen.len() > 4096 {
+            seen.clear();
+            seen.insert(format!("{id}:{unit}"));
+          }
+        }
+        if let Ok(sink) = EventSink::for_session(&Self::state_dir(), &id) {
+          let _ = sink.emit("escape_unit", &unit, "deny");
+        }
+        eprintln!("castellan-daemon: escape-shape unit {unit} under session {id} — reported (B8.3)");
+      }
+    }
   }
 }
 

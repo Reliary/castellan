@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# B8.2 live acceptance: the seccomp user-notification broker closes the
-# T4 escape (systemd-run --user reaches the user manager over a unix
-# socket no filesystem rule covers) and, with --net, restricts egress by
-# destination. Both are verified from INSIDE an enforced session.
+# B8.2 live acceptance: the seccomp user-notification broker.
+#
+# Two structural holes close here:
+#   T4 escape  — both routes to the systemd user manager must FAIL from
+#                inside an enforced session: the private manager socket
+#                AND the session bus (org.freedesktop.systemd1 is
+#                exported there too, and systemd-run falls back to it).
+#   --net      — destination-scoped egress (Landlock ABI4 net rules are
+#                port-scoped and TCP-only).
+# Both must close WITHOUT over-blocking ordinary unix sockets, loopback,
+# or a git workflow.
+#
+# Probes live in script files: inline `bash -c "..."` nests three quote
+# levels and mangles backslashes (found building this suite).
 set -u
 cd "$(dirname "$0")/../.."
 BIN="$PWD/target/release"
@@ -35,72 +45,101 @@ for _ in $(seq 1 40); do
 done
 grep -q listening "$WORK/daemon.log" && ok "daemon started" || { bad "daemon failed to start"; exit 1; }
 
-echo "== T4 CLOSE: systemd-run --user must FAIL inside an enforced session =="
-"$BIN/castellan" launch --harness claude --project "$WORK/proj" --enforce -- bash -c "
-  # A) the manager private socket is denied by the broker
-  if systemd-run --user --scope --quiet true 2>/dev/null; then
-    echo T4_ESCAPE_OK
-  else
-    echo T4_BLOCKED
-  fi
-  # B) an ordinary local unix socket is NOT denied (no over-block)
-  python3 -c \"
-import socket,os
-s=socket.socket(socket.AF_UNIX)
-p='/run/user/%d/castellan-b82-ok.sock'%os.getuid()
+# ---- T4: both manager routes denied, no over-block ----------------
+cat > "$WORK/t4.py" <<PY
+import socket, os, subprocess
+
+# Route 1: the private manager socket, via systemd-run.
+r1 = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "true"],
+                    capture_output=True)
+print("ROUTE1_OK" if r1.returncode == 0 else "ROUTE1_BLOCKED")
+
+# Route 2: StartTransientUnit over the SESSION BUS. This is the route
+# systemd-run falls back to; deny the private socket alone and this
+# still launches an arbitrary command outside the scope.
+r2 = subprocess.run([
+    "busctl", "--user", "call",
+    "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+    "org.freedesktop.systemd1.Manager", "StartTransientUnit",
+    r"ssa(sv)a(sa(sv))",
+    "castellan-esc-accept.service", "replace",
+    "1", "ExecStart", "a(sasb)", "1", "/bin/sh", "1", "/bin/sh",
+    "false", "0",
+], capture_output=True)
+# A successful call prints a job object; a denied bus gives EPERM.
+out = r2.stdout.decode() + r2.stderr.decode()
+print("ROUTE2_OK" if "job/" in out else "ROUTE2_BLOCKED")
+print("ROUTE2_RAW:" + out.strip().replace(chr(10), " ")[:120])
+
+# No over-block: an ordinary (absent) unix socket must fail with
+# FileNotFound/Refused, never PermissionError.
+s = socket.socket(socket.AF_UNIX)
 try:
-    s.connect(p)
-except (FileNotFoundError, ConnectionRefusedError):
-    print('UNIX_OK')
+    s.connect("/run/user/%d/castellan-b82-ok.sock" % os.getuid())
 except PermissionError:
-    print('UNIX_DENIED')
+    print("UNIX_DENIED")
 except OSError:
-    print('UNIX_OTHER')
-\"
-  # C) loopback TCP is allowed (broker does not over-block)
-  python3 -c \"
-import socket
-s=socket.socket()
+    print("UNIX_OK")
+else:
+    print("UNIX_OK")
+
+# No over-block: loopback TCP.
+t = socket.socket(); t.settimeout(2)
 try:
-    s.connect(('127.0.0.1', 9))
-except ConnectionRefusedError:
-    print('LOOP_OK')
+    t.connect(("127.0.0.1", 9))
 except PermissionError:
-    print('LOOP_DENIED')
+    print("LOOP_DENIED")
 except OSError:
-    print('LOOP_OTHER')
-\"
-" > "$WORK/t4.out" 2>"$WORK/t4.err"
+    print("LOOP_OK")
+
+# No over-block: git must still work.
+import shutil
+g = subprocess.run(["git", "-c", "commit.gpgsign=false", "init", "-q", "."],
+                   cwd=os.environ["PROBE_CWD"], capture_output=True)
+g = subprocess.run(["git", "config", "user.email", "t@t"], cwd=os.environ["PROBE_CWD"], capture_output=True)
+g = subprocess.run(["git", "config", "user.name", "t"], cwd=os.environ["PROBE_CWD"], capture_output=True)
+open(os.path.join(os.environ["PROBE_CWD"], "f.txt"), "w").write("x")
+subprocess.run(["git", "add", "f.txt"], cwd=os.environ["PROBE_CWD"], capture_output=True)
+g = subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-qm", "one"],
+                   cwd=os.environ["PROBE_CWD"], capture_output=True)
+print("GIT_OK" if g.returncode == 0 else "GIT_FAIL")
+PY
+
+PROBE_CWD="$WORK/proj" "$BIN/castellan" launch --harness claude --project "$WORK/proj" \
+  --enforce -- python3 "$WORK/t4.py" > "$WORK/t4.out" 2>"$WORK/t4.err"
 SID=$(grep -o 's[0-9a-f]\{10,\}' "$WORK/t4.err" | head -1)
-[[ -n "$SID" ]] && ok "session $SID launched" || bad "no session id"
+[[ -n "$SID" ]] && ok "session launched" || bad "no session id"
 
-grep -q T4_BLOCKED "$WORK/t4.out" && ok "systemd-run --user DENIED by broker (T4 closed)" || bad "T4 escape still open (or systemd-run absent)"
-grep -q T4_ESCAPE_OK "$WORK/t4.out" && bad "T4 escape succeeded — broker did not block the manager socket" || true
-grep -q UNIX_OK "$WORK/t4.out" && ok "ordinary unix socket still allowed (no over-block)" || bad "ordinary unix socket wrongly denied"
+grep -q ROUTE1_BLOCKED "$WORK/t4.out" && ok "route 1 (private manager socket) DENIED" || { bad "route 1 open"; grep ROUTE1 "$WORK/t4.out"; }
+grep -q ROUTE2_BLOCKED "$WORK/t4.out" && ok "route 2 (session bus StartTransientUnit) DENIED" || { bad "route 2 open — bus escape works"; grep ROUTE2_RAW "$WORK/t4.out"; }
+grep -q UNIX_OK "$WORK/t4.out" && ok "ordinary unix socket still allowed" || bad "ordinary unix socket wrongly denied"
 grep -q LOOP_OK "$WORK/t4.out" && ok "loopback TCP still allowed" || bad "loopback TCP wrongly denied"
-"$BIN/castellan" kill "$SID" >/dev/null 2>&1
+grep -q GIT_OK "$WORK/t4.out" && ok "git workflow survives" || bad "git broken"
+# A launched unit would leave a job on the manager; assert none.
+if systemctl --user is-active castellan-esc-accept.service >/dev/null 2>&1; then
+  bad "escaped transient unit is active"
+  systemctl --user stop castellan-esc-accept.service 2>/dev/null
+else
+  ok "no escaped transient unit active"
+fi
+[[ -n "$SID" ]] && "$BIN/castellan" kill "$SID" >/dev/null 2>&1
 
+# ---- --net: destination-scoped egress -----------------------------
 echo "== --net: destination-scoped egress restriction =="
-"$BIN/castellan" launch --harness claude --project "$WORK/proj" --enforce --net -- bash -c "
-  python3 -c \"
+cat > "$WORK/net.py" <<'PY'
 import socket
-# public TCP 443 -> must be denied by the broker's IP restriction
-s=socket.socket()
-s.settimeout(3)
+s = socket.socket(); s.settimeout(3)
 try:
-    s.connect(('1.2.3.4', 443))
-    print('PUB_OK')
+    s.connect(("1.2.3.4", 443))
 except PermissionError:
-    print('PUB_DENIED')
+    print("PUB_DENIED")
 except OSError as e:
-    print('PUB_OTHER:%s'%e.errno)
-\"
-  # systemd socket still denied under --net
-  systemd-run --user --scope --quiet true 2>/dev/null && echo T4_ESCAPE_OK || echo T4_BLOCKED
-" > "$WORK/net.out" 2>"$WORK/net.err"
+    print("PUB_OTHER:%s" % e.errno)
+PY
+"$BIN/castellan" launch --harness claude --project "$WORK/proj" --enforce --net \
+  -- python3 "$WORK/net.py" > "$WORK/net.out" 2>"$WORK/net.err"
 SID2=$(grep -o 's[0-9a-f]\{10,\}' "$WORK/net.err" | head -1)
-grep -q PUB_DENIED "$WORK/net.out" && ok "--net denies public TCP by destination" || { bad "--net did not deny public TCP"; echo "    (got: $(grep PUB "$WORK/net.out"))"; }
-grep -q T4_BLOCKED "$WORK/net.out" && ok "--net keeps the manager socket denied" || bad "--net leaked the manager socket"
+grep -q PUB_DENIED "$WORK/net.out" && ok "--net denies public TCP by destination" || { bad "--net did not deny public TCP"; grep PUB "$WORK/net.out"; }
 [[ -n "$SID2" ]] && "$BIN/castellan" kill "$SID2" >/dev/null 2>&1
 
 echo "== SUMMARY =="

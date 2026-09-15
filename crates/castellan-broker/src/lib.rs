@@ -95,6 +95,18 @@ pub struct EgressPolicy {
   pub resolver_ips: Vec<IpAddr>,
   /// Deny the systemd user-manager sockets (T4). Default true.
   pub deny_systemd_sockets: bool,
+  /// Deny the session bus (`$XDG_RUNTIME_DIR/bus`). Default true.
+  ///
+  /// The private manager socket is NOT the only route to systemd's
+  /// manager: `org.freedesktop.systemd1` is also exported on the session
+  /// bus, and `StartTransientUnit` over the bus launches an arbitrary
+  /// command as a transient unit — outside the session cgroup and the
+  /// envelope. Verified live 2026-09-15: a busctl StartTransientUnit
+  /// call from inside an enforced session wrote a marker file on the
+  /// host. `systemd-run` falls back to the bus when the private socket
+  /// is denied, so denying the private socket alone closes nothing.
+  /// The bus must be denied too.
+  pub deny_user_bus: bool,
   /// When false (default), non-loopback IPs are allowed — the broker
   /// only closes the unix/systemd-socket hole and leaves egress alone.
   /// When true, only loopback + extra_ips + resolver_ips are allowed.
@@ -103,7 +115,12 @@ pub struct EgressPolicy {
 
 impl EgressPolicy {
   pub fn new() -> Self {
-    Self { deny_systemd_sockets: true, resolver_ips: resolver_ips(), ..Default::default() }
+    Self {
+      deny_systemd_sockets: true,
+      deny_user_bus: true,
+      resolver_ips: resolver_ips(),
+      ..Default::default()
+    }
   }
 
   /// Resolve hostnames into extra_ips now, before any filter exists.
@@ -248,6 +265,8 @@ pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
     Sockaddr::Unix(path) => {
       if policy.deny_systemd_sockets && is_manager_socket(path) {
         (Verdict::Deny, "systemd-socket")
+      } else if policy.deny_user_bus && is_user_bus(path) {
+        (Verdict::Deny, "session-bus")
       } else {
         (Verdict::Allow, "unix")
       }
@@ -558,11 +577,18 @@ mod tests {
     let p = EgressPolicy::new();
     let sa = Sockaddr::Unix(b"/run/user/1000/systemd/private".to_vec());
     assert_eq!(decide(&sa, &p).0, Verdict::Deny);
-    // B8.2: the general session bus is NOT denied by default (high
-    // false-block risk; systemd-run does not use it).
+    // B8.2: the session bus is ALSO denied by default — systemd1 is
+    // exported there and StartTransientUnit over the bus escapes.
     let sa = Sockaddr::Unix(b"/run/user/1000/bus".to_vec());
-    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+    assert_eq!(decide(&sa, &p).0, Verdict::Deny);
     let sa = Sockaddr::Unix(b"/run/user/1000/wayland-0".to_vec());
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn session_bus_allowed_when_disabled() {
+    let p = EgressPolicy { deny_user_bus: false, ..EgressPolicy::new() };
+    let sa = Sockaddr::Unix(b"/run/user/1000/bus".to_vec());
     assert_eq!(decide(&sa, &p).0, Verdict::Allow);
   }
 

@@ -159,24 +159,50 @@ The pre-registered V3 criteria were measured on a scripted corpus; the honest
 gap is real LLM sessions. The C34 friction fixes (TMPDIR, utime,
 CARGO_TARGET_DIR) make dogfooding viable.
 
-### R1 — Dogfood
-Launch our own development sessions through `castellan launch` on this repo and
-on .227; accumulate ≥40 real spines (kept + reverted). No new code unless the
-friction blocks the session — friction findings are first-class deliverables.
+### R1 — Dogfood — FIRST BATCH DONE (2026-09-16)
+12 real Pi + deepseek-v4-flash sessions through the full stack (enforce+undo,
+tier-gated), on a lab project with per-task hidden acceptance tests that decide
+keep/revert mechanically. Harness: `test/corpus/real-corpus.sh` (one pty per
+trial for the B7 witnessed-tty rule; planted bugs for fix-tasks).
 
-### R2 — Re-evaluate on real spines
-Rerun the pre-registered criteria: trust kept-vs-reverted marginals (demote to
-gate-mechanism if no separation), K2 radar FP on real benign sessions
-(advisory-forever already), campaign silence on benign weeks, memory recall
-usage. Record everything.
+The first attempt at this exposed a real composition bug rather than producing
+data: the tier-floor forced `net`, the B8.2 broker turned that into a real IP
+restriction, and a tier-0 project's agent could not reach its API — no edits,
+auto-revert, trust stays 0, unrecoverable deadlock. Four of twelve trials were
+bricked by this, not failed. Fixed (`5dd19a3`): net is not forced at any tier
+(enforce+undo remain the floor). A second bug rode along: the CLI read the
+honeypot port from the wrong JSON field, so `--net` silently no-opped.
+
+### R2 — Re-evaluate on real spines — FIRST RESULTS
+| Criterion | Scripted V3 | Real sessions (n=12) | Verdict |
+|---|---|---|---|
+| K1 trust marginals | PASS | **PASS** — kept +1.0 each (n=10), reverted −30/−29 (n=2), correct signs both arms, ledger rows present | survives real data |
+| K2 radar FP | 47% (post-fix) | **70%** (7/10 kept flagged, leave-one-out with the real Prototype math) | advisory-forever confirmed; real sessions are *worse* than the scripted corpus |
+| K3 campaign | PASS (scripted) | **FAIL, corrected** — two isolated reverts 8 kept sessions apart were reported as two 1-session "campaigns". Minimum run is now 2 consecutive bad sessions | detector fixed; re-measure next batch |
+| K4 memory recall | PASS (scripted) | **fixed** — the tty gate contradicted its own comment and blocked read-only recall for humans outside the launching terminal | read ops removed from the gate |
+
+K1 is the headline: the pre-registered trust criterion holds on real LLM
+sessions, not just scripted ones. K2 is honestly dead as a detector (V3
+demoted it; real data makes it worse). K3 and K4 were real bugs found by the
+corpus doing its job.
+
+New probe: `crates/castellan-radar/examples/radar_loo.rs` — leave-one-out radar
+measurement. The daemon folds kept sessions into the project prototype, so
+querying a kept session against the live prototype compares it with itself
+(cosine ≈ 1.0 by construction). The probe removes that bias.
 
 ### R3 — Cross-machine
 Repeat a smaller batch on .227 (kernel 7.1.8). The only prior cross-kernel data
 is the portability pass; this extends it to the behavioral layer.
 
 **Kill criterion:** trust fails to separate on real sessions → demote per
-pre-registration. **Honesty:** cooperative agent, single user, small N; no
-adversarial claims. Findings are descriptive, not significance claims.
+pre-registration. **Honesty:** cooperative agent, single user, small N (12); no
+adversarial claims. Findings are descriptive, not significance claims. The
+corpus is one model on one project shape — not a fleet measurement.
+
+**Still open:** the corpus is 12 sessions, one model, one project. The next
+batch should grow N, vary the project shape, and re-measure K3 after the
+minimum-run fix. Nothing here is adversarial-validated.
 
 ---
 

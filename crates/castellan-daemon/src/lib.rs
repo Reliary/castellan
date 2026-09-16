@@ -2488,14 +2488,20 @@ impl Daemon {
         .collect();
       (low, cold, tier, granted)
     };
-    // tiers 0-1: enforce+undo+net regardless of flags (trust was
-    // earned down — full fail-closed containment). Cold: undo forced
-    // only; net is NOT forced — Landlock ABI4 net rules are port-
-    // scoped, so allowing the LLM API (443) also allows 443 exfil,
-    // and forcing net would break every LLM harness cold start. The
-    // canary honeypot remains the exfil detector (C10a posture).
+    // tiers 0-1: enforce+undo forced regardless of flags (trust was
+    // earned down — full fail-closed containment). net is NOT forced at
+    // any tier: Landlock ABI4 net rules are port-scoped, so allowing the
+    // LLM API (443) also allows 443 exfil, and forcing net denies the
+    // API itself — the agent cannot run, produces no edits, gets
+    // auto-reverted, and the project can never earn trust back. This is
+    // an unrecoverable deadlock, found live by real-session dogfooding
+    // (2026-09-16): the cold branch already avoided it (8d6ca8b) but the
+    // low-trust branch still forced net, and the B8.2 broker turned the
+    // silently-skipped flag into a real IP restriction. Egress remains
+    // detect-not-prevent (canary honeypot, C10a); the floor is the
+    // filesystem envelope + undo + canaries.
     let (enforce, undo, net) = if low_trust && granted.is_empty() {
-      (true, true, true)
+      (true, true, net)
     } else if cold_trust && granted.is_empty() {
       (enforce, true, net)
     } else {

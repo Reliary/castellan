@@ -506,7 +506,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   }
   // trust floor coupling: the daemon may have forced flags regardless
   // of what the launcher requested (tiers 0-1 fail-closed unless a
-  // human grant was consumed; cold projects force undo+net)
+  // human grant was consumed; cold projects force undo)
   let profile = serde_json::from_str::<serde_json::Value>(&resp)
     .ok()
     .and_then(|v| v.get("extra").and_then(|e| e.get("profile")).cloned());
@@ -524,10 +524,11 @@ fn launch(args: &[String], sock: &str) -> ! {
     .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
     .unwrap_or_default();
   if forced {
-    eprintln!("castellan: trust tier <= 1 — forcing enforce+undo+net (fail-closed)");
+    eprintln!("castellan: trust tier <= 1 — forcing enforce+undo (fail-closed)");
     enforce = true;
     undo = true;
-    net = true;
+    // net is not forced at any tier: it denies the LLM API and deadlocks
+    // the project at tier 0 (see the daemon spawn comment).
   } else if cold_forced_undo {
     eprintln!("castellan: no trust history — forcing undo for this first session (keep or undo to earn the default)");
     undo = true;
@@ -607,10 +608,21 @@ fn launch(args: &[String], sock: &str) -> ! {
     }
     let mut policy = castellan_policy::Policy::new(session, harness, project.to_path_buf());
     if net {
-      let port = rpc(sock, &serde_json::json!({ "op": "honeypot_port" }));
-      let port: u16 = serde_json::from_str(&port)
+      let resp = rpc(sock, &serde_json::json!({ "op": "honeypot_port" }));
+      // The daemon returns the port under `extra` (Response::with_extra);
+      // reading a top-level "port" silently yielded 0 and the net half of
+      // the policy was skipped while the CLI claimed the honeypot was
+      // detached (found by real-session dogfooding 2026-09-16). Accept
+      // both shapes.
+      let port: u16 = serde_json::from_str::<serde_json::Value>(&resp)
         .ok()
-        .and_then(|v: serde_json::Value| v["port"].as_u64().map(|p| p as u16))
+        .and_then(|v| {
+          v.get("extra")
+            .and_then(|e| e.get("port"))
+            .or_else(|| v.get("port"))
+            .and_then(|p| p.as_u64())
+            .map(|p| p as u16)
+        })
         .unwrap_or(0);
       if port == 0 {
         eprintln!("--net requested but daemon honeypot is detached; continuing WITHOUT net lockdown");

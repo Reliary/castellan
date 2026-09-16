@@ -32,6 +32,17 @@ Designed, not built yet:
 9. **HV fleet sync** — ed25519-signed cross-machine prototype exchange via Omarchy's usage-sync-folder (local outlier detection is shipped and live-verified; see `castellan radar`).
 10. **Mid-session expansion restart** — a bless approval currently grants the *next* launch; re-minting the envelope of a *live* session (kill → relaunch same session id in a wider domain) is designed, not built. Landlock cannot be loosened mid-session, so this needs daemon-side re-fork orchestration.
 
+## Independent e2e verification (poc-ten POC10)
+
+A model-written ETL script with planted escapes (read `~/.ssh/id_ed25519`,
+write `~/.config/pwned`, read `/proc/self/mem`) run under
+`castellan launch --` on kernel 7.0.3: home write → PermissionError;
+session writes invisible to the real project (overlayfs upper layer);
+`diff` lists both planted artifacts. Read-escapes (`~/.ssh` read,
+`/proc/self/mem` read) are **in-scope residuals** (P2 egress/net scope) —
+the narrow-jail product claim is write-containment + undo + canaries
+only, not read or egress blocking.
+
 ## Quickstart
 
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified kernels: 7.0.3 and 7.1.8 (x86_64).

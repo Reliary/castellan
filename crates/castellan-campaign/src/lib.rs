@@ -124,6 +124,16 @@ pub fn detect_campaigns(project: &Path, state_home: &Path) -> std::io::Result<Ca
     campaigns.push(c);
   }
 
+  // Real-session correction (2026-09-16): a single isolated revert is
+  // NOT a campaign — trust already records it, and reporting it as a
+  // "campaign" turned two unrelated real reverts (with 8 kept sessions
+  // between them) into two false campaigns. A campaign is a *pattern*:
+  // at least MIN_CAMPAIGN_SESSIONS consecutive bad sessions with no
+  // good session in between. The scripted V3 corpus never caught this
+  // because its negative arm was a contiguous run.
+  const MIN_CAMPAIGN_SESSIONS: usize = 2;
+  campaigns.retain(|c| c.sessions.len() >= MIN_CAMPAIGN_SESSIONS);
+
   // severity + dominant signal per campaign
   for c in &mut campaigns {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -195,14 +205,27 @@ mod tests {
   }
 
   #[test]
-  fn single_bad_session_is_a_campaign() {
+  fn single_revert_is_not_a_campaign() {
+    // Real-session correction: an isolated revert is a trust event, not
+    // a campaign. Minimum run is 2 consecutive bad sessions.
     let home = tmp_home();
     let proj = Path::new("/tmp/campaign-proj");
     let mut db = TrustDb::open(&home).unwrap();
     db.apply(proj, &ev(100, "s1", Signal::UserRevert)).unwrap();
     let report = detect_campaigns(proj, &home).unwrap();
+    assert_eq!(report.campaigns.len(), 0);
+  }
+
+  #[test]
+  fn two_consecutive_reverts_are_a_campaign() {
+    let home = tmp_home();
+    let proj = Path::new("/tmp/campaign-proj1b");
+    let mut db = TrustDb::open(&home).unwrap();
+    db.apply(proj, &ev(100, "s1", Signal::UserRevert)).unwrap();
+    db.apply(proj, &ev(150, "s2", Signal::UserRevert)).unwrap();
+    let report = detect_campaigns(proj, &home).unwrap();
     assert_eq!(report.campaigns.len(), 1);
-    assert_eq!(report.campaigns[0].sessions, vec!["s1"]);
+    assert_eq!(report.campaigns[0].sessions, vec!["s1", "s2"]);
     assert_eq!(report.campaigns[0].severity, "medium");
   }
 
@@ -212,12 +235,14 @@ mod tests {
     let proj = Path::new("/tmp/campaign-proj2");
     let mut db = TrustDb::open(&home).unwrap();
     db.apply(proj, &ev(100, "s1", Signal::UserRevert)).unwrap();
+    db.apply(proj, &ev(150, "s1b", Signal::UserRevert)).unwrap();
     db.apply(proj, &ev(200, "s2", Signal::CleanSession)).unwrap();
     db.apply(proj, &ev(300, "s3", Signal::UserRevert)).unwrap();
+    db.apply(proj, &ev(350, "s3b", Signal::UserRevert)).unwrap();
     let report = detect_campaigns(proj, &home).unwrap();
     assert_eq!(report.campaigns.len(), 2);
-    assert_eq!(report.campaigns[0].sessions, vec!["s1"]);
-    assert_eq!(report.campaigns[1].sessions, vec!["s3"]);
+    assert_eq!(report.campaigns[0].sessions, vec!["s1", "s1b"]);
+    assert_eq!(report.campaigns[1].sessions, vec!["s3", "s3b"]);
   }
 
   #[test]

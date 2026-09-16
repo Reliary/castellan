@@ -516,12 +516,15 @@ impl Daemon {
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
       // Cert/Radar/MemoryRecall/Replay are read-only evidence and
-      // agent-allowed — a tty requirement on human callers protected
-      // nothing (the agent can read its own cert) and blocked
-      // headless operators. Read ops need no terminal proof.
-      | Request::Replay { session, .. }
-      | Request::Radar { session, .. }
-      | Request::MemoryRecall { session } => Some(session),
+      // agent-allowed. The tty gate applied only to human callers, but
+      // it protected nothing — the agent can call these anyway without
+      // a tty check (agent_allowed short-circuits before this) — while
+      // blocking a human from reading evidence outside the launching
+      // terminal. Real-session validation (2026-09-16) caught the
+      // contradiction: the comment said "read ops need no terminal
+      // proof" while the code still gated three of the four. Cert was
+      // removed in B7; the rest are removed here.
+      => Some(session),
       // session-less human-only ops (thaw/kill/freeze ALL): require a
       // daemon-witnessed launcher tty (B7). tty!=0 alone was spoofable —
       // an escaped process can allocate a fresh pty. The caller's tty

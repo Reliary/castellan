@@ -4,7 +4,7 @@
 
 Castellan is a Linux-native agent safety system that confines, observes, and proves what AI coding agents do on your machine — at the kernel level, where prompt injection cannot reach. It is being designed as a contribution to [Omarchy](https://github.com/basecamp/omarchy) (DHH's Arch + Hyprland distro), but the core is reusable on any systemd + Landlock Linux.
 
-> **Status: working.** P0–P4 are implemented and acceptance-tested on Linux 7.x / Landlock ABI 8: session substrate + freeze (P0), the envelope floor with audit + enforce launch (P1), surgical undo + canary credentials (P2), earned autonomy (trust engine + placebo-proof pipeline + bless-broker, P3), and proof-carrying sessions (certificate assembly + kill-criterion benchmarks, P4). P5 (HV radar, engfield, sentinel) is designed but not built. Every claim below is scoped accordingly; see [docs/ROADMAP.md](docs/ROADMAP.md) for phase status, [docs/PRIOR_ART.md](docs/PRIOR_ART.md) for what already exists elsewhere, and [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for how claims get earned.
+> **Status: working.** Built and acceptance-tested on Linux 7.x / Landlock ABI 8–9: session substrate + freeze (P0), the envelope floor with audit + enforce launch, now the default (P1/B6), surgical undo + canary credentials (P2), earned autonomy (trust engine + placebo-proof pipeline + bless-broker, P3), proof-carrying sessions with hash-chained spines and ed25519 signing (P4/chapter 5), trust→envelope coupling and the fail-closed floor (P6), the frontier-round socket identity + timer sweep (B7), the seccomp egress broker (B8), and real-session validation (chapter 2, K1 holds). **Demoted honestly:** HV radar shipped then was demoted to advisory-forever by its own kill criterion (47% FP on the scripted corpus, 70% on real sessions); the seq-engine port was killed before building (probe). **Not built:** HV fleet sync, mid-session expansion restart. Every claim below is scoped accordingly; see [docs/ROADMAP.md](docs/ROADMAP.md) for phase status, [docs/PRIOR_ART.md](docs/PRIOR_ART.md) for what already exists elsewhere, and [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for how claims get earned.
 
 ## The problem in one sentence
 
@@ -24,13 +24,16 @@ Shipped:
 4. **Surgical undo** — per-session rollback via overlayfs upper layer (`castellan launch --undo`), so one bad agent doesn't force a whole-disk rollback. `castellan diff/undo/keep` shows, discards, or commits the session's changes.
 5. **Canary credentials** — fake credentials planted in the envelope, wired to a localhost honeypot. Using a canary IS the trigger: trip → event logged + session frozen. Egress lockdown (Landlock ABI 4 net rules) denies all TCP connect except the honeypot port.
 6. **Earned autonomy** — per-project trust score (EWMA, tiers 0–4) fed by kernel-witnessed signals: placebo-controlled proof (+10, the only positive signal), clean session (+1), user revert (−30), envelope escape (−20), canary hit (−50). The trust tier is consulted at spawn: tiers 0–1 run fail-closed (enforce + undo + net forced, launcher flags ignored — the agent cannot self-widen), tiers 2+ run with the launcher's flags. Bless-broker approves record daemon-side one-shot grants (in-memory, never on disk where the agent could forge them) that override the floor for one expansion.
-7. **Proof-carrying sessions** — `castellan cert <session>` assembles a ProofCertificate from kernel-witnessed state: bounds proof (event spine), placebo + test evidence (trust ledger, session-scoped). Quality labels STRONG/MODERATE/WEAK/NON-EVIDENTIAL. Kill-criterion benchmarks pass: 0/20 known-bad FN, 0/20 known-good FN, monotonic tier↔revert (ρ=0.900).
+7. **Proof-carrying sessions** — `castellan cert <session>` assembles a ProofCertificate from kernel-witnessed state: bounds proof (event spine), placebo + test evidence (trust ledger, session-scoped), the spine hash-chain verdict, and an ed25519 signature when the daemon has a key. Quality labels STRONG/MODERATE/WEAK/NON-EVIDENTIAL. `castellan verify <cert.json>` re-checks the signature and chain. Kill-criterion benchmarks pass: 0/20 known-bad FN, 0/20 known-good FN, monotonic tier↔revert (ρ=0.900 on a signal-simulated corpus; K1 holds on real sessions). **Signature scope, stated in the artifact:** integrity/provenance within a boot, not non-repudiation against a same-uid adversary (see docs/s0-key-extraction-probe.md).
 8. **Forensic replay** — `castellan replay <session> <narrower-project>` re-classifies the recorded event spine against an alternate envelope (static re-classification, never re-execution) and reports the permissive-case delta: writes the original envelope allowed that a narrower one would deny.
+9. **Egress broker** — `castellan launch --net` installs a seccomp user-notification broker that denies public TCP/UDP to an IP allowlist (public connect → EPERM). Loopback and non-manager unix sockets stay allowed; the systemd private socket and session bus are denied, closing the `systemd-run` escape route. Detection/denial for the LLM-agent threat model, not a racing-thread boundary (TOCTOU documented).
 
 Designed, not built yet:
 
-9. **HV fleet sync** — ed25519-signed cross-machine prototype exchange via Omarchy's usage-sync-folder (local outlier detection is shipped and live-verified; see `castellan radar`).
-10. **Mid-session expansion restart** — a bless approval currently grants the *next* launch; re-minting the envelope of a *live* session (kill → relaunch same session id in a wider domain) is designed, not built. Landlock cannot be loosened mid-session, so this needs daemon-side re-fork orchestration.
+10. **HV fleet sync** — ed25519-signed cross-machine prototype exchange (local outlier detection shipped, then demoted to advisory by its kill criterion; see `castellan radar`).
+11. **Mid-session expansion restart** — a bless approval currently grants the *next* launch; re-minting the envelope of a *live* session is designed, not built, because Landlock cannot be loosened mid-session.
+12. **Real egress proxy + credential keyring** — a credential-injecting proxy so agents can reach allowlisted hosts while holding only canaries. Today: no real-credential path exists at all (docs/components/egress-proxy.md is design intent).
+13. **Merkle transparency log** — the spine chain + per-cert signature are built; cross-machine append-only signed tree heads are not.
 
 ## Independent e2e verification (poc-ten POC10)
 
@@ -57,6 +60,8 @@ castellan freeze && castellan thaw         # the panic button
 castellan launch --undo -- claude          # every write lands in a discardable overlay
 castellan diff <session>                    # what did it change?
 castellan keep <session>                   # commit it, or `undo` to throw it away
+castellan cert <session>                   # signed ProofCertificate (bounds, placebo, chain)
+castellan verify cert.json                 # re-check the signature + spine chain
 ```
 
 `--harness` is auto-detected from the command (claude, codex, pi, opencode, aider, cursor-agent, gemini, crush); unknown harnesses still get the envelope, just no harness-state protection. `--no-enforce` opts out loudly (audit mode) — for debugging only.

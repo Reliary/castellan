@@ -315,8 +315,11 @@ savings/security claims beyond the recorded measurements.
 - **V5:** audit-on-change — daemon-touching changes re-run v3-corpus + p0/p1/p2/
   p9-stack before merge (documented as process, then CI if feasible).
 - **Doc overstatements (found 2026-09-05):**
-  - `egress-proxy.md` claims "loopback only via Landlock TCP rules" — Landlock
-    net rules are port-scoped, not address-scoped. Rewrite to the honest
-    mechanism once B8.1 exists.
-  - `THREAT_MODEL.md` line ~139 says processes can read "the signing key" — C9
-    is design-only, no key exists. Correct the status.
+  - `egress-proxy.md` "loopback only via Landlock TCP rules" — **corrected
+    2026-09-17** (eb7e276): port-scoped, not address-scoped; component marked
+    designed-not-built; the B8 broker is the built mechanism.
+  - `THREAT_MODEL.md` "signing key" readable — **corrected 2026-09-17**: the key
+    now exists (chapter 5) and is memory-only + non-dumpable; C14 narrowed,
+    A9a added.
+  - `proof-carrying.md` schema drift + "not built yet" — **corrected
+    2026-09-17** (596aac5).

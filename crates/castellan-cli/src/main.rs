@@ -30,6 +30,7 @@ fn main() {
     "trust" => trust_req(&args[1..]),
     "bless" => bless_req(&args[1..]),
     "cert" => cert_req(&args[1..]),
+    "verify" => verify_req(&args[1..]),
     "replay" => replay_req(&args[1..]),
     "radar" => radar_req(&args[1..]),
     "campaign" => campaign_req(&args[1..]),
@@ -355,6 +356,55 @@ fn cert_req(args: &[String]) -> serde_json::Value {
     std::process::exit(2);
   };
   serde_json::json!({"op": "cert", "session": session})
+}
+
+/// S2: verify a certificate. Reads the cert JSON from a file (or `-`
+/// for stdin). The cert carries its own public key; `--key <hex>` pins
+/// it.
+fn verify_req(args: &[String]) -> serde_json::Value {
+  let mut file: Option<String> = None;
+  let mut expected: Option<String> = None;
+  let mut i = 0;
+  while i < args.len() {
+    match args[i].as_str() {
+      "--key" => {
+        i += 1;
+        expected = args.get(i).cloned();
+      }
+      "-h" | "--help" => {
+        eprintln!("usage: castellan verify <cert.json|-> [--key <hex-public-key>]");
+        std::process::exit(0);
+      }
+      other => file = Some(other.to_string()),
+    }
+    i += 1;
+  }
+  let Some(file) = file else {
+    eprintln!("usage: castellan verify <cert.json|-> [--key <hex-public-key>]");
+    std::process::exit(2);
+  };
+  let cert = if file == "-" {
+    use std::io::Read;
+    let mut s = String::new();
+    if std::io::stdin().read_to_string(&mut s).is_err() {
+      eprintln!("verify: could not read certificate from stdin");
+      std::process::exit(1);
+    }
+    s
+  } else {
+    match std::fs::read_to_string(&file) {
+      Ok(s) => s,
+      Err(e) => {
+        eprintln!("verify: cannot read {file}: {e}");
+        std::process::exit(1);
+      }
+    }
+  };
+  let mut v = serde_json::json!({"op": "verify_cert", "cert": cert});
+  if let Some(k) = expected {
+    v["expected_public"] = serde_json::Value::String(k);
+  }
+  v
 }
 
 fn bless_req(args: &[String]) -> serde_json::Value {
@@ -1006,6 +1056,46 @@ fn render(line: &str) -> String {
           }
           out.push_str("  scope: session-touched files only; absence of findings is NOT evidence of safety\n");
         }
+        if let Some(chain) = cert.get("spine_chain") {
+          let checked = chain.get("checked").and_then(|x| x.as_u64()).unwrap_or(0);
+          let intact = chain.get("intact").and_then(|x| x.as_bool()).unwrap_or(false);
+          if intact {
+            out.push_str(&format!("spine chain: intact ({checked} events)\n"));
+          } else {
+            let at = chain.get("broken_at").and_then(|x| x.as_str()).unwrap_or("?");
+            out.push_str(&format!("spine chain: BROKEN ({checked} checked) at {at}\n"));
+          }
+        } else {
+          out.push_str("spine chain: none (no chained spine)\n");
+        }
+        match cert.get("signature") {
+          Some(sig) => {
+            let pk = sig.get("public_key").and_then(|x| x.as_str()).unwrap_or("?");
+            out.push_str(&format!("signature: ed25519 present (pub {}...)\n", &pk[..pk.len().min(16)]));
+          }
+          None => out.push_str("signature: UNSIGNED (daemon has no key)\n"),
+        }
+      }
+      if let Some(ve) = v.get("extra").and_then(|e| e.get("verify")) {
+        let signed = ve.get("signed").and_then(|x| x.as_bool()).unwrap_or(false);
+        let sig_ok = ve.get("signature_ok").and_then(|x| x.as_bool()).unwrap_or(false);
+        let chain = ve.get("spine_chain_ok").and_then(|x| x.as_bool());
+        let checked = ve.get("spine_chain_checked").and_then(|x| x.as_u64()).unwrap_or(0);
+        out.push_str(&format!(
+          "signature: {}\n",
+          if sig_ok { "VALID" } else if signed { "INVALID" } else { "UNSIGNED" }
+        ));
+        if let Some(err) = ve.get("signature_error").and_then(|x| x.as_str()) {
+          out.push_str(&format!("  error: {err}\n"));
+        }
+        match chain {
+          Some(true) => out.push_str(&format!("spine chain: intact ({checked} events)\n")),
+          Some(false) => out.push_str("spine chain: BROKEN\n"),
+          None => out.push_str("spine chain: none\n"),
+        }
+        if let Some(scope) = ve.get("scope").and_then(|x| x.as_str()) {
+          out.push_str(&format!("scope: {scope}\n"));
+        }
       }
       if let Some(rp) = v.get("extra").and_then(|e| e.get("replay")) {
         let verdict = rp.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
@@ -1183,7 +1273,8 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan bless request --session S --want W [--reason R]");
   eprintln!("  castellan bless approve <nonce>   approve an expansion (human only)");
   eprintln!("  castellan bless reject <nonce>    reject an expansion");
-  eprintln!("  castellan cert <session>          assemble a ProofCertificate");
+  eprintln!("  castellan cert <session>          assemble a ProofCertificate (signed when the daemon has a key)");
+  eprintln!("  castellan verify <cert.json|-> [--key <hex>]   verify a certificate's signature + chain");
   eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
   eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
   eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");

@@ -247,11 +247,33 @@ pub struct Daemon {
   /// "session:unit" so a persistent unit is reported once, not every
   /// sweep.
   swept: Arc<Mutex<FxHashSet<String>>>,
+  /// S2 (chapter 5): ed25519 signing key, generated at daemon start and
+  /// held only in memory (the process is made non-dumpable first, per
+  /// the S0 probe). None = key generation failed; certificates are then
+  /// assembled unsigned and say so.
+  signing_key: Option<Arc<castellan_proof::signing::SigningKey>>,
 }
 
 impl Daemon {
   pub fn new() -> std::io::Result<Self> {
     let state = Self::state_dir();
+    // S2/S0: make this process non-dumpable and core-dump-free BEFORE
+    // generating the signing key, so the key cannot be recovered from a
+    // core by a same-uid agent (verified vector in the S0 probe).
+    castellan_proof::signing::SigningKey::harden_process();
+    let signing_key = match castellan_proof::signing::SigningKey::generate() {
+      Ok(k) => {
+        eprintln!(
+          "castellan-daemon signing key ready (ed25519, memory-only, pub={})",
+          &k.public_hex()[..16]
+        );
+        Some(Arc::new(k))
+      }
+      Err(e) => {
+        eprintln!("castellan-daemon: signing key unavailable ({e}) — certificates will be UNSIGNED");
+        None
+      }
+    };
     let trust = match TrustDb::open(&state) {
       Ok(t) => Arc::new(Mutex::new(t)),
       Err(e) => {
@@ -324,6 +346,7 @@ impl Daemon {
       voice: Arc::new(Mutex::new(FxHashMap::default())),
       trusted_ttys: Arc::new(Mutex::new(FxHashMap::default())),
       swept: Arc::new(Mutex::new(FxHashSet::default())),
+      signing_key,
     };
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
@@ -729,6 +752,9 @@ impl Daemon {
       Request::BlessReject { nonce } => self.bless_reject(&nonce),
       Request::BlessShow => self.bless_show(),
       Request::Cert { session } => self.cert(&session),
+    Request::VerifyCert { cert, expected_public } => {
+      self.verify_cert(&cert, expected_public.as_deref())
+    }
       Request::Replay { session, narrower_project } => self.replay(&session, &narrower_project),
       Request::PolicyCheck { project, candidate_project } => {
         self.policy_check(&project, &candidate_project)
@@ -1464,17 +1490,56 @@ impl Daemon {
         }
       }
     };
-    match castellan_proof::certificate::assemble_certificate(
-      session,
-      &project,
-      &Self::state_dir(),
-    ) {
+    let cert = match &self.signing_key {
+      Some(key) => castellan_proof::certificate::assemble_certificate_signed(
+        session,
+        &project,
+        &Self::state_dir(),
+        key,
+      ),
+      None => castellan_proof::certificate::assemble_certificate(
+        session,
+        &project,
+        &Self::state_dir(),
+      ),
+    };
+    match cert {
       Ok(cert) => {
         let json = serde_json::to_value(&cert).unwrap_or(serde_json::Value::Null);
         Response::ok().with_extra("cert", json)
       }
       Err(e) => Response::err(format!("certificate assembly failed: {e}")),
     }
+  }
+
+  /// S2: verify a certificate's signature and spine chain. Takes the
+  /// certificate JSON as sent by a caller (self-contained: the public
+  /// key is embedded). `expected_public` pins the key per boot when the
+  /// caller knows it.
+  fn verify_cert(&self, cert_json: &str, expected_public: Option<&str>) -> Response {
+    let cert: castellan_proof::certificate::ProofCertificate = match serde_json::from_str(cert_json)
+    {
+      Ok(c) => c,
+      Err(e) => return Response::err(format!("malformed certificate: {e}")),
+    };
+    let canonical = castellan_proof::certificate::cert_canonical(&cert);
+    let signature_ok = match &cert.signature {
+      Some(sig) => castellan_proof::signing::verify(&canonical, sig, expected_public),
+      None => Err("certificate is unsigned".to_string()),
+    };
+    let chain_ok = cert.spine_chain.as_ref().map(|c| c.intact);
+    Response::ok().with_extra(
+      "verify",
+      serde_json::json!({
+        "session": cert.session,
+        "signed": cert.signature.is_some(),
+        "signature_ok": signature_ok.is_ok(),
+        "signature_error": signature_ok.err(),
+        "scope": cert.signature.as_ref().map(|s| s.scope.clone()),
+        "spine_chain_ok": chain_ok,
+        "spine_chain_checked": cert.spine_chain.as_ref().map(|c| c.checked),
+      }),
+    )
   }
 
   fn trust_score(&self, project: &Path) -> Response {

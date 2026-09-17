@@ -207,6 +207,14 @@ pub enum Request {
   Cert {
     session: SessionId,
   },
+  /// S2: verify a certificate's signature and spine chain. The
+  /// certificate is self-contained (the signing public key is embedded);
+  /// `expected_public` optionally pins the key.
+  VerifyCert {
+    cert: String,
+    #[serde(default)]
+    expected_public: Option<String>,
+  },
   /// Forensic replay: re-classify a session's recorded events against a
   /// narrower envelope (permissive-case delta).
   Replay {
@@ -367,7 +375,35 @@ pub struct Event {
   pub kind: String,
   pub path: String,
   pub verdict: String,
+  /// S1 (chapter 5): hash chain. `prev` is the hex sha256 of the
+  /// previous event's canonical bytes, or 64 zeros for the first
+  /// event. `hash` is sha256(prev || canonical_event_without_hash).
+  /// The spine is write-denied to the agent (Landlock), and the chain
+  /// makes any post-hoc edit of an earlier line detectable: editing a
+  /// line changes its hash, which breaks every following `prev`.
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub prev: String,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub hash: String,
 }
+
+/// S1: canonical bytes an event hashes over — every field EXCEPT the
+/// hash itself (and prev is included, so the chain is bound).
+fn event_canonical(ev: &Event) -> String {
+  format!(
+    "{}|{}|{}|{}|{}|{}",
+    ev.ts, ev.session, ev.kind, ev.path, ev.verdict, ev.prev
+  )
+}
+
+fn hex_sha256(s: &str) -> String {
+  use sha2::{Digest, Sha256};
+  let d = Sha256::digest(s.as_bytes());
+  d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub const ZERO_HASH: &str =
+  "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub struct EventSink {
   path: PathBuf,
@@ -381,25 +417,54 @@ impl EventSink {
     Ok(Self { path: dir.join(format!("{session}.jsonl")), session: session.to_owned() })
   }
 
+  /// The current chain tip: the hash of the last event on the active
+  /// spine, or ZERO_HASH on an empty/absent spine. Reads only the
+  /// active (non-rotated) segment — a rotation starts a fresh segment
+  /// whose first event links to its own ZERO_HASH, so each segment is
+  /// independently verifiable (segments are sealed at their boundaries
+  /// by the chain-head file the daemon writes).
+  fn tip(&self) -> io::Result<String> {
+    let content = match fs::read_to_string(&self.path) {
+      Ok(c) => c,
+      Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ZERO_HASH.to_owned()),
+      Err(e) => return Err(e),
+    };
+    Ok(content
+      .lines()
+      .rev()
+      .find_map(|l| serde_json::from_str::<Event>(l).ok())
+      .map(|e| e.hash)
+      .filter(|h| !h.is_empty())
+      .unwrap_or_else(|| ZERO_HASH.to_owned()))
+  }
+
   pub fn emit(&self, kind: &str, path: &str, verdict: &str) -> io::Result<()> {
-    let ev = Event {
+    let mut ev = Event {
       ts: now_unix(),
       session: self.session.clone(),
       kind: kind.to_owned(),
       path: path.to_owned(),
       verdict: verdict.to_owned(),
+      prev: self.tip()?,
+      hash: String::new(),
     };
+    ev.hash = hex_sha256(&event_canonical(&ev));
     // rotation: a chatty session must not grow the spine unbounded
     // (2MB+ jsonl observed). Rotate to .1 (previous .1 is dropped).
     if let Ok(meta) = fs::metadata(&self.path) {
       if meta.len() > SPINE_MAX_BYTES {
         let _ = fs::rename(&self.path, self.path.with_extension("jsonl.1"));
+        // new segment: link its first event to ZERO, not to the
+        // rotated tip (the rotated segment carries its own head)
+        ev.prev = ZERO_HASH.to_owned();
+        ev.hash = hex_sha256(&event_canonical(&ev));
       }
     }
     let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
     serde_json::to_writer(&mut f, &ev)?;
     f.write_all(b"\n")
   }
+
 
   pub fn read_all(&self) -> io::Result<Vec<Event>> {
     let primary = match fs::read_to_string(&self.path) {
@@ -420,6 +485,81 @@ impl EventSink {
       .collect();
     events.sort_by_key(|e| e.ts);
     Ok(events)
+  }
+
+  /// S1: verify the hash chain over the active spine. Returns the
+  /// number of events checked and the verified tip hash, or an error
+  /// naming the first broken link (edited/deleted/reordered line).
+  /// Events written before S1 (no `hash` field) are skipped: they
+  /// carry no chain and must not be treated as verified.
+  pub fn verify_chain(&self) -> io::Result<ChainVerdict> {
+    let content = match fs::read_to_string(&self.path) {
+      Ok(c) => c,
+      Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        return Ok(ChainVerdict { checked: 0, tip: ZERO_HASH.to_owned(), broken_at: None })
+      }
+      Err(e) => return Err(e),
+    };
+    let mut prev = ZERO_HASH.to_owned();
+    let mut checked = 0usize;
+    for (i, line) in content.lines().enumerate() {
+      let Ok(ev) = serde_json::from_str::<Event>(line) else {
+        return Ok(ChainVerdict {
+          checked,
+          tip: prev,
+          broken_at: Some(format!("line {}: unparseable", i + 1)),
+        });
+      };
+      if ev.hash.is_empty() {
+        // pre-chain event: not verifiable, and it breaks continuity
+        // for anything after it
+        if checked > 0 {
+          return Ok(ChainVerdict {
+            checked,
+            tip: prev,
+            broken_at: Some(format!("line {}: unchained (pre-S1) event in chained spine", i + 1)),
+          });
+        }
+        continue;
+      }
+      if ev.prev != prev {
+        let tip_short = prev[..prev.len().min(12)].to_owned();
+        return Ok(ChainVerdict {
+          checked,
+          tip: prev,
+          broken_at: Some(format!(
+            "line {}: prev={} does not match tip={}",
+            i + 1,
+            &ev.prev[..ev.prev.len().min(12)],
+            tip_short
+          )),
+        });
+      }
+      let expect = hex_sha256(&event_canonical(&ev));
+      if expect != ev.hash {
+        return Ok(ChainVerdict {
+          checked,
+          tip: prev,
+          broken_at: Some(format!("line {}: content hash mismatch (edited line)", i + 1)),
+        });
+      }
+      prev = ev.hash.clone();
+      checked += 1;
+    }
+    Ok(ChainVerdict { checked, tip: prev, broken_at: None })
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainVerdict {
+  pub checked: usize,
+  pub tip: String,
+  pub broken_at: Option<String>,
+}
+
+impl ChainVerdict {
+  pub fn intact(&self) -> bool {
+    self.broken_at.is_none()
   }
 }
 
@@ -496,5 +636,56 @@ mod tests {
   #[test]
   fn unknown_signals_default_to_silent() {
     assert_eq!(response_tier("something_new"), ResponseTier::Silent);
+  }
+
+  fn tmp_state() -> PathBuf {
+    let ts = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_nanos())
+      .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("castellan-core-chain-{ts}"));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  #[test]
+  fn spine_chain_verifies_and_detects_edits() {
+    let state = tmp_state();
+    let sink = EventSink::for_session(&state, "s1").unwrap();
+    sink.emit("fs_write", "/proj/a", "allow").unwrap();
+    sink.emit("fs_write", "/proj/b", "allow").unwrap();
+    sink.emit("canary_trip", "x", "frozen").unwrap();
+
+    let v = sink.verify_chain().unwrap();
+    assert!(v.intact(), "fresh chain must be intact: {:?}", v.broken_at);
+    assert_eq!(v.checked, 3);
+
+    // edit an earlier line's verdict — the chain must break at it
+    let path = state.join("castellan/events/s1.jsonl");
+    let content = fs::read_to_string(&path).unwrap();
+    let tampered = content.replacen("\"allow\"", "\"deny \"", 1);
+    assert_ne!(content, tampered);
+    fs::write(&path, &tampered).unwrap();
+    let v = sink.verify_chain().unwrap();
+    assert!(!v.intact(), "edited line must break the chain");
+    assert!(v.broken_at.unwrap().contains("line 1"));
+  }
+
+  #[test]
+  fn spine_chain_detects_deleted_line() {
+    let state = tmp_state();
+    let sink = EventSink::for_session(&state, "s2").unwrap();
+    sink.emit("fs_write", "/proj/a", "allow").unwrap();
+    sink.emit("fs_write", "/proj/b", "allow").unwrap();
+    sink.emit("fs_write", "/proj/c", "allow").unwrap();
+
+    // delete the middle line: line 3's prev no longer matches line 1
+    let path = state.join("castellan/events/s2.jsonl");
+    let content = fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let kept = format!("{}\n{}\n", lines[0], lines[2]);
+    fs::write(&path, kept).unwrap();
+    let v = sink.verify_chain().unwrap();
+    assert!(!v.intact(), "deleted line must break the chain");
   }
 }

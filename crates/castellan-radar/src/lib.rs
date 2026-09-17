@@ -297,6 +297,8 @@ mod tests {
       kind: kind.into(),
       path: path.into(),
       verdict: verdict.into(),
+      prev: String::new(),
+      hash: String::new(),
     }
   }
 

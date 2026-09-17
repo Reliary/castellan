@@ -14,6 +14,18 @@ use castellan_core::{Event, EventSink};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// S2: canonical bytes a certificate is signed over — deterministic
+/// JSON of the certificate with the signature field absent. `to_string`
+/// on serde_json::Value is stable for a fixed structure (sorted keys),
+/// so both signer and verifier derive identical bytes.
+pub fn cert_canonical(cert: &ProofCertificate) -> Vec<u8> {
+  let mut v = serde_json::to_value(cert).unwrap_or(serde_json::Value::Null);
+  if let Some(obj) = v.as_object_mut() {
+    obj.remove("signature");
+  }
+  serde_json::to_vec(&v).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundsProof {
   pub writes_inside: usize,
@@ -57,7 +69,27 @@ pub struct ProofCertificate {
   /// clean delta (findings-only-negative — no claim either way).
   #[serde(default)]
   pub artifact_scan: Option<ArtifactScan>,
+  /// S1: spine hash-chain verdict at assembly time. None = no chain
+  /// (spine absent or pre-S1 events only). Some = the chain was
+  /// verified; `broken_at` names the first edited/deleted line, if any.
+  #[serde(default)]
+  pub spine_chain: Option<ChainEvidence>,
+  /// S2: detached ed25519 signature over `cert_canonical(self)`. None
+  /// = the daemon has no signing key (unsigned cert — recorded
+  /// honestly, never implied to be signed).
+  #[serde(default)]
+  pub signature: Option<super::signing::CertSignature>,
   pub quality_label: String,
+}
+
+/// S1: the spine chain status embedded in the certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainEvidence {
+  pub checked: usize,
+  pub tip: String,
+  pub intact: bool,
+  #[serde(default)]
+  pub broken_at: Option<String>,
 }
 
 impl ProofCertificate {
@@ -69,10 +101,32 @@ impl ProofCertificate {
 /// Assemble a certificate for a session from kernel-witnessed state.
 /// `state_dir` is the XDG_STATE_HOME root (events live under
 /// `castellan/events/<session>.jsonl`).
+///
+/// `signing_key` (S2): when Some, the certificate is signed with it and
+/// the detached signature is embedded. When None, `signature` is None
+/// and the certificate is honestly unsigned.
 pub fn assemble_certificate(
   session: &str,
   project: &Path,
   state_dir: &Path,
+) -> std::io::Result<ProofCertificate> {
+  assemble_certificate_inner(session, project, state_dir, None)
+}
+
+pub fn assemble_certificate_signed(
+  session: &str,
+  project: &Path,
+  state_dir: &Path,
+  signing_key: &super::signing::SigningKey,
+) -> std::io::Result<ProofCertificate> {
+  assemble_certificate_inner(session, project, state_dir, Some(signing_key))
+}
+
+fn assemble_certificate_inner(
+  session: &str,
+  project: &Path,
+  state_dir: &Path,
+  signing_key: Option<&super::signing::SigningKey>,
 ) -> std::io::Result<ProofCertificate> {
   let sink = EventSink::for_session(state_dir, session)?;
   let spine_path = state_dir.join("castellan/events").join(format!("{session}.jsonl"));
@@ -107,6 +161,22 @@ pub fn assemble_certificate(
   // a clean delta or no scan = None (no claim either way).
   let artifact_scan = read_artifact_scan(state_dir, session);
 
+  // S1: verify the spine hash chain. Include the verdict when at least
+  // one event was checked OR a break was found — a break on the very
+  // first line has checked==0 and must NOT be reported as "no chain".
+  let spine_chain = match sink.verify_chain() {
+    Ok(v) if v.checked > 0 || v.broken_at.is_some() => {
+      let intact = v.intact();
+      Some(ChainEvidence {
+        checked: v.checked,
+        tip: v.tip,
+        intact,
+        broken_at: v.broken_at,
+      })
+    }
+    _ => None,
+  };
+
   let quality_label = match (bounds_verdict, proofs_passed, test_rerun_passed, spine_exists) {
     ("STAYED_IN_BOUNDS", p, t, true) if p > 0 && t => "STRONG",
     ("STAYED_IN_BOUNDS", p, _, true) if p > 0 => "MODERATE",
@@ -115,7 +185,7 @@ pub fn assemble_certificate(
     _ => "NON-EVIDENTIAL",
   };
 
-  Ok(ProofCertificate {
+  let mut cert = ProofCertificate {
     session: session.to_string(),
     project: project.display().to_string(),
     generated_at: castellan_core::now_unix(),
@@ -131,8 +201,14 @@ pub fn assemble_certificate(
     },
     census,
     artifact_scan,
+    spine_chain,
+    signature: None,
     quality_label: quality_label.to_string(),
-  })
+  };
+  if let Some(key) = signing_key {
+    cert.signature = Some(key.sign(&cert_canonical(&cert)));
+  }
+  Ok(cert)
 }
 
 /// Read the P9.2 artifact-scan factor from the session spine. The

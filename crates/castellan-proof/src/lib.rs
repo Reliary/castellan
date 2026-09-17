@@ -9,6 +9,7 @@
 //! Grammar-free: byte-scan counters, no AST, no parsers.
 
 pub mod certificate;
+pub mod signing;
 
 use castellan_ledger::diff_upper;
 use serde::{Deserialize, Serialize};

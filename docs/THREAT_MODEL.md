@@ -49,6 +49,9 @@ The agent tries to disable, widen, or escape the safety system.
 ### A9. Agent replays a stolen proof certificate
 **closed.** ProofCertificates are session-bound: UUID + cgroup start time + ledger hash. The daemon verifies the session actually happened by checking the kernel-witnessed event spine.
 
+### A9a. Agent edits a certificate or the spine it is built from
+**closed (chapter 5, built 2026-09-17).** The spine is hash-chained (S1): every event carries `prev`/`hash`, and `verify_chain` names the first edited/deleted/reordered line. Certificates are signed with an in-process ed25519 key (S2), and `castellan verify` rejects an edited certificate. The spine, `sessions/`, and `trust.db` are write-denied to the agent (Landlock), so the anchor cannot be rewritten. **Scope, stated in the artifact:** the signature proves integrity/provenance within a boot, not non-repudiation against a same-uid adversary with kernel-level access — the key and the anchor live on the same machine. The key is memory-only and the daemon is non-dumpable (S0 closure), so it is not recoverable from a core or a disk read. See DESIGN_DECISIONS C37 and docs/s0-key-extraction-probe.md.
+
 ### A10. Agent corrupts the undo ledger
 **closed by commitment #2.** overlayfs lower layer is read-only mount; the agent cannot modify it. The blob store is outside the envelope. The upper layer IS agent-writable (that's the point), but undo = discard upper, so a corrupted upper is undone by discarding it.
 
@@ -136,7 +139,7 @@ An external attacker targets the agent, the harness, or the safety system.
 **mitigated by design (N3, designed not built).** Radar prototypes update only on `keep`/`clean_session` (human-validated sessions); poisoning then requires also fooling the human review. P8.1 (built 2026-08-27) extends the same principle to the immune memory: incident writes are daemon-only (drills + kernel-witnessed incidents), self (tolerance) shapes are written only on human keep — the agent has no write path to the memory.
 
 ### C14. The unprotected sibling (T5)
-**residual.** Any process not launched via castellan (plain harness run, cron, another agent) can read trust.db, the spine, and the signing key. All castellan claims are conditional on launch-path exclusivity. Mitigation: sibling detector (N5, designed not built) — pgrep known harness binaries lacking the castellan env tag → warn. Real value under Omarchy-default integration.
+**residual, narrowed by chapter 5 (2026-09-17).** Any process not launched via castellan (plain harness run, cron, another agent) can READ trust.db and the spine (read roots are `/`; reads were never denied). It can no longer read the *signing key*: the key is memory-only and the daemon is non-dumpable (`/proc/<daemon>/*` is root-owned; no core on abort — S0 probe), so a same-uid sibling has no path to it. Integrity of trust.db and the spine against modification rests on Landlock write-denial, not on the sibling's absence. All castellan claims remain conditional on launch-path exclusivity for *confinement* (a sibling runs unconfined). Mitigation: sibling detector (N5, built — `castellan siblings` scans for untagged harness processes; advisory, detects the boundary violation, cannot prevent it).
 
 ### C15. Post-session persistence (T6)
 **mitigated by N6 (built).** Processes surviving past kill act after cert issuance (TOCTOU on certificates). Session-end orphan census + kill closes the window; cert carries a "no surviving processes" attestation.

@@ -99,7 +99,7 @@ This document records what antagonism killed, what it hardened, and why each of 
 ### C9. HVs are signed per-machine — DESIGN-ONLY, not implemented (B6 D4-F10)
 **Attack:** agent forges HVs to poison fleet radar; or a malicious machine ships bad HVs.
 **Without this:** fleet detection is spoofable.
-**Commitment:** the daemon signs every HV with its per-machine ed25519 key (key outside any envelope). Fleet sync verifies signatures. Agent cannot sign. **STATUS: designed, not built.** No ed25519 code exists in the workspace; HV integrity currently rests on daemon-write-only storage. Revisit before any fleet sync.
+**Commitment:** the daemon signs every HV with its per-machine ed25519 key (key outside any envelope). Fleet sync verifies signatures. Agent cannot sign. **STATUS: HV signing still designed, not built; fleet sync does not exist.** ed25519 code now exists in the workspace (chapter 5, `castellan-proof::signing`) but it signs *certificates*, not HVs. HV integrity currently rests on daemon-write-only storage. Revisit before any fleet sync. See C37 for the certificate-signing decision and its S0-derived scope.
 
 ### C10. Bless broker is nonce-gated, rate-limited, biometric for high-risk
 **Attack:** agent forges an approval to self-expand its envelope; or socially engineers the human at scale.
@@ -124,6 +124,14 @@ This document records what antagonism killed, what it hardened, and why each of 
 **Why:** the pre-B6 posture was an inversion — the least-trusted session (a fresh project's first agent) got the widest write surface (direct writes to the real project, no overlay, no canary lockdown), while a project with earned trust got more confinement. B6 made enforce the default for everyone; this closes the remaining first-session gap: writes land in the discardable overlay from session zero, and the human decides with `keep`/`undo`.
 **Alternatives rejected:** (a) keep tier-2 cold permissive — adoption-friendly but preserves the inversion; decided against. (b) cold floor overriding `--no-enforce` too — maximum safety but blocks the labeled debug mode on every new project and broke the p1 audit suite; the explicit human flag is the boundary the floor respects.
 **Verified:** cold+default forces undo+net (banner, session record); cold+`--no-enforce` runs audit with undo+net still forced (enforce:false in the record); keep moves 50.0→51.0 and off cold; warm tier-2 launches force nothing. All suites green (p0-p4, p9-stack).
+
+### C37. Certificate signing: memory-only key, S0-derived scope (chapter 5, 2026-09-17)
+**Attack:** a same-uid agent forges or edits a ProofCertificate, or edits the spine it is assembled from.
+**Probe (S0, docs/s0-key-extraction-probe.md):** `/proc/<daemon>/mem`, `process_vm_readv`, and ptrace are kernel-denied (ptrace_scope=1). Two real vectors: a **disk** key is readable (read roots are `/`), and a plain **memory** key is recoverable from a coredump (`kill -6` wrote a core containing the planted secret). The spine, `sessions/`, and `trust.db` are write-denied to the agent.
+**Decision:** (a) never persist the key; (b) generate it in-process at daemon start after `PR_SET_DUMPABLE=0` + `RLIMIT_CORE=0` (verified: `/proc/<daemon>/*` is then root-owned and no core is produced); (c) hash-chain the spine (S1) so post-hoc edits to the anchor are detectable even without the signature; (d) sign certificates over canonical JSON and verify with an optional pinned key.
+**Scope (stated in the artifact):** integrity and provenance **within a boot**; not non-repudiation against a same-uid adversary with kernel-level access. A signature does not make the spine independently witnessed — both keys and anchor live on the same machine. This is the honest boundary, not a weakness to hide.
+**Alternatives rejected:** (a) persist a key file — readable by the agent, worthless; (b) sign without hardening — coredump-extractable; (c) skip the chain and sign only the cert — leaves the *evidence* (spine) editable while the wrapper verifies, which is security theater.
+**Verified:** test/shell.d/ch5-proof.sh 8/8 (hardening, signed verify, edited-cert reject, edited-spine BROKEN, unsigned reported honestly).
 
 ## Alternatives considered and rejected
 

@@ -266,6 +266,40 @@ the S0 probe result is documented either way.
 
 ---
 
+## Chapter 5 — Signed evidence / transparency log — BUILT (S0/S1/S2)
+
+### S0 — Antagonism probe — DONE (docs/s0-key-extraction-probe.md)
+Probed host-side and inside an enforced session (kernel 7.0.3,
+ptrace_scope=1). `/proc/<daemon>/mem`, `process_vm_readv`, and ptrace are
+denied. Two real vectors: (1) a disk 0600 key is **readable** by the agent
+(read roots are `/`), so a persisted key is worthless; (2) a plain memory key
+is **coredumpable** — `kill -6` on the daemon wrote a core containing the
+planted secret. Closure: `PR_SET_DUMPABLE=0` + `RLIMIT_CORE=0`; verified live
+(the kernel then serves `/proc/<daemon>/*` as root:root and SIGABRT produces
+no core). The anchor is already safe: spine, `sessions/`, and `trust.db` are
+write-denied to the agent.
+
+**Honest claim:** integrity and provenance within a boot; not
+non-repudiation against a same-uid adversary with kernel-level access.
+
+### S1 — Hash-chained spines — DONE
+Every `Event` carries `prev`/`hash` (sha256 over canonical bytes, prev
+included). `verify_chain` reports the first edited/deleted/reordered line.
+Rotation starts a fresh segment linked to ZERO_HASH.
+
+### S2 — ed25519 signing + verify verb — DONE
+Key generated in-process at daemon start, never on disk, process hardened
+first. Certs signed over canonical JSON; `castellan verify` checks the
+signature (pinning optional) and the embedded chain verdict.
+
+**Kill criterion met** (test/shell.d/ch5-proof.sh, 8/8): an edited spine is
+detected as BROKEN, an edited cert fails verification, and an unsigned cert
+is reported UNSIGNED rather than implied signed.
+
+**Not built:** a Merkle transparency log with signed tree heads. The chain +
+per-cert signature cover the stated claim without it; a log would add
+append-only evidence across machines and is deferred, not silently dropped.
+
 ## Chapter 6 — Publish
 
 After real-session data: write the composition up honestly (architecture, kill

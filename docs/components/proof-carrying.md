@@ -1,137 +1,123 @@
-# Proof-carrying sessions (designed core)
+# Proof-carrying sessions
 
-Every session ends with a cryptographic ProofCertificate: stayed in bounds, didn't remove validation paths, preserved config completeness, passed placebo-controlled tests. Tamper-evident, exportable, transferable. **The agent is the prover; the daemon is the verifier.** Not built yet — this doc is the design.
+Every session ends with a ProofCertificate: stayed in bounds, passed
+placebo-controlled proof, with the spine hash-chain verdict and an optional
+ed25519 signature. **The agent is the prover; the daemon is the verifier.**
+**Built** (P4 assembly, chapter 5 signing). This doc describes the implemented
+certificate and marks, explicitly, what is designed-but-not-built.
 
-## Why we think this is worth building
+## What actually shipped
 
-Proof-carrying code (Necula, 1990s) externalized verification from the runtime to a certificate. Castellan generalizes relay-vuln's ProofCertificate from "this code is vuln-free" to "this session was safe." The placebo control is the candidate answer to the gaming problem: self-reported "tests passed" is worthless, but a neutral-placeholder comparison plus a daemon-side re-run is harder to fake. Whether it survives contact with real agents is exactly what the P4 kill criteria test.
+- **Bounds proof** — counts of kernel-witnessed in-bounds writes and
+  out-of-bounds attempts, from the event spine.
+- **Placebo proof** — row-level from the trust ledger for THIS session:
+  `proofs_passed` (pair-placebo) and `test_rerun_passed` (Factor A).
+- **Census attestation** — `Some((found, killed))` when the session-end
+  orphan census ran (N6).
+- **Artifact scan** — findings-only-negative; a finding delta names the
+  scanner, a clean delta is `None` (no claim).
+- **Spine chain (S1)** — `checked`/`tip`/`intact`/`broken_at` from
+  `EventSink::verify_chain`. `None` = no chained spine.
+- **Signature (S2)** — detached ed25519 over canonical (signature-stripped)
+  JSON; `None` = unsigned and the CLI says so. `castellan verify` checks the
+  signature (optional pinning) and the embedded chain verdict.
 
-Nothing here is unbuildable by others: Landlock/cgroup plumbing is documented syscall work, and the proof composition is just engineering. Our advantage is inventory and momentum — internal primitives (relay-vuln, proof-fixes, cert-evals, evidence-pack, seq-engine, config-radar, agent-audit-trail) already exist and were benchmarked for other purposes, so the composition cost for us is lower than for a cold start. See docs/PRIMITIVES.md for honest verdicts, including primitives that died in real-data testing (refactor-proof: KILL).
+**Designed, not built** (present in the schema below for the record only):
+a separate relay-vuln "validation-path proof" crate, a config-radar
+"completeness proof", a Merkle `audit_chain` with signed tree heads, and
+cross-machine fleet transfer. The implemented artifact-scan factor is the
+scanner hook; the dedicated crates and the transparency log are deferred.
 
-## ProofCertificate schema
+## ProofCertificate schema (implemented)
 
 ```json
 {
-  "session_uuid": "...",
-  "project_hash": "blake3",
-  "started_at": 1234567890,
-  "ended_at": 1234567999,
-  "envelope_profile": "tier2",
-  "bounds_proof": {
-    "kernel_witnessed_writes": [...],
-    "out_of_bounds_attempts": 0,
-    "verdict": "STAYED_IN_BOUNDS"
-  },
-  "validation_path_proof": {
-    "scanner": "relay-vuln",
-    "missing_validation_paths_found": 0,
-    "evidence_tuples": [],
-    "verdict": "NO_VALIDATION_PATH_REMOVED"
-  },
-  "completeness_proof": {
-    "config_scanner": "config-radar",
-    "missing_keys": [],
-    "verdict": "COMPLETENESS_PRESERVED"
-  },
-  "placebo_test_proof": {
-    "pre_existing_tests_re_run_by_daemon": true,
-    "tests_passed": true,
-    "danger_signal_drop_real_fix": 0.78,
-    "danger_signal_drop_placebo": 0.03,
-    "placebo_delta": 0.75,
-    "verdict": "PLACEBO_CONTROLLED_PASS"
-  },
-  "audit_chain": {
-    "trail_root_hash": "...",
-    "trail_verified": true,
-    "kernel_vs_agent_mismatches": 0
-  },
-  "quality_label": "STRONG",
-  "signature": "ed25519:..."
+  "session": "s...",
+  "project": "/path/to/project",
+  "generated_at": 1234567999,
+  "bounds": { "writes_inside": 12, "out_of_bounds_attempts": 0, "verdict": "STAYED_IN_BOUNDS" },
+  "placebo": { "proofs_passed": 1, "test_rerun_passed": false, "verdict": "PLACEBO_CONTROLLED_PASS" },
+  "census": [1, 1],
+  "artifact_scan": null,
+  "spine_chain": { "checked": 14, "tip": "9f...", "intact": true, "broken_at": null },
+  "signature": { "public_key": "a6...", "signature": "3c...", "scope": "integrity and provenance within this boot; not non-repudiation against a same-uid adversary with kernel access" },
+  "quality_label": "MODERATE"
 }
 ```
 
-## The four proofs
+## The proofs (implemented)
 
 ### 1. Bounds proof
-From the kernel-witnessed event spine (overlayfs upper layer + inotify on expanded paths). `verdict: STAYED_IN_BOUNDS` if zero out-of-bounds attempts and all writes were inside the envelope allow-set. Fail → `OUT_OF_BOUNDS_ATTEMPT` (trust takes the −20 hit, certificate is WEAK).
+From the kernel-witnessed event spine. `verdict: STAYED_IN_BOUNDS` if zero
+out-of-bounds attempts. Fail → `OUT_OF_BOUNDS_ATTEMPT` and the certificate is
+NON-EVIDENTIAL.
 
-### 2. Validation-path proof
-relay-vuln scans post-edit state for missing-validation-path patterns (the `missing_space.rs`, `path_vuln.rs`, `validation_density.rs` detectors). Produces EvidenceTuples. `verdict: NO_VALIDATION_PATH_REMOVED` if zero findings. **Honest limit:** relay-vuln is grammar-free with false negatives — this proof is labeled "best-effort detection," not "proven safe." Quality label reflects this: if validation-path proof is the only positive evidence, the certificate is at most MODERATE.
-
-### 3. Completeness proof
-config-radar checks for missing config keys (per-format extractors: YAML/TOML/JSON/HCL/INI/.env/Dockerfile/NGINX). `verdict: COMPLETENESS_PRESERVED` if it passes. Failure → `COMPLETENESS_BROKEN` (certificate is WEAK or NON-EVIDENTIAL). **seq-engine was KILLed 2026-08-27** — the expected-pair auditor is tautological on event-derived token sets (78% of learned expectations co-emitted by the same event), learns zero expectations on composite-only encoding, and its ordered fingerprints add no separation over radar's order-agnostic encoding on real spines. See PRIMITIVES.md.
-
-### 4. Placebo test proof (the un-gameable positive signal)
+### 2. Placebo test proof (the un-gameable positive signal)
 Row-level OR, cert-level AND (see C12 in DESIGN_DECISIONS.md):
-- **Factor A — daemon re-run:** the daemon independently re-runs the pre-existing test suite (tests that existed pre-session AND were unmodified by the session) in a side-scope reading post-edit state. Must pass. Agent-reported results do not count. (commitment #3) Each pass earns its own `proof_passed` ledger row (`evidence` "test suite").
-- **Factor B — placebo control:** a real fix (the session's actual edits) must drop the danger_signal more than a neutral placeholder would. proof-fixes methodology: apply the real fix, measure danger_signal; apply a neutral placeholder (e.g., a no-op comment), measure danger_signal; the real fix must drop more. `assert True` and "delete the dangerous line" both fail this — they're placebos that don't differentially drop danger. (commitment: placebo control mandatory for any causal claim) Each passing file earns its own `proof_passed` ledger row (`evidence` "placebo-controlled", names the strength).
+- **Factor A — daemon re-run:** the daemon independently re-runs the
+  pre-existing test suite (unmodified by the session) from a config-pinned
+  command. Agent-reported results do not count. Each pass earns its own
+  `proof_passed` ledger row (`evidence` "test suite").
+- **Factor B — placebo control:** the session's actual edit (orig → new) must
+  drop the danger_signal more than a neutral placeholder would. `assert True`
+  and no-op edits fail; a real guard that drops danger passes. Each passing
+  file earns its own `proof_passed` ledger row (`evidence` "placebo-controlled").
+- Factor A is skipped and honestly labeled `test_rerun_passed: false` when the
+  project configures no test command.
 
-`verdict: PLACEBO_CONTROLLED_PASS` only if both factors pass. This is the ONLY positive trust signal (Phase 3).
+### 3. Artifact scan (P9.2)
+A pluggable scanner (relay-vuln or semgrep) runs at the keep gate over the
+session's touched files. **Findings-only-negative:** a new finding produces a
+factor and a `vuln_introduced` event; a clean delta is `None` (no claim). The
+cert states the scanner's scope and that absence of findings is not evidence of
+safety.
 
-## Quality labels (from evidence-pack)
+### 4. Spine chain + signature (chapter 5)
+The spine is a sha256 hash chain; `verify_chain` reports the first broken link.
+The certificate is signed with an in-process ed25519 key (memory-only,
+non-dumpable daemon — S0 probe). `castellan verify` re-checks both.
 
-- **STRONG:** all four proofs pass, audit chain verified, zero kernel-vs-agent mismatches.
-- **MODERATE:** bounds + placebo pass; validation-path or completeness has minor findings (within relay-vuln's known false-negative rate, honestly labeled).
-- **WEAK:** bounds passes but placebo fails, OR validation-path/completeness has significant findings.
-- **NON-EVIDENTIAL:** out-of-bounds attempts, or audit chain broken, or kernel-vs-agent mismatches.
+## Quality labels (implemented)
+
+- **STRONG:** in bounds + placebo proof + test re-run.
+- **MODERATE:** in bounds + one positive factor (placebo or tests).
+- **WEAK:** in bounds, no positive evidence.
+- **NON-EVIDENTIAL:** out-of-bounds attempt, or no event spine.
+
+The validation-path and completeness proofs are NOT part of the label today
+(they were designed, not built); the artifact scan is reported as a factor but
+does not raise the label.
 
 ## Daemon as verifier (commitment #3)
 
-The agent does NOT generate the certificate. The daemon does, from:
-- kernel-witnessed event spine (bounds, audit chain)
-- daemon-re-run test results (placebo factor A)
-- relay-vuln scan of post-edit state (validation-path — daemon calls relay-vuln as a Rust crate; relay-vuln reads state directly, not agent-reported)
-- config-radar scan of post-edit state (completeness — same)
-- proof-fixes placebo computation (daemon invokes proof-fixes; the danger_signal comparison is done by proof-fixes reading state, not by the agent)
-
-The agent's audit-trail is cross-checked against kernel truth (mismatches decrement trust and weaken the certificate) but is never the source of truth.
-
-## Transfer (fleet trust, Phase 5)
-
-Verified ProofCertificates raise a project's trust tier. A fleet of verified sessions = a reputation system with cryptographic, placebo-controlled backing. Composed from:
-- engfield SDM (predictive memory: prior verified sessions influence context, zero-token)
-- cortex-rs consolidation (verified sessions promote to consolidated tier)
-- evidence-pack export (portable certificate format)
-- agent-audit-trail (tamper-evident backing)
-
-HV fingerprints of verified sessions sync across machines via Omarchy's usage-sync-folder, signed per-machine (commitment #9). A new machine joining a project sees "this project has 47 verified sessions across 3 machines" and starts at a higher tier.
-
-## Antagonism survivors
-
-- A5 (fake tests): closed — placebo + daemon re-run + pre-existing-only.
-- A6 (fake placebo): closed — two-factor.
-- A9 (proof replay): closed — session-bound (UUID + cgroup start + ledger hash).
-- B1 (agent lies about tests): closed — daemon re-runs.
-- B6 (agent tampers with audit trail): closed — hash chain + kernel cross-check.
-- D1 (refactor-proof killed): closed — placebo control replaces it.
+The agent does NOT generate the certificate. The daemon assembles it from the
+kernel-witnessed spine, the trust ledger (scoped to this session), the census
+file, the scanner evidence, and — when a key exists — signs it.
 
 ## Residual risks
 
-- relay-vuln false negatives: validation-path proof is best-effort, not proven-safe. Labeled honestly in quality labels (MODERATE at best if validation-path is the only positive).
-- Proof coverage: if a session made no edits (read-only), the placebo proof is vacuous. Certificate is MODERATE ("no harm done, no benefit proven") rather than STRONG.
-- Cross-machine trust transfer assumes the machines share a project definition (realpath hash). A malicious machine could ship fabricated certificates — defeated by ed25519 signatures (commitment #9), but a compromised daemon key is residual.
+- Scanner false negatives: the artifact scan is best-effort, labeled per
+  finding and findings-only-negative. No "proven safe" claim.
+- Proof coverage: a read-only session has no placebo evidence → WEAK at best.
+- **Signature scope:** the key and the anchor (spine) live on the same
+  machine, so a signature proves integrity/provenance **within a boot**, not
+  non-repudiation against a same-uid adversary with kernel access. Cross-machine
+  trust transfer is designed, not built.
+- A compromised daemon key is out of scope (kernel-level compromise).
 
-## Kill criterion (Phase 4)
+## Dependencies (implemented)
 
-20 known-bad sessions (agent removed validation, broke completeness, or wrote a fake test) classified NOT-EVIDENTIAL or WEAK; 20 known-good sessions classified STRONG or MODERATE. False-negative rate on known-bad < 20%. We accept relay-vuln is grammar-free and not perfect — the proof is honestly labeled "best-effort detection," not "proven safe."
-
-## Dependencies
-
-- `castellan-core` (ProofCertificate type)
-- `castellan-ledger` (kernel-witnessed events)
-- `castellan-trust` (certificate feeds positive signal)
-- Owned primitives (all Rust crates, linked into the daemon — no Python in the trusted path):
-  - `relay-vuln` (validation-path, EvidenceTuple, ProofCertificate origin pattern — already pure Rust, 52K LOC)
-  - `castellan-proof` export module (was evidence-pack — rewritten as Rust, quality labels via serde)
-  - `castellan-proof` placebo module (was proof-fixes — rewritten as Rust, placebo orchestration over relay-vuln)
-  - `cert-evals` (benchmark methodology, SHA-256 cert — stays Python, dev/CI only, NOT in daemon)
-  - `castellan-completeness` (was config-radar — rewritten as Rust; seq-engine KILLed 2026-08-27, see PRIMITIVES.md)
-  - `castellan-ledger` audit chain (was agent-audit-trail — rewritten as Rust hash chain)
-  - `engfield` (Phase 5 priors — already has 2183 LOC Rust, link as crate)
-  - `cortex-rs` (Phase 5 consolidation — already pure Rust, link as crate)
+- `castellan-core` — `Event` with `prev`/`hash`, `EventSink::verify_chain`,
+  `ChainVerdict`.
+- `castellan-proof` — `certificate` (assembly) and `signing` (ed25519).
+- `castellan-trust` — ledger rows feeding the placebo factor.
+- `castellan-ledger` — overlay diff for the pair-placebo.
+- Scanner adapter (P9.2) — relay-vuln or semgrep behind one interface.
 - CVEfixes DB: local at `/home/john/data/`, never shipped.
 
 ## Status
 
-Greenfield certificate assembly; owned scanner pipeline. Phase 4, ~3 weeks. This is the contribution worth being patient for.
+Built: assembly (P4), hash chain + signing (chapter 5). Kill criterion met on
+a scripted corpus (P4, 0/20 FN both arms) and the crypto properties verified
+live (test/shell.d/ch5-proof.sh 8/8). Not built: dedicated validation-path and
+completeness crates, Merkle transparency log, fleet transfer.

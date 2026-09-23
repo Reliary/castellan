@@ -41,7 +41,9 @@ Always-on deny-list (commitment #6) regardless of tier: `~/.ssh`, `~/.gnupg`, `.
 
 ## Cold start
 
-New project: tier 2 (50). Full-auto within workspace, no egress, config-dir via bless. Power users keep full-auto within workspace from the first session. The floor is the safety; the ceiling is earned.
+New project: tier 2 (50). Full-auto within workspace, undo forced for the first session, egress unrestricted unless the operator restricts it. Power users keep full-auto within workspace from the first session. The floor is the safety; the ceiling is earned.
+
+At tiers 0–1 the floor forces **enforce + undo + destination-scoped egress restriction**, regardless of the launcher's flags. The egress floor is `--net-restrict` (the broker's IP allowlist, which keeps the operator-declared LLM host reachable), never `--net` (Landlock's port-scoped rule, which cannot distinguish the LLM API from any other 443 host and therefore cannot be forced without bricking the agent). A human `egress` bless grant lifts the egress part of the floor for exactly one launch. See DESIGN_DECISIONS C38.
 
 ## "Why am I tier 2?" — fully reconstructible
 

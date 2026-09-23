@@ -93,6 +93,11 @@ pub struct EgressPolicy {
   pub extra_ips: Vec<IpAddr>,
   /// Resolver IPs parsed from /etc/resolv.conf — DNS must survive.
   pub resolver_ips: Vec<IpAddr>,
+  /// Specific (ip, port) pairs denied even though they are loopback.
+  /// Used for the systemd-resolved stub (127.0.0.53:53), which is a
+  /// relay to the real upstream: allowing it is an unmonitored egress
+  /// path and a DNS-tunnel channel. Empty by default (audit posture).
+  pub denied_loopback: Vec<(IpAddr, u16)>,
   /// Deny the systemd user-manager sockets (T4). Default true.
   pub deny_systemd_sockets: bool,
   /// Deny the session bus (`$XDG_RUNTIME_DIR/bus`). Default true.
@@ -109,7 +114,9 @@ pub struct EgressPolicy {
   pub deny_user_bus: bool,
   /// When false (default), non-loopback IPs are allowed — the broker
   /// only closes the unix/systemd-socket hole and leaves egress alone.
-  /// When true, only loopback + extra_ips + resolver_ips are allowed.
+  /// When true, only loopback + extra_ips + resolver_ips are allowed, and
+  /// a destination argument the broker cannot read from tracee memory is
+  /// DENIED (fail-closed: no proof of destination, no packet).
   pub restrict_ip: bool,
 }
 
@@ -135,6 +142,50 @@ impl EgressPolicy {
       }
     }
     self
+  }
+
+  /// Tier floor: loopback + declared hosts only. The resolver is NOT
+  /// allowed: a low-trust agent that can resolve names can tunnel data
+  /// out in DNS queries. The provider is already resolved before the
+  /// filter is installed, so the agent does not need runtime DNS to
+  /// reach it.
+  ///
+  /// This does NOT by itself close DNS exfiltration on a
+  /// systemd-resolved host, where /etc/resolv.conf points at the LOCAL
+  /// stub 127.0.0.53. The stub is loopback, so the blanket loopback
+  /// allowance passes it, and the stub forwards to the real upstream.
+  /// `deny_resolver_stub` closes that; it is applied automatically.
+  pub fn with_llm_only(mut self, hosts: &[String]) -> Self {
+    self.restrict_ip = true;
+    self.resolver_ips.clear();
+    self.deny_resolver_stub();
+    self.with_hosts(hosts)
+  }
+
+  /// Under a destination policy, DENY the systemd-resolved stub even
+  /// though it is loopback. The stub is a RELAY: anything an agent sends
+  /// to it is forwarded to the real upstream, so an allowed
+  /// 127.0.0.53:53 is an unmonitored egress path and a DNS-tunnel
+  /// channel. The canary honeypot (an arbitrary loopback port) is
+  /// unaffected — this denies a specific (ip, port) pair, not loopback.
+  ///
+  /// Verified live 2026-09-17: before this, the D6 census read DNS
+  /// OPEN under the tier floor on a host whose resolver is
+  /// 127.0.0.53 (systemd-resolved stub). The 53 is the stub's port; the
+  /// upstream is reached by the stub, not by the agent.
+  pub fn deny_resolver_stub(&mut self) {
+    for octet in [53u8, 54] {
+      let entry = (IpAddr::V4(Ipv4Addr::new(127, 0, 0, octet)), 53u16);
+      if !self.denied_loopback.contains(&entry) {
+        self.denied_loopback.push(entry);
+      }
+    }
+  }
+
+  /// Is this specific (ip, port) pair explicitly denied even though it
+  /// is loopback? Used for the resolver stub.
+  fn loopback_denied(&self, ip: &IpAddr, port: u16) -> bool {
+    self.denied_loopback.contains(&(*ip, port))
   }
 
   fn ip_allowed(&self, ip: &IpAddr) -> bool {
@@ -260,8 +311,18 @@ pub fn parse_sockaddr(buf: &[u8]) -> Option<Sockaddr> {
 /// when false, manager sockets are allowed (audit posture).
 pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
   match sa {
-    Sockaddr::V4(ip, _) => (evaluate_v4(*ip, policy), "ipv4"),
-    Sockaddr::V6(ip, _) => (evaluate_v6(*ip, policy), "ipv6"),
+    Sockaddr::V4(ip, port) => {
+      if policy.loopback_denied(&IpAddr::V4(*ip), *port) {
+        return (Verdict::Deny, "resolver-stub");
+      }
+      (evaluate_v4(*ip, policy), "ipv4")
+    }
+    Sockaddr::V6(ip, port) => {
+      if policy.loopback_denied(&IpAddr::V6(*ip), *port) {
+        return (Verdict::Deny, "resolver-stub");
+      }
+      (evaluate_v6(*ip, policy), "ipv6")
+    }
     Sockaddr::Unix(path) => {
       if policy.deny_systemd_sockets && is_manager_socket(path) {
         (Verdict::Deny, "systemd-socket")
@@ -281,6 +342,23 @@ pub struct BrokerEvent {
   pub verdict: Verdict,
   pub reason: &'static str,
   pub detail: String,
+}
+
+impl BrokerEvent {
+  /// A deny is an attempted escape, not a note. The supervisor (which
+  /// runs outside the agent's envelope) records it to the session spine
+  /// so the ProofCertificate's bounds proof can count it.
+  pub fn as_spine_row(&self) -> Option<(String, String, &'static str)> {
+    if self.verdict == Verdict::Deny {
+      Some((
+        "broker_deny".to_string(),
+        format!("{} {} pid={}", self.reason, self.detail, self.pid),
+        "deny",
+      ))
+    } else {
+      None
+    }
+  }
 }
 
 pub type BrokerLog = (Sender<BrokerEvent>, Receiver<BrokerEvent>);
@@ -307,7 +385,8 @@ fn read_tracee(pid: u32, ptr: u64, len: usize) -> Option<Vec<u8>> {
 
 /// Extract the destination sockaddr from a notification, if the syscall
 /// carries one. Returns None when the destination is implicit (connected
-/// socket) or unreadable.
+/// socket) or unreadable; `read_dest` distinguishes those two cases.
+#[allow(dead_code)]
 fn notification_dest(req: &SeccompNotif) -> Option<Sockaddr> {
   match req.data.nr as i64 {
     libc::SYS_connect => {
@@ -341,18 +420,96 @@ fn notification_dest(req: &SeccompNotif) -> Option<Sockaddr> {
   }
 }
 
-fn decide_notification(
-  req: &SeccompNotif,
+/// The outcome of reading a syscall's destination argument out of
+/// tracee memory. `Unreadable` is NOT the same as `None` (no
+/// destination argument at all): a failed read means we cannot prove
+/// where the packet is going, and under a destination policy that must
+/// be denied rather than allowed.
+pub enum DestRead {
+  Parsed(Sockaddr),
+  /// The syscall carries no destination (sendto on an already-connected
+  /// socket, or a connect form we do not parse) — vetted at connect time.
+  None,
+  /// The destination was not readable from the tracee.
+  Unreadable,
+}
+
+pub fn read_dest(req: &SeccompNotif) -> DestRead {
+  let nr = req.data.nr as i64;
+  let read = |ptr: u64, len: u64| read_tracee(req.pid, ptr, len as usize);
+  match nr {
+    libc::SYS_connect => match read(req.data.args[1], req.data.args[2]) {
+      Some(buf) => match parse_sockaddr(&buf) {
+        Some(sa) => DestRead::Parsed(sa),
+        None => DestRead::Unreadable,
+      },
+      None => DestRead::Unreadable,
+    },
+    libc::SYS_sendto => {
+      // sendto(fd, buf, len, flags, dest_addr, addrlen). glibc implements
+      // send() as sendto with a NULL destination on a connected socket,
+      // so a NULL here is the normal implicit case, not a failure.
+      if req.data.args[4] == 0 {
+        return DestRead::None;
+      }
+      match read(req.data.args[4], req.data.args[5]) {
+        Some(buf) => match parse_sockaddr(&buf) {
+          Some(sa) => DestRead::Parsed(sa),
+          None => DestRead::Unreadable,
+        },
+        None => DestRead::Unreadable,
+      }
+    }
+    libc::SYS_sendmsg => {
+      // sendmsg(fd, msg, flags): msghdr.msg_name at offset 0,
+      // msg_namelen at offset 8 on x86_64.
+      let hdr = match read(req.data.args[1], 16) {
+        Some(h) if h.len() >= 16 => h,
+        _ => return DestRead::Unreadable,
+      };
+      let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+      let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+      if name_ptr == 0 || name_len == 0 {
+        return DestRead::None;
+      }
+      match read(name_ptr, name_len as u64) {
+        Some(buf) => match parse_sockaddr(&buf) {
+          Some(sa) => DestRead::Parsed(sa),
+          None => DestRead::Unreadable,
+        },
+        None => DestRead::Unreadable,
+      }
+    }
+    _ => DestRead::None,
+  }
+}
+
+pub fn decide_dest(
+  dest: &DestRead,
   policy: &EgressPolicy,
 ) -> (Verdict, &'static str, String) {
-  match notification_dest(req) {
-    Some(sa) => {
-      let (v, r) = decide(&sa, policy);
+  match dest {
+    DestRead::Parsed(sa) => {
+      let (v, r) = decide(sa, policy);
       (v, r, sa.detail())
     }
-    None => {
-      // Implicit destination: the socket was vetted at connect time.
-      (Verdict::Allow, "implicit-dest", String::new())
+    // An implicit destination means the socket was vetted when it was
+    // connected, and `connect` is intercepted. This MUST stay allowed:
+    // glibc's send() is a sendto with a NULL destination and most TLS
+    // stacks use sendmsg on connected sockets, so denying here would
+    // block every program that sends anything. The inherited-fd case
+    // (connected before the filter) is a documented residual (C10a),
+    // not something a deny here can fix.
+    DestRead::None => (Verdict::Allow, "implicit-dest", String::new()),
+    DestRead::Unreadable => {
+      // A destination argument was present but could not be read. We
+      // cannot prove where this goes, so under a destination policy it
+      // does not go.
+      if policy.restrict_ip {
+        (Verdict::Deny, "dest-unreadable", String::new())
+      } else {
+        (Verdict::Allow, "dest-unreadable", String::new())
+      }
     }
   }
 }
@@ -436,6 +593,139 @@ pub struct Broker {
   agent_status: Option<i32>,
 }
 
+/// Run `exe args` under the broker and capture its stdout.
+///
+/// The filter is installed in a short-lived grandchild supervisor, never
+/// in the calling process: installing a seccomp notif filter is
+/// irreversible, and every later connect/sendto/sendmsg in the caller
+/// would then notify a listener that dies with the supervisor. The first
+/// version installed it in the long-lived daemon and hung the daemon
+/// permanently (found live, 2026-09-17).
+///
+/// Shape:
+///   caller  --fork--> supervisor (installs filter, forks) --fork-->
+///           agent (execs `exe args`; its connects notify supervisor)
+///   supervisor --exit--> caller reads the agent's stdout
+pub fn supervise_capture(
+  exe: &std::path::Path,
+  args: &[String],
+  env: &[(&str, String)],
+  policy: &EgressPolicy,
+) -> String {
+  // stdout of the agent must reach a pipe the caller owns.
+  let (out_r, out_w) = {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+      return format!("broker: pipe failed ({})\n", std::io::Error::last_os_error());
+    }
+    (fds[0], fds[1])
+  };
+  // Hand the write end to the supervisor through the fork: the caller
+  // keeps the read end only.
+  let pid = unsafe { libc::fork() };
+  if pid < 0 {
+    return format!("broker: fork failed ({})\n", std::io::Error::last_os_error());
+  }
+  if pid > 0 {
+    // Caller: close the write end, read the agent's output to EOF, then
+    // reap the supervisor. Reading to EOF before reaping is required:
+    // the agent holds the write end until it exits.
+    unsafe { libc::close(out_w) };
+    let mut out = String::new();
+    let mut f = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(out_r) };
+    {
+      use std::io::Read as _;
+      let _ = f.read_to_string(&mut out);
+    }
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    return out;
+  }
+  // Supervisor (short-lived): its stdout is irrelevant; only the agent's
+  // captured output matters, so point our own stdout at the pipe too in
+  // case anything in the supervision path prints.
+  unsafe {
+    libc::close(out_r);
+    libc::dup2(out_w, 1);
+    libc::close(out_w);
+    for (k, v) in env {
+      std::env::set_var(k, v);
+    }
+  }
+  let out = supervise_capture_inner(exe, args, policy);
+  let bytes = out.as_bytes();
+  unsafe {
+    libc::write(1, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    libc::_exit(0)
+  }
+}
+
+fn supervise_capture_inner(
+  exe: &std::path::Path,
+  args: &[String],
+  policy: &EgressPolicy,
+) -> String {
+  use std::io::Read as _;
+  let listener = match install_listener() {
+    Ok(l) => l,
+    Err(e) => return format!("broker: filter install failed ({e})\n"),
+  };
+  // The agent's stdout goes through a pipe the supervisor drains.
+  let (r, w) = {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+      return format!("broker: pipe failed ({})\n", std::io::Error::last_os_error());
+    }
+    (fds[0], fds[1])
+  };
+  let pid = unsafe { libc::fork() };
+  if pid < 0 {
+    return format!("broker: fork failed ({})\n", std::io::Error::last_os_error());
+  }
+  if pid == 0 {
+    // Agent: the filter is inherited. Drop the listener, the read end,
+    // and every fd above 2 (the daemon's own socket must not leak into
+    // the agent — a leaked socket makes the agent's own writes re-enter
+    // this process's dispatch and deadlock). Then exec.
+    unsafe {
+      libc::close(listener);
+      libc::close(r);
+      libc::dup2(w, 1);
+      libc::close(w);
+      let max = libc::sysconf(libc::_SC_OPEN_MAX);
+      let max = if max > 0 { max as i32 } else { 4096 };
+      for fd in 3..max.min(1024) {
+        libc::close(fd);
+      }
+    }
+    let c = std::process::Command::new(exe);
+    let err = execve(c, args);
+    eprintln!("broker: exec failed: {err}");
+    unsafe { libc::_exit(127) }
+  }
+  unsafe { libc::close(w) };
+  // Drain the agent's stdout on a thread WHILE the decision loop runs:
+  // the agent blocks once the pipe buffer fills, so reading only after
+  // the loop deadlocks whenever its output exceeds the pipe capacity.
+  let reader = std::thread::spawn(move || {
+    let mut f = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(r) };
+    let mut out = String::new();
+    let _ = f.read_to_string(&mut out);
+    out
+  });
+  let mut policy = policy.clone();
+  let mut sup = Broker { listener, agent_pid: pid, agent_status: None };
+  let (btx, _brx) = broker_log();
+  let _ = sup.run(&mut policy, &btx);
+  reader.join().unwrap_or_default()
+}
+
+fn execve(mut c: std::process::Command, args: &[String]) -> std::io::Error {
+  use std::os::unix::process::CommandExt as _;
+  c.args(args);
+  c.exec()
+}
+
 impl Broker {
   /// Run the decision loop until the agent tree exits.
   ///
@@ -472,7 +762,8 @@ impl Broker {
         }
       }
       count += 1;
-      let (verdict, reason, detail) = decide_notification(&req, policy);
+      let dest = read_dest(&req);
+      let (verdict, reason, detail) = decide_dest(&dest, policy);
       let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
       respond(self.listener, &req, verdict)?;
     }
@@ -570,6 +861,81 @@ mod tests {
     let mut p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
     p.extra_ips.push(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 5)));
     assert_eq!(evaluate_v4(Ipv4Addr::new(140, 82, 112, 5), &p), Verdict::Allow);
+  }
+
+  #[test]
+  fn unparseable_destination_fails_closed_under_restriction() {
+    let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
+    let (v, r, _) = decide_dest(&DestRead::Unreadable, &p);
+    assert_eq!(v, Verdict::Deny);
+    assert_eq!(r, "dest-unreadable");
+  }
+
+  #[test]
+  fn unparseable_destination_is_allowed_under_audit_posture() {
+    let p = EgressPolicy::new();
+    assert!(!p.restrict_ip);
+    let (v, _, _) = decide_dest(&DestRead::Unreadable, &p);
+    assert_eq!(v, Verdict::Allow);
+  }
+
+  #[test]
+  fn implicit_destination_is_allowed_under_restriction() {
+    // The send() path. Denying here would break every TLS stack, because
+    // most send via sendto/sendmsg with a NULL destination on a socket
+    // whose connect() was already vetted by the broker.
+    let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
+    let (v, r, _) = decide_dest(&DestRead::None, &p);
+    assert_eq!(v, Verdict::Allow);
+    assert_eq!(r, "implicit-dest");
+  }
+
+  #[test]
+  fn llm_only_allows_loopback_and_denies_public() {
+    // A host that cannot resolve leaves the policy with no extra IPs,
+    // which is the honest "provider unreachable" case: loopback (the
+    // honeypot) survives, every public destination is denied.
+    let p = EgressPolicy::new().with_llm_only(&["provider.invalid.".to_string()]);
+    assert!(p.restrict_ip);
+    assert_eq!(evaluate_v4(Ipv4Addr::new(127, 0, 0, 1), &p), Verdict::Allow);
+    assert_eq!(evaluate_v4(Ipv4Addr::new(1, 2, 3, 4), &p), Verdict::Deny);
+  }
+
+  #[test]
+  fn llm_only_denies_the_resolver() {
+    // DNS is an exfil channel. The provider is resolved BEFORE the
+    // filter, so the agent never needs the resolver to reach it.
+    let mut p = EgressPolicy::new();
+    p.resolver_ips.push(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
+    assert_eq!(evaluate_v4(Ipv4Addr::new(9, 9, 9, 9), &p), Verdict::Allow);
+    let p = p.with_llm_only(&[]);
+    assert_eq!(evaluate_v4(Ipv4Addr::new(9, 9, 9, 9), &p), Verdict::Deny);
+  }
+
+  #[test]
+  fn llm_only_denies_the_resolved_stub_on_loopback() {
+    // The real finding: /etc/resolv.conf points at 127.0.0.53 on a
+    // systemd-resolved host. The stub is loopback, so the blanket
+    // loopback allowance passed it, and the stub relays to the upstream
+    // — an unmonitored DNS tunnel. Found by the D6 census 2026-09-17.
+    let p = EgressPolicy::new().with_llm_only(&[]);
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 53), 53);
+    assert_eq!(decide(&sa, &p).0, Verdict::Deny);
+    // A different loopback port (the canary honeypot) is unaffected.
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 53), 44407);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+    // The honeypot's own loopback address and port still works.
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 44407);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn the_stub_is_allowed_under_the_audit_posture() {
+    // The denial is a destination-policy behavior, not a blanket one:
+    // audit mode leaves DNS exactly as the system configures it.
+    let p = EgressPolicy::new();
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 53), 53);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
   }
 
   #[test]

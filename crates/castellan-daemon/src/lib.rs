@@ -166,6 +166,48 @@ struct LaunchProfileFields {
   net: bool,
 }
 
+/// P11: merge the operator's declared egress destinations.
+///
+/// Sources, in precedence order — all operator-owned, never
+/// agent-writable. The harness's own provider config is deliberately NOT
+/// a source: it lives in the agent's writable state root, so deriving
+/// the allowlist from it would let the agent authorize its own egress.
+///  1. explicit `--allow-host` values from the launcher
+///  2. `CASTELLAN_EGRESS_ALLOW_HOSTS` (comma-separated)
+///  3. `$XDG_CONFIG_HOME/castellan/egress.toml` `[llm] hosts = [...]`
+fn resolve_allow_hosts(explicit: &[String]) -> Vec<String> {
+  let mut hosts: Vec<String> = explicit.iter().filter(|h| !h.trim().is_empty()).cloned().collect();
+  if let Ok(raw) = std::env::var("CASTELLAN_EGRESS_ALLOW_HOSTS") {
+    for h in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+      if !hosts.iter().any(|e| e == h) {
+        hosts.push(h.to_string());
+      }
+    }
+  }
+  let cfg = std::env::var("XDG_CONFIG_HOME")
+    .map(PathBuf::from)
+    .unwrap_or_else(|_| {
+      PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+    })
+    .join("castellan/egress.toml");
+  if let Ok(text) = std::fs::read_to_string(&cfg) {
+    if let Some(llm) = toml::from_str::<toml::Value>(&text)
+      .ok()
+      .and_then(|v| v.get("llm").cloned())
+    {
+      if let Some(list) = llm.get("hosts").and_then(|h| h.as_array()) {
+        for h in list.iter().filter_map(|v| v.as_str()) {
+          let h = h.trim().to_string();
+          if !h.is_empty() && !hosts.iter().any(|e| *e == h) {
+            hosts.push(h);
+          }
+        }
+      }
+    }
+  }
+  hosts
+}
+
 /// A pending bless-broker expansion request.
 #[derive(Debug, Clone)]
 struct BlessRequest {
@@ -715,8 +757,8 @@ impl Daemon {
 
   fn dispatch(&self, req: Request) -> Response {
     match req {
-      Request::Spawn { harness, project, pid, command, enforce, undo, net, grants, launcher_tty } => {
-        self.spawn(harness, project, pid, command, enforce, undo, net, grants, launcher_tty)
+      Request::Spawn { harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty } => {
+        self.spawn(harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty)
       }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
       Request::JoinSession { session, pid } => self.join_session(&session, pid),
@@ -780,8 +822,8 @@ impl Daemon {
         Response::ok().with_extra("memory", mem.status())
       }
       Request::VoiceApprove { session, utterance } => self.voice_approve(&session, &utterance),
-      Request::ChannelsRun => {
-        let results = self.run_channels();
+      Request::ChannelsRun { net_restrict } => {
+        let results = self.run_channels(net_restrict);
         let json: Vec<serde_json::Value> =
           results.iter().map(|(c, v)| serde_json::json!({ "channel": c, "verdict": v })).collect();
         Response::ok().with_extra("channels", serde_json::json!({ "inventory": json }))
@@ -798,10 +840,19 @@ impl Daemon {
 
   /// P9.1: run the exfil channel census (D6) and store the inventory.
   /// The census is a REPORT — it may confirm open channels (expected:
-  /// UDP, unix sockets, inherited fds — Landlock ABI4 covers TCP
-  /// connect only). Findings are recorded in THREAT_MODEL, never
-  /// silently patched.
-  fn run_channels(&self) -> Vec<(String, String)> {
+  /// unix sockets, inherited fds, loopback UDP — Landlock covers TCP
+  /// connect only, and the broker covers only destinations it can
+  /// read). Findings are recorded in THREAT_MODEL, never silently
+  /// patched.
+  ///
+  /// P11: the census child is forked through the EGRESS BROKER when
+  /// `net_restrict` is requested, so the census measures the real launch
+  /// path. Previously it was spawned with a plain `Command::new`, which
+  /// bypassed the broker entirely — it could never observe a broker
+  /// decision, and its probes targeted loopback, which the broker always
+  /// allows. The census therefore proved nothing about the mechanism it
+  /// was written to audit.
+  fn run_channels(&self, net_restrict: bool) -> Vec<(String, String)> {
     let started = std::time::Instant::now();
     let nonce = self.drill.issue();
     let session = format!("drill-{nonce}");
@@ -811,24 +862,40 @@ impl Daemon {
     let unix_path = "/tmp/castellan-channels-probe.sock";
     let _ = std::fs::remove_file(unix_path);
     let listener = std::os::unix::net::UnixListener::bind(unix_path);
-    let mut child = match std::process::Command::new(std::env::current_exe().unwrap_or_default())
-      .arg("--drill-channels")
-      .arg(&honeypot_port.to_string())
-      .env("CASTELLAN_DRILL_SESSION", &session)
-      .stdout(std::process::Stdio::piped())
-      .spawn()
-    {
-      Ok(c) => c,
-      Err(e) => {
-        let results = vec![("spawn".to_string(), format!("failed ({e})"))];
-        *self.channels_results.lock().unwrap() = results.clone();
-        return results;
+    let exe = std::env::current_exe().unwrap_or_default();
+    let probe_args: Vec<String> = vec!["--drill-channels".to_string(), honeypot_port.to_string()];
+    // P11: with net_restrict the probe runs UNDER the egress broker, so
+    // the census measures the real launch path and its connects are
+    // judged by the same policy a low-trust session would get. It
+    // previously spawned the probe with a plain Command, bypassing the
+    // broker entirely, and probed loopback only — the broker always
+    // allows loopback — so the census could not distinguish a working
+    // destination policy from a broken one.
+    let out = if net_restrict {
+      // The tier floor's exact shape with no provider declared: loopback
+      // only, resolver excluded so the DNS probe is decisive.
+      let policy = castellan_broker::EgressPolicy::new().with_llm_only(&[]);
+      let env: Vec<(&str, String)> = vec![
+        ("CASTELLAN_DRILL_SESSION", session.clone()),
+        ("CASTELLAN_DRILL_NET_RESTRICT", "1".to_string()),
+      ];
+      castellan_broker::supervise_capture(&exe, &probe_args, &env, &policy)
+    } else {
+      let mut c = std::process::Command::new(&exe);
+      c.args(&probe_args)
+        .env("CASTELLAN_DRILL_SESSION", &session)
+        .stdout(std::process::Stdio::piped());
+      match c.spawn() {
+        Ok(mut c) => {
+          let mut out = String::new();
+          use std::io::Read as _;
+          let _ = c.stdout.take().map(|mut s| s.read_to_string(&mut out));
+          let _ = c.wait();
+          out
+        }
+        Err(e) => format!("spawn: failed ({e})\n"),
       }
     };
-    let mut out = String::new();
-    use std::io::Read as _;
-    let _ = child.stdout.take().map(|mut s| s.read_to_string(&mut out));
-    let _ = child.wait();
     drop(listener);
     let _ = std::fs::remove_file(unix_path);
     let results: Vec<(String, String)> = out
@@ -845,7 +912,7 @@ impl Daemon {
     let _ = sink;
     *self.channels_results.lock().unwrap() = results.clone();
     eprintln!(
-      "castellan-daemon: channel census complete in {}ms ({} channels)",
+      "castellan-daemon: channel census complete in {}ms ({} channels, net_restrict={net_restrict})",
       started.elapsed().as_millis() as u64,
       results.len()
     );
@@ -1407,7 +1474,10 @@ impl Daemon {
   /// net rights do not cover).
   fn drill_channels(&self) -> castellan_drill::DrillResult {
     let started = std::time::Instant::now();
-    let results = self.run_channels();
+    // The scheduled drill runs the plain envelope census (audit posture).
+    // The broker-measured census is a manual `channels run --net-restrict`
+    // because it forks a supervised child and must not run on a timer.
+    let results = self.run_channels(false);
     let pass = results.len() >= 6;
     let open: Vec<&str> = results
       .iter()
@@ -2502,6 +2572,8 @@ impl Daemon {
     enforce: bool,
     undo: bool,
     net: bool,
+    net_restrict: bool,
+    allow_hosts: Vec<String>,
     grants: Vec<String>,
     launcher_tty: u64,
   ) -> Response {
@@ -2557,24 +2629,51 @@ impl Daemon {
       (low, cold, tier, granted)
     };
     // tiers 0-1: enforce+undo forced regardless of flags (trust was
-    // earned down — full fail-closed containment). net is NOT forced at
-    // any tier: Landlock ABI4 net rules are port-scoped, so allowing the
-    // LLM API (443) also allows 443 exfil, and forcing net denies the
-    // API itself — the agent cannot run, produces no edits, gets
-    // auto-reverted, and the project can never earn trust back. This is
-    // an unrecoverable deadlock, found live by real-session dogfooding
-    // (2026-09-16): the cold branch already avoided it (8d6ca8b) but the
-    // low-trust branch still forced net, and the B8.2 broker turned the
-    // silently-skipped flag into a real IP restriction. Egress remains
-    // detect-not-prevent (canary honeypot, C10a); the floor is the
-    // filesystem envelope + undo + canaries.
-    let (enforce, undo, net) = if low_trust && granted.is_empty() {
-      (true, true, net)
+    // earned down — full fail-closed containment).
+    //
+    // P11: destination-scoped egress (`net_restrict`) is ALSO forced at
+    // tiers 0-1, via the broker's IP allowlist. This is the mechanism
+    // that makes the floor real without the deadlock found live on
+    // 2026-09-16: Landlock's `net` is port-scoped, so allowing 443 for
+    // the LLM API also allows 443 exfil, and forcing it denied the API
+    // itself — no edits, auto-revert, trust stays 0, unrecoverable. The
+    // broker allowlist is destination-scoped, so the LLM provider stays
+    // reachable while everything else is denied.
+    //
+    // Cold start is NOT forced: absence of history is not evidence of
+    // misbehavior, and a stranger's first session should not be unable
+    // to fetch a dependency. Cold still forces undo (C11).
+    //
+    // Landlock's port-scoped `net` is never forced at any tier.
+    let egress_grant = granted.iter().any(|g| g == "egress");
+    let (enforce, undo, net, mut net_restrict) = if low_trust && granted.is_empty() {
+      (true, true, net, true)
     } else if cold_trust && granted.is_empty() {
-      (enforce, true, net)
+      (enforce, true, net, net_restrict)
     } else {
-      (enforce, undo, net)
+      (enforce, undo, net, net_restrict)
     };
+    // The effective allowlist is resolved HERE, daemon-side, so the
+    // policy the broker enforces and the policy the launch profile
+    // records are the same list. A missing allowlist under a forced
+    // restriction is deny-all: the honest fail-closed state, and the
+    // CLI says so loudly.
+    let allow_hosts: Vec<String> = if net_restrict && !egress_grant {
+      resolve_allow_hosts(&allow_hosts)
+    } else if egress_grant {
+      // a human-approved egress grant: unrestricted for this launch
+      net_restrict = false;
+      Vec::new()
+    } else {
+      allow_hosts
+    };
+    if low_trust && granted.is_empty() {
+      eprintln!(
+        "castellan-daemon: tier floor active for {} — enforce+undo+egress-restrict (allowlist: {})",
+        project.display(),
+        if allow_hosts.is_empty() { "none (deny-all egress)".into() } else { allow_hosts.join(", ") }
+      );
+    }
     let config_sha = project_config_sha(&project);
     let pinned = config_sha.clone();
     // P9.4 gap-plug: pin the stria phrase index at spawn. The weight
@@ -2658,6 +2757,8 @@ impl Daemon {
           "enforce": enforce,
           "undo": undo,
           "net": net,
+          "net_restrict": net_restrict,
+          "allow_hosts": allow_hosts,
           "forced": low_trust && granted.is_empty(),
           "cold_forced_undo": cold_trust && granted.is_empty() && !low_trust,
           "tier": tier_str,
@@ -2944,15 +3045,23 @@ fn rand_hex(n: usize) -> String {
 /// Channels probed:
 /// - tcp_allowed: TCP connect to the honeypot port (must be ALLOWED)
 /// - tcp_denied:  TCP connect to a non-honeypot port (must be DENIED)
-/// - udp:         UDP send to localhost (expected OPEN — Landlock
-///                ABI4 has no UDP access rights)
+/// - udp:         UDP send to a PUBLIC address (expected OPEN without
+///                the broker; DENIED under a destination policy)
 /// - unix:        unix socket connect outside the session (expected
 ///                OPEN — unix sockets are not covered by Landlock)
-/// - dns:         DNS-crafted UDP query to a resolver (expected OPEN)
+/// - dns:         DNS-crafted UDP query to the resolver (expected OPEN
+///                without the broker; DENIED under a destination policy)
 /// - fs_drop:     write to a world-readable path outside the workspace
 ///                (expected DENIED by Landlock write roots)
 /// - fd_inherit:  write through an inherited fd (expected OPEN — the
 ///                envelope cannot revoke an already-open fd)
+///
+/// P11: the UDP and DNS probes target a PUBLIC address, not loopback.
+/// They previously sent to 127.0.0.1, which the broker always allows
+/// (loopback is the honeypot path), so the census could not distinguish
+/// a working destination policy from a broken one. A loopback UDP send
+/// is still reported as `udp_loopback`, because that channel genuinely
+/// stays open for any local listener.
 pub fn probe_channels(honeypot_port: u16) -> Vec<(String, String)> {
   use std::io::Write as _;
   use std::net::{TcpStream, UdpSocket};
@@ -2974,15 +3083,40 @@ pub fn probe_channels(honeypot_port: u16) -> Vec<(String, String)> {
   };
   out.push(("tcp_denied".into(), tcp_denied));
 
-  // UDP send: Landlock ABI4 has no UDP rights — expected OPEN.
-  let udp = match UdpSocket::bind("127.0.0.1:0") {
-    Ok(s) => match s.send_to(b"probe", ("127.0.0.1", denied_port)) {
-      Ok(_) => "OPEN (UDP not covered by Landlock)".to_string(),
+  // TCP to a PUBLIC destination: the decisive probe for the B8 broker's
+  // destination policy. 1.2.3.4 is TEST-NET-1 (RFC 5737), reserved and
+  // never routed — a connect that "succeeds" would be a kernel-level
+  // false positive, so an EPERM here is unambiguous.
+  let tcp_public = match TcpStream::connect(("1.2.3.4", 443)) {
+    Ok(_) => "ALLOWED (destination policy not enforced)".to_string(),
+    Err(e) => format!("DENIED ({e})"),
+  };
+  out.push(("tcp_public".into(), tcp_public));
+
+  // UDP send to a PUBLIC address. Connected-UDP (connect + send) is
+  // used deliberately: the broker's decision point is `connect`, which
+  // every UDP client performs, and a bare sendto on an unconnected
+  // socket is the implicit-destination path the broker cannot judge.
+  let udp = match UdpSocket::bind("0.0.0.0:0") {
+    Ok(s) => match s.connect(("1.2.3.4", 53)).and_then(|_| s.send(b"probe")) {
+      Ok(_) => "OPEN (UDP not covered)".to_string(),
       Err(e) => format!("DENIED ({e})"),
     },
     Err(e) => format!("bind failed ({e})"),
   };
   out.push(("udp".into(), udp));
+
+  // UDP to a LOCAL listener: genuinely open under every posture, because
+  // loopback is the canary-honeypot path. Recorded so the residual is
+  // explicit rather than implied by the public probe.
+  let udp_loop = match UdpSocket::bind("127.0.0.1:0") {
+    Ok(s) => match s.send_to(b"probe", ("127.0.0.1", denied_port)) {
+      Ok(_) => "OPEN (loopback UDP — local listener channel)".to_string(),
+      Err(e) => format!("DENIED ({e})"),
+    },
+    Err(e) => format!("bind failed ({e})"),
+  };
+  out.push(("udp_loopback".into(), udp_loop));
 
   // Unix socket connect outside the session — expected OPEN.
   let unix = match UnixStream::connect("/tmp/castellan-channels-probe.sock") {
@@ -2991,12 +3125,21 @@ pub fn probe_channels(honeypot_port: u16) -> Vec<(String, String)> {
   };
   out.push(("unix".into(), unix));
 
-  // DNS-crafted UDP query to a resolver — expected OPEN.
-  let dns = match UdpSocket::bind("127.0.0.1:0") {
-    Ok(s) => match s.send_to(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00", ("127.0.0.1", 53)) {
-      Ok(_) => "OPEN (DNS exfil possible)".to_string(),
-      Err(e) => format!("DENIED ({e})"),
-    },
+  // DNS-crafted UDP query to the system resolver. Under the tier floor
+  // the resolver is NOT in the allowlist (a reachable resolver is a DNS
+  // tunnel), so this must be DENIED; without a destination policy it
+  // stays OPEN.
+  let dns = match UdpSocket::bind("0.0.0.0:0") {
+    Ok(s) => {
+      let target = castellan_broker::resolver_ips()
+        .first()
+        .map(|ip| (ip.to_string(), 53u16))
+        .unwrap_or_else(|| ("1.2.3.4".to_string(), 53u16));
+      match s.connect(&target).and_then(|_| s.send(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00")) {
+        Ok(_) => "OPEN (DNS exfil possible)".to_string(),
+        Err(e) => format!("DENIED ({e})"),
+      }
+    }
     Err(e) => format!("bind failed ({e})"),
   };
   out.push(("dns".into(), dns));

@@ -86,10 +86,33 @@ supervisor installs the notif filter and forks the agent, which then applies the
 envelope. `test/shell.d/b8-broker.sh` → **9/9 on kernel 7.0.3** (both manager
 routes denied, ordinary unix + loopback + git survive); cross-kernel
 verification on **7.1.8** (.227) matches. With `--net`, public TCP `1.2.3.4:443`
-→ `PUB_DENIED` by destination. The B8.1 kill criterion's UDP/DNS clause is
-**open**: `restrict_ip` denies UDP to a public resolver as a connect target, but
-the original criterion (a full D6 rerun under a dogfood hour) has not been run;
-recorded here rather than claimed.
+→ `PUB_DENIED` by destination.
+
+**Kill criterion — MET by measurement (2026-09-17, P11).** The UDP/DNS clause is
+closed, but not by `--net`: `--net` is Landlock's port-scoped rule, which cannot
+keep the LLM API reachable and therefore cannot be the floor. The D6 census now
+runs in both postures (`castellan channels run [--net-restrict]`) and records:
+
+| Channel | Audit | Restricted (tier floor) |
+|---|---|---|
+| TCP public | DENIED | **DENIED (broker, EPERM)** |
+| UDP public | OPEN | **DENIED (broker, EPERM)** |
+| DNS to resolver | OPEN | **DENIED (broker, EPERM)** |
+| UDP loopback | OPEN | OPEN (residual) |
+| Inherited fd | OPEN | OPEN (residual) |
+
+`test/channels-census.sh` runs both and prints the table. The census was
+rewritten to probe a **public** destination (1.2.3.4, RFC 5737 TEST-NET-1) and to
+run its probe **through the broker** (`supervise_capture`): it previously probed
+loopback only, which the broker always allows, so it could not distinguish a
+working destination policy from a broken one — it proved nothing about the
+mechanism it audited.
+
+**Hole found by the census, then closed:** the first restricted run read DNS
+OPEN, because `/etc/resolv.conf` on a systemd-resolved host points at the LOCAL
+stub `127.0.0.53`, which the blanket loopback allowance passed and which then
+relays upstream. The policy now denies the stub's exact (ip, port) pairs while
+leaving every other loopback port — the canary honeypot included — alone.
 
 **Residual:** a harness that legitimately needs the desktop session bus
 (portal dialogs, tray integration) is denied it under enforce. Recorded, not
@@ -140,16 +163,14 @@ path:
 Cross-kernel (7.1.8 on .227): b8-broker route blocking verified
 (T4_BLOCKED, bus blocked, no over-block), matching 7.0.3.
 
-**Not run / open:** the D6 channel-census rerun under a full dogfood hour
-(the B8.1 UDP/DNS kill criterion), and `v3-corpus.sh` (its pre-registered
-criteria were already evaluated 2026-09-02; re-running after a broker change is
-a real-session-program task, not a B8 gate). `p9-policycheck.sh` fails 1/6
-without its `/tmp/opencode/scan-proj` fixture (missing fixture, not a broker
-regression — verified: 5/6 with the fixture, and policycheck runs clean against
-the live repo).
+**Not run / open:** `v3-corpus.sh` under the broker (its pre-registered criteria
+were evaluated 2026-09-02 and again on real sessions 2026-09-16; re-running
+under a broker change is a real-session-program task, not a B8 gate).
+`p9-policycheck.sh` fails 1/6 without its `/tmp/opencode/scan-proj` fixture
+(missing fixture, not a broker regression — verified: 5/6 with the fixture, and
+policycheck runs clean against the live repo).
 
-THREAT_MODEL C35/C36 added; C10a remains the honest egress inventory (the broker
-narrows it under `--net`, but the full census rerun is pending).
+THREAT_MODEL C35/C36 added; C10a re-measured in both postures (2026-09-17).
 
 ---
 

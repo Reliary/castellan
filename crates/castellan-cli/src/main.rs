@@ -271,11 +271,19 @@ fn drill_req(args: &[String]) -> serde_json::Value {
 }
 
 fn channels_req(args: &[String]) -> serde_json::Value {
-  match args.first().map(|s| s.as_str()) {
-    Some("run") => serde_json::json!({"op": "channels_run"}),
-    Some("status") | None => serde_json::json!({"op": "channels_status"}),
-    Some(other) => {
-      eprintln!("usage: castellan channels [run|status]");
+  let mut net_restrict = false;
+  let mut rest: Vec<&str> = Vec::new();
+  for a in args {
+    match a.as_str() {
+      "--net-restrict" => net_restrict = true,
+      other => rest.push(other),
+    }
+  }
+  match rest.first() {
+    Some(&"run") => serde_json::json!({"op": "channels_run", "net_restrict": net_restrict}),
+    Some(&"status") | None => serde_json::json!({"op": "channels_status"}),
+    Some(_) => {
+      eprintln!("usage: castellan channels [run [--net-restrict]|status]");
       std::process::exit(2);
     }
   }
@@ -474,12 +482,68 @@ fn bless_req(args: &[String]) -> serde_json::Value {
   }
 }
 
+/// P11: operator-declared egress destinations, in precedence order.
+///
+/// The LLM provider host MUST be reachable or the agent cannot run at
+/// all, so the operator declares it. The sources are deliberately
+/// operator-owned, never agent-writable: the harness's own provider
+/// config lives in the agent's writable state root, so deriving the
+/// allowlist from it would let the agent authorize its own egress.
+///
+///  1. explicit `--allow-host` flags (already collected)
+///  2. `CASTELLAN_EGRESS_ALLOW_HOSTS` (comma-separated)
+///  3. `$XDG_CONFIG_HOME/castellan/egress.toml` `[llm] hosts = [...]`
+fn allow_hosts_from_config(restrict: bool, explicit: &[String]) -> Vec<String> {
+  if !restrict && explicit.is_empty() && std::env::var("CASTELLAN_EGRESS_ALLOW_HOSTS").is_err() {
+    return Vec::new();
+  }
+  let mut hosts: Vec<String> = explicit.to_vec();
+  if let Ok(raw) = std::env::var("CASTELLAN_EGRESS_ALLOW_HOSTS") {
+    for h in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+      if !hosts.iter().any(|e| e == h) {
+        hosts.push(h.to_string());
+      }
+    }
+  }
+  let cfg = std::env::var("XDG_CONFIG_HOME")
+    .map(std::path::PathBuf::from)
+    .unwrap_or_else(|_| {
+      std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+    })
+    .join("castellan/egress.toml");
+  if let Ok(text) = std::fs::read_to_string(&cfg) {
+    #[derive(serde::Deserialize)]
+    struct Egress {
+      llm: Option<LlmHosts>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LlmHosts {
+      #[serde(default)]
+      hosts: Vec<String>,
+    }
+    match toml::from_str::<Egress>(&text) {
+      Ok(cfgv) => {
+        for h in cfgv.llm.unwrap_or(LlmHosts { hosts: Vec::new() }).hosts {
+          let h = h.trim().to_string();
+          if !h.is_empty() && !hosts.iter().any(|e| *e == h) {
+            hosts.push(h);
+          }
+        }
+      }
+      Err(e) => eprintln!("castellan: ignoring {} ({e})", cfg.display()),
+    }
+  }
+  hosts
+}
+
 fn launch(args: &[String], sock: &str) -> ! {
   let mut harness: Option<String> = None;
   let mut project = std::env::current_dir().unwrap_or_default();
   let mut enforce = true;
   let mut undo = false;
   let mut net = false;
+  let mut net_restrict = false;
+  let mut allow_hosts: Vec<String> = Vec::new();
   let mut grants: Vec<String> = Vec::new();
   let mut cmd: Option<Vec<String>> = None;
   let mut i = 0;
@@ -497,6 +561,11 @@ fn launch(args: &[String], sock: &str) -> ! {
       "--no-enforce" => enforce = false,
       "--undo" => undo = true,
       "--net" => net = true,
+      "--net-restrict" => net_restrict = true,
+      "--allow-host" if i + 1 < args.len() => {
+        allow_hosts.push(args[i + 1].clone());
+        i += 1;
+      }
       "--grant" if i + 1 < args.len() => {
         grants.push(args[i + 1].clone());
         i += 1;
@@ -515,7 +584,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   let cmd = match cmd {
     Some(c) if !c.is_empty() => c,
     _ => {
-      eprintln!("usage: castellan launch [--harness H] [--project P] [--no-enforce] [--undo] [--net] [--grant WANT] -- <command> [args...]");
+      eprintln!("usage: castellan launch [--harness H] [--project P] [--no-enforce] [--undo] [--net] [--net-restrict] [--allow-host HOST]... [--grant WANT] -- <command> [args...]");
       std::process::exit(2);
     }
   };
@@ -542,6 +611,8 @@ fn launch(args: &[String], sock: &str) -> ! {
     "enforce": enforce,
     "undo": undo,
     "net": net,
+    "net_restrict": net_restrict,
+    "allow_hosts": allow_hosts,
     "grants": grants,
     "launcher_tty": launcher_tty()
   }));
@@ -568,21 +639,48 @@ fn launch(args: &[String], sock: &str) -> ! {
     .as_ref()
     .and_then(|p| p.get("cold_forced_undo").and_then(|f| f.as_bool()))
     .unwrap_or(false);
+  // P11: the daemon decides the effective destination policy. `net_restrict`
+  // is the broker's IP allowlist — it can force egress down to the LLM API
+  // without the deadlock that Landlock's port-scoped `net` caused. The
+  // resolved allowlist comes back in the profile so the CLI and the
+  // daemon never disagree about what was permitted.
+  let profile_net_restrict = profile
+    .as_ref()
+    .and_then(|p| p.get("net_restrict").and_then(|n| n.as_bool()))
+    .unwrap_or(false);
+  let profile_allow_hosts: Vec<String> = profile
+    .as_ref()
+    .and_then(|p| p.get("allow_hosts").and_then(|h| h.as_array()))
+    .map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect())
+    .unwrap_or_default();
   let consumed: Vec<String> = profile
     .as_ref()
     .and_then(|p| p.get("grants").and_then(|g| g.as_array()))
     .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
     .unwrap_or_default();
   if forced {
-    eprintln!("castellan: trust tier <= 1 — forcing enforce+undo (fail-closed)");
+    eprintln!("castellan: trust tier <= 1 — forcing enforce+undo+net-restrict (fail-closed)");
     enforce = true;
     undo = true;
-    // net is not forced at any tier: it denies the LLM API and deadlocks
-    // the project at tier 0 (see the daemon spawn comment).
+    // P11: destination-scoped egress is forced (the broker allowlist
+    // keeps the LLM API reachable, so this cannot deadlock). Landlock's
+    // port-scoped `net` is NOT forced at any tier: allowing 443 for the
+    // LLM API also allows 443 exfil, and forcing it denied the API
+    // itself — the tier-0 deadlock found live on 2026-09-16.
+    net_restrict = true;
   } else if cold_forced_undo {
     eprintln!("castellan: no trust history — forcing undo for this first session (keep or undo to earn the default)");
     undo = true;
   }
+  if profile_net_restrict && !net_restrict {
+    eprintln!("castellan: daemon set the destination policy (net-restrict)");
+  }
+  net_restrict = profile_net_restrict;
+  let allow_hosts = if profile_allow_hosts.is_empty() {
+    allow_hosts_from_config(net_restrict, &allow_hosts)
+  } else {
+    profile_allow_hosts
+  };
   if !consumed.is_empty() {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
   }
@@ -739,19 +837,45 @@ fn launch(args: &[String], sock: &str) -> ! {
   let broker = castellan_broker::spawn_broker();
   match broker {
     Ok(castellan_broker::Spawn::Supervisor(mut sup)) => {
+      // P11: the broker's IP allowlist is a separate mechanism from
+      // Landlock's port-scoped rule. `--net` (or the floor) sets
+      // restrict_ip; the operator's allowlist is the LLM provider plus
+      // anything else declared. An empty allowlist under restrict_ip is
+      // deny-all-by-exception, and that is the honest fail-closed state.
       let mut bpolicy = castellan_broker::EgressPolicy::new();
-      bpolicy.restrict_ip = net;
-      if net {
-        // Under --net, allow the daemon honeypot port's loopback and the
-        // provider hosts resolved at launch time (LLM API survival).
-        let hosts: Vec<String> = std::env::var("CASTELLAN_EGRESS_ALLOW_HOSTS")
-          .ok()
-          .map(|h| h.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-          .unwrap_or_default();
-        bpolicy = bpolicy.with_hosts(&hosts);
+      if net_restrict {
+        bpolicy = bpolicy.with_llm_only(&allow_hosts);
+        if !allow_hosts.is_empty() {
+          eprintln!(
+            "castellan: egress restricted to loopback + {} declared host(s): {}",
+            allow_hosts.len(),
+            allow_hosts.join(", ")
+          );
+        } else {
+          eprintln!("castellan: egress restricted to loopback only — the agent will not reach its LLM API");
+        }
       }
-      let (btx, _brx) = castellan_broker::broker_log();
+      let (btx, brx) = castellan_broker::broker_log();
+      let state_dir = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+          std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+        });
+      // The supervisor is outside the agent's envelope, so it is the only
+      // process that can honestly record what the agent attempted. Denies
+      // land on the session spine; the ProofCertificate's bounds proof
+      // counts them as out-of-bounds attempts.
+      let recorder = std::thread::spawn(move || {
+        let sink = castellan_core::EventSink::for_session(&state_dir, &session);
+        while let Ok(ev) = brx.recv() {
+          if let (Ok(sink), Some((kind, detail, verdict))) = (sink.as_ref(), ev.as_spine_row()) {
+            let _ = sink.emit(&kind, &detail, verdict);
+          }
+        }
+      });
       let _ = sup.run(&mut bpolicy, &btx);
+      drop(btx);
+      let _ = recorder.join();
       std::process::exit(sup.finish());
     }
     Ok(castellan_broker::Spawn::Agent) => {

@@ -108,7 +108,9 @@ dependencies = [
  "castellan-ledger",
  "castellan-policy",
  "nix",
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -125,6 +127,7 @@ dependencies = [
 name = "castellan-daemon"
 version = "0.1.0"
 dependencies = [
+ "castellan-broker",
  "castellan-campaign",
  "castellan-canary",
  "castellan-core",

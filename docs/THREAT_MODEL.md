@@ -114,20 +114,27 @@ An external attacker targets the agent, the harness, or the safety system.
 ### C10. Cgroup-hop escape (T4, live-verified 2026-08-27, kernel 7.0.3)
 **Vector 1 (self-migration) is kernel-closed:** writing own pid to a parent `cgroup.procs` returns EBUSY — the kernel refuses a process moving itself out of its own subtree. **Vector 2 is OPEN:** the agent asks the user manager (`systemd-run --user --unit=...`) to spawn a sibling unit under `app.slice/`. No cgroup write, no unit-file write (the private socket is not covered by Landlock ABI4 net rules — port-scoped — nor by classic-BPF seccomp, which cannot dereference the sockaddr). The escaped process is outside the session cgroup: freeze does not touch it, `kill_all` does not reach it — **the kill switch is defeated for escaped processes.** Mitigation: session-end orphan census (N6) — at kill, enumerate processes started during the session window whose parent is the user manager and whose cgroup is outside the session scope; report and kill them. Enforce mode does not close this vector (the socket is not a file write). Documented as residual: a determined agent can always escape the session scope via the user manager; the census bounds the blast radius to the session window.
 
-### C10a. Exfil channel census (P9.1, live-verified 2026-08-28, kernel 7.0.3)
-**The channel inventory is now a dated, kernel-verified fact, not an assumption.** D6 (drill `channels`) applies the full envelope (Landlock + seccomp + net lockdown) in a sacrificial child and probes every egress channel. Verdicts on this kernel:
+### C10a. Exfil channel census (P9.1 + P11, live-verified 2026-09-17, kernel 7.0.3)
+**The channel inventory is now a dated, kernel-verified fact, measured in both postures.** D6 (drill `channels`) applies the full envelope in a sacrificial child and probes every egress channel. The census runs twice: once in the audit posture (Landlock + seccomp) and once **under the tier floor's destination policy** (the P11 broker IP allowlist), because the two differ and the difference is the actual evidence.
 
-| Channel | Verdict | Why |
+| Channel | Audit posture | Restricted (tier floor) |
 |---|---|---|
-| TCP connect (honeypot port) | ALLOWED | the one permitted connect |
-| TCP connect (other port) | DENIED (EACCES) | Landlock ABI4 NET_CONNECT_TCP |
-| UDP send | **OPEN** | Landlock ABI4 has no UDP access rights |
-| Unix socket connect | **OPEN** | unix sockets not covered by Landlock |
-| DNS-crafted UDP query | **OPEN** | same UDP gap |
-| Filesystem drop (~/.ssh) | DENIED (EACCES) | Landlock write-root deny list |
-| Inherited-fd write | **OPEN** | an fd opened before the envelope cannot be revoked |
+| TCP connect (honeypot port) | ALLOWED | ALLOWED |
+| TCP connect (other loopback port) | DENIED | DENIED |
+| TCP connect (public, 1.2.3.4) | DENIED | DENIED |
+| TCP connect (public) via broker | not applicable | **DENIED (EPERM from the broker)** |
+| UDP send (public) | OPEN | **DENIED (EPERM from the broker)** |
+| DNS query to the resolver | OPEN | **DENIED (EPERM from the broker)** |
+| UDP send (loopback) | OPEN | OPEN — local listener channel |
+| Unix socket connect | DENIED (Landlock blocks the /tmp path on this kernel) | DENIED |
+| Filesystem drop (~/.ssh) | DENIED | DENIED |
+| Inherited-fd write | OPEN | OPEN — the envelope and the broker cannot revoke an fd opened before them |
 
-**Consequence:** the `--net` lockdown is a TCP-connect lockdown, not an egress lockdown. An enforced agent can still exfil via UDP (including DNS tunneling), unix sockets, and inherited fds. The canary honeypot remains the primary egress detector — it is the only mechanism that catches these channels (a canary secret sent over ANY channel trips it). Mitigations designed, not built: UDP access rights do not exist in Landlock ABI4 (kernel limitation); seccomp cannot filter by sockaddr; inherited-fd revocation would require a seccomp user-notif fd audit (designed, not built). The census re-runs on the drill schedule, so a kernel upgrade that changes any verdict is detected and re-recorded, not assumed.
+**What the destination policy closes (P11, 2026-09-17):** public TCP, public UDP, and DNS. This is the B8.1 kill criterion's UDP/DNS clause, now measured rather than assumed.
+
+**A real hole found by the census and closed:** the first restricted run read DNS **OPEN**. The cause: `/etc/resolv.conf` points at `127.0.0.53` (systemd-resolved's LOCAL stub), and the broker's blanket loopback allowance passed it — the stub then relays to the real upstream, so DNS was an unmonitored egress path and a tunnel channel. Fixed by denying the stub's exact (ip, port) pairs (`127.0.0.53:53`, `127.0.0.54:53`) under a destination policy while leaving every other loopback port — the canary honeypot included — alone. A denial scoped to a relay, not to loopback as a class.
+
+**Honest residuals under the tier floor:** (a) loopback UDP to a local listener is open, because loopback is the canary honeypot path and the two are not separable by destination; (b) an fd connected before the filter was installed cannot be revoked (kernel property, both Landlock and the broker); (c) the broker's allow path uses `CONTINUE`, so a racing thread that rewrites a `sockaddr` between our check and the kernel's re-read can redirect a permitted connect — the kernel's documented limitation, and the reason the broker is a detection/denial layer for the LLM-agent threat model, not a hard boundary against a malicious multi-threaded actor.
 
 ### C11. Slow-drip campaigns (T1)
 **residual, detected post-hoc.** An attack split across sessions/days defeats per-session spines and per-session detection. Mitigation (built 2026-08-27): longitudinal project-level correlation (N1) — maximal-run campaign detector over the cross-session trust-event stream (castellan-campaign). The planned seq-engine structural layer was KILLed by probe (tautological expectations on event-derived tokens, zero expectations on composite-only encoding, no fingerprint separation on real spines) — see PRIMITIVES.md. P8.2 (built 2026-08-27) adds scale-invariant campaign signatures: per-kind time-histograms over normalized time (discrete Mellin-domain sampling) — dilation-invariant (a 3-hour attack and its 3-week dilation produce the same signature) and discriminative (probe-validated: cross-dilation cosine 0.87-0.99, cross-family 0.29-0.35). Advisory-only: signatures annotate, never auto-enforce.
@@ -223,7 +230,7 @@ An external attacker targets the agent, the harness, or the safety system.
 | Pre-existing compromise | residual | clean-install prerequisite documented |
 | Indirect prompt injection (semantic) | mitigated | blast radius bounded by envelope + proxy, confusion not prevented |
 | Cgroup-hop escape (C10) | residual | orphan census bounds blast radius; kernel closes self-migration |
-| Exfil channels (C10a) | residual, inventoried | D6 census live-verified 2026-08-28: UDP/unix/DNS/inherited-fd OPEN; canary honeypot is the only cross-channel detector |
+| Exfil channels (C10a) | residual, narrowed | D6 census re-measured 2026-09-17 in both postures: the tier floor's destination policy DENIES public TCP, public UDP, and DNS (the resolver-stub hole found and closed in the same pass); loopback UDP, inherited fds, and the broker's documented CONTINUE TOCTOU remain open |
 | Slow-drip campaigns (C11) | residual | campaign detector + scale-invariant signatures built (P8.2) |
 | Detection-oracle probing (C12) | mitigated by design | two-tier response designed, not built |
 | Mimicry + prototype poisoning (C13) | mitigated by design | kept-only folding designed, not built; immune memory daemon-only writes built (P8.1) |

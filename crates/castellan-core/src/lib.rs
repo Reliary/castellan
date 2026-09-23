@@ -113,6 +113,16 @@ pub enum Request {
     undo: bool,
     #[serde(default)]
     net: bool,
+    /// B8/P11: destination-scoped egress (the broker's IP allowlist).
+    /// Distinct from `net` (Landlock's port-scoped rule): this one can
+    /// keep the LLM API reachable while denying everything else, so the
+    /// trust floor can force it without bricking the agent.
+    #[serde(default)]
+    net_restrict: bool,
+    /// Operator-declared destinations allowed under `net_restrict`:
+    /// the LLM provider, and anything else the human wants reachable.
+    #[serde(default)]
+    allow_hosts: Vec<String>,
     /// Expansion wants this launch wants to consume. The daemon
     /// consumes daemon-side one-shot grants (keyed project:want);
     /// a consumed grant overrides the tier floor (human decision).
@@ -256,7 +266,12 @@ pub enum Request {
   },
   /// P9.1: exfil channel census — run the D6 drill now (manual
   /// trigger) and return the kernel-verified channel inventory.
-  ChannelsRun,
+  /// P11: `net_restrict` runs the probe under the egress broker, so the
+  /// census measures the destination policy a low-trust session gets.
+  ChannelsRun {
+    #[serde(default)]
+    net_restrict: bool,
+  },
   /// P9.1: report the last channel census results.
   ChannelsStatus,
   /// P9.3: cross-session contact tracing — sessions that wrote files

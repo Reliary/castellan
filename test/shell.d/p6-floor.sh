@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # P6 trust-floor acceptance: the tier floor must confine (enforce+undo)
-# without deadlocking the agent.
+# and gate egress, without deadlocking the agent.
 #
 # Regression for the 2026-09-16 dogfooding find: the low-trust branch
 # forced net=true, which denies the LLM API. The agent could not run,
@@ -10,9 +10,12 @@
 # pre-B8.2 Landlock half silently no-opped because the CLI read the
 # honeypot port from the wrong JSON field.
 #
-# This suite proves BOTH halves:
-#   A. a tier-0 project launches a session that actually runs (no net
-#      forcing, no API denial)
+# P11 (2026-09-17) resolved the deadlock properly instead of just
+# removing the forcing: the floor now forces the broker's
+# destination-scoped egress, which gates egress WITHOUT denying the LLM
+# API. This suite proves both halves:
+#   A. a tier-0 project launches a session that actually runs, with the
+#      destination policy announced and the port-scoped net unforced
 #   B. the honeypot port is read correctly (the --net path applies when
 #      requested, not silently skipped)
 set -u
@@ -68,19 +71,28 @@ else
   bad "could not drive trust down: $SCORE"
 fi
 
-# ---- A. tier 0 does NOT force net, and the session runs ------------
-echo "== tier floor: enforce+undo forced, net NOT forced =="
+# ---- A. tier 0 forces net-RESTRICT, not net; and the session runs -----
+# P11 (2026-09-17) changed the contract. The floor now forces the
+# broker's destination-scoped egress (`--net-restrict`), NOT Landlock's
+# port-scoped `--net`. Both properties matter and they are different:
+#   --net          Landlock, port-scoped: allowing 443 for the LLM API
+#                  also allows 443 exfil, and forcing it denied the API
+#                  itself — the deadlock this suite exists to catch.
+#   --net-restrict broker, destination-scoped: the declared LLM host
+#                  stays reachable and everything else is EPERM. It can
+#                  therefore be the floor without bricking the agent.
+echo "== tier floor: enforce+undo+net-restrict forced, net NOT forced =="
 OUT=$(script -qec "
   export XDG_STATE_HOME='$XDG_STATE_HOME'
   '$CASTELLAN' launch --harness pi --project '$WORK/proj' --enforce -- bash -c 'echo RAN_OK' 2>&1
 " /dev/null)
 echo "$OUT" > "$WORK/floor.out"
 grep -q "RAN_OK" "$WORK/floor.out" && ok "session ran under the floor (no net deadlock)" || bad "session did not run"
-grep -q "forcing enforce+undo" "$WORK/floor.out" && ok "enforce+undo forced (banner)" || bad "floor banner missing the expected shape"
-if grep -q "forcing enforce+undo+net" "$WORK/floor.out"; then
-  bad "net is still forced — the tier-0 API deadlock is back"
+grep -q "forcing enforce+undo+net-restrict" "$WORK/floor.out" && ok "enforce+undo+net-restrict forced (banner)" || bad "floor banner missing the expected shape"
+if grep -q "forcing enforce+undo+net$\|forcing enforce+undo+net " "$WORK/floor.out"; then
+  bad "port-scoped net is forced again — the tier-0 API deadlock is back"
 else
-  ok "net NOT forced (the deadlock regression)"
+  ok "port-scoped net NOT forced (the deadlock regression)"
 fi
 
 # ---- B. --net applies when requested (port parse) -------------------

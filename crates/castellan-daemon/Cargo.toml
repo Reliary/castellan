@@ -34,6 +34,9 @@ castellan-trace = { path = "../castellan-trace" }
 castellan-decoy = { path = "../castellan-decoy" }
 castellan-policycheck = { path = "../castellan-policycheck" }
 castellan-broker = { path = "../castellan-broker" }
+castellan-keyring = { path = "../castellan-keyring" }
+castellan-proxy = { path = "../castellan-proxy" }
+rustls = { workspace = true }
 sha2 = "0.10"
 toml = "0.8"
 serde = { workspace = true }

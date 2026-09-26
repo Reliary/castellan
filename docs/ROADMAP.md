@@ -152,6 +152,30 @@ Kernel findings recorded during build:
 - semgrep live-verified: 1.172.0 installed (pysemgrep entrypoint; the OCaml wrapper needs pysemgrep on PATH). Local offline rule (gets() detection), live keep → finding → vuln_introduced trust signal → evidence names scanner=semgrep.
 - **Composed-verified 2026-08-28**: `test/shell.d/p9-stack.sh` — one fresh project, one daemon, everything composed in single sessions (overlay + placebo + hub weight + artifact scan + decoys + trace + policycheck). 12/12 PASS. Session A (good) and Session B (bad: decoy weaponized → DECOY TRIP, trace exposes B) in one flow.
 
+## Phase 12 — Egress proxy + credential keyring (built 2026-09-26)
+
+**Scope:** close commitment C4's mechanism gap — real credentials exist
+for the session without ever entering the envelope. `castellan-keyring`
+(daemon-resident, config-dir file, zeroized, host-bound, sha-pinned per
+session) + `castellan-proxy` (per-session localhost CONNECT MITM with a
+per-session in-memory CA, strip agent auth headers, inject the bound
+credential, enforce the session's resolved allowlist, spine rows) +
+launcher env (`HTTP(S)_PROXY`/`NO_PROXY`/`SSL_CERT_FILE`-family +
+Landlock loopback port) + `castellan proxy off` kill switch.
+
+**Deliverables (all built):**
+- `castellan-keyring` — load-once from `$XDG_CONFIG_HOME/castellan/keyring.toml`; bearer|x-api-key|basic schemes frozen; exact/`*.suffix` host binding; config sha pinned into the session record.
+- `castellan-proxy` — rcgen per-session CA (key memory-only under S0), leaf per target, rustls both hops, `close_notify` both hops, `Connection: close` one-exchange model, `egress_inject`/`egress_deny` spine rows.
+- daemon: proxy lifecycle at spawn/kill, `proxy_status`/`proxy_off` ops; CLI: env injection + `castellan proxy` verb.
+- `test/shell.d/p12-proxy.sh` + proxy integration tests (stub TLS upstream).
+
+**Kill criterion (pre-committed in `docs/plans/p12-egress-proxy-keyring.md`):** K1–K6 all pass, else the phase ships reduced (no-enforce / keyring-disabled) or is killed.
+**Status: PASSES — p12 suite 25/25; integration 4/4 (K2 injection, K6 no-injection, K3c 403, K5 poison); regressions green (p0 15, p1 13, p4 5, p9-stack 12, p11 12; 161 unit/integration tests).** Live findings recorded during the run: three python/OpenSSL certificate strictness failures (empty-subject-SAN criticality, missing AKI, missing CA keyUsage) — fixed in the leaf/CA params; a pre-existing cross-process spine race surfaced by concurrent proxy+audit emission — fixed by flock (C40).
+
+**Dependencies:** P11 (resolved allowlist is the proxy policy), P6 (floor), S0/C37 (memory-only key boundary), C5 (canary path must stay direct — `NO_PROXY`).
+
+**Estimated effort:** the plan estimated ~1 week; actual: same session, with three certificate-strictness rounds and one concurrency fix found by the suite.
+
 ## Total
 
 ~12-14 weeks of build at honest pace, sequenced. P0 ships first as a standalone demoable wedge and the first upstream PR. Each phase gates on its kill criterion; failure → reduced scope, not hand-waving.

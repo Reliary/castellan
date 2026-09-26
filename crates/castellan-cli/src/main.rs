@@ -41,6 +41,7 @@ fn main() {
     "policycheck" => policycheck_req(&args[1..]),
     "memory" => memory_req(&args[1..]),
     "voice" => voice_req(&args[1..]),
+    "proxy" => proxy_req(&args[1..]),
     "help" | "--help" | "-h" => print_usage_and_exit(),
     other => {
       eprintln!("unknown command: {other}");
@@ -307,6 +308,20 @@ fn policycheck_req(args: &[String]) -> serde_json::Value {
     "project": project,
     "candidate_project": candidate,
   })
+}
+
+fn proxy_req(args: &[String]) -> serde_json::Value {
+  match args.first().map(|s| s.as_str()) {
+    Some("off") => {
+      let session = args.get(1).cloned();
+      serde_json::json!({"op": "proxy_off", "session": session})
+    }
+    Some("status") | None => serde_json::json!({"op": "proxy_status"}),
+    Some(_) => {
+      eprintln!("usage: castellan proxy [status|off [session]]");
+      std::process::exit(2);
+    }
+  }
 }
 
 fn memory_req(args: &[String]) -> serde_json::Value {
@@ -684,6 +699,42 @@ fn launch(args: &[String], sock: &str) -> ! {
   if !consumed.is_empty() {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
   }
+  // P12: point the session at its egress proxy. The CA bundle the
+  // session trusts is daemon-minted per session (system roots +
+  // session CA); SSL_CERT_FILE et al. steer OpenSSL/curl, Node, Python
+  // and cargo at it. NO_PROXY keeps the canary honeypot reachable
+  // directly — a proxied canary probe would hit the proxy's 501 and
+  // never trip the wire (C5 must keep working).
+  let proxy_port: u16 = profile
+    .as_ref()
+    .and_then(|p| p.get("proxy_port"))
+    .and_then(|v| v.as_u64())
+    .unwrap_or(0) as u16;
+  let ca_cert: String = profile
+    .as_ref()
+    .and_then(|p| p.get("ca_cert"))
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_string();
+  if proxy_port > 0 && !ca_cert.is_empty() {
+    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+    unsafe {
+      std::env::set_var("HTTP_PROXY", &proxy_url);
+      std::env::set_var("HTTPS_PROXY", &proxy_url);
+      std::env::set_var("http_proxy", &proxy_url);
+      std::env::set_var("https_proxy", &proxy_url);
+      std::env::set_var("NO_PROXY", "localhost,127.0.0.1");
+      std::env::set_var("no_proxy", "localhost,127.0.0.1");
+      std::env::set_var("SSL_CERT_FILE", &ca_cert);
+      std::env::set_var("NODE_EXTRA_CA_CERTS", &ca_cert);
+      std::env::set_var("REQUESTS_CA_BUNDLE", &ca_cert);
+      std::env::set_var("CARGO_HTTP_CAINFO", &ca_cert);
+      std::env::set_var("CURL_CA_BUNDLE", &ca_cert);
+    }
+    eprintln!(
+      "castellan: egress via session proxy 127.0.0.1:{proxy_port} (real credentials injected daemon-side)"
+    );
+  }
   let _ = &session;
   // undo overlay FIRST: setup enters a user+mount namespace and mounts
   // the overlay. The envelope's seccomp filter blocks mount(2), so
@@ -775,7 +826,14 @@ fn launch(args: &[String], sock: &str) -> ! {
       if port == 0 {
         eprintln!("--net requested but daemon honeypot is detached; continuing WITHOUT net lockdown");
       } else {
-        policy.set_net(castellan_policy::NetMode::Loopback(vec![port]));
+        // P12: the session proxy listens on loopback too; Landlock's
+        // port-scoped rule must admit it or the agent cannot reach its
+        // own egress path (the proxy would be unreachable under enforce).
+        let mut ports = vec![port];
+        if proxy_port > 0 {
+          ports.push(proxy_port);
+        }
+        policy.set_net(castellan_policy::NetMode::Loopback(ports));
       }
     }
     if let Err(e) = castellan_envelope::apply_envelope(&policy) {
@@ -1407,6 +1465,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan policycheck <proj> <cand>    policy regression replay (P9.6, advisory)");
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
+  eprintln!("  castellan proxy [status|off [session]]   egress proxy control (P12)");
   eprintln!("  castellan daemon                 start the daemon (foreground)");
   std::process::exit(2);
 }

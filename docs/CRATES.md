@@ -13,7 +13,8 @@ castellan/
 │   ├── castellan-proof/            ProofCertificate assembly + export (was evidence-pack), placebo pipeline (was proof-fixes), relay-vuln + config-radar wiring
 │   ├── castellan-completeness/     config key audit (was config-radar). seq-engine KILLed 2026-08-27 — see PRIMITIVES.md
 │   ├── castellan-replay/           action-stream extraction, overlayfs shadow execution, permissive-case diff
-│   ├── castellan-egress/           HTTP proxy, real-cred injection, canary honeypot listener
+│   ├── castellan-keyring/           P12 daemon-resident credentials: zeroized secrets, exact/*.suffix host binding, config-sha pin (loaded once, config dir only)
+│   ├── castellan-proxy/             P12 per-session egress proxy: rcgen per-session CA, rustls MITM, strip+inject auth, allowlist = session policy, spine rows
 │   ├── castellan-canary/           credential planting, honeypot trigger → freeze wiring
 │   ├── castellan-radar/            sensor-hdc encoding, local outlier (ed25519 signing: DESIGN-ONLY — see commitment #9)
 │   ├── castellan-drill/            P8.0 live-fire drills: nonce registry, scheduler, 5-drill suite
@@ -50,7 +51,7 @@ castellan/
 - **rustc-hash FxHash** maps in hot paths (matches reliary-agent).
 - **ahash** where insertion-heavy and not security-sensitive (matches reliary-compress).
 - **rayon** for parallel ingest/reindex/scavenger (matches reliary-agent).
-- **NO HTTP framework** for the egress proxy — hyper or a minimal hand-rolled parser. The proxy is in the trusted path and must be auditable; small surface.
+- **NO HTTP framework** for the egress proxy — hyper or a minimal hand-rolled parser. The proxy is in the trusted path and must be auditable; small surface. Shipped (P12): **httparse** (head parsing only) + **rustls** (ring provider, both hops) + **rcgen** (per-session CA and leaf minting) — no framework, no async runtime, threads only.
 - **NO parsers, ASTs, tree-sitter, per-language code** — grammar-free, no exceptions.
 
 ## Crate dependency graph (proposed)

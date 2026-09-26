@@ -1,0 +1,18 @@
+[package]
+name = "castellan-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Per-session credential-injecting egress proxy (P12)."
+publish.workspace = true
+
+[dependencies]
+castellan-core = { path = "../castellan-core" }
+castellan-keyring = { path = "../castellan-keyring" }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-native-certs = { workspace = true }
+rcgen = { workspace = true }
+httparse = { workspace = true }

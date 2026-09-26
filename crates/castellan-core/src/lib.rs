@@ -287,6 +287,16 @@ pub enum Request {
     project: PathBuf,
     candidate_project: PathBuf,
   },
+  /// P12: report live egress proxies (session -> port).
+  ProxyStatus,
+  /// P12: stop the egress proxy for one session (or all). The listener
+  /// closes; the next agent request to the proxy port is refused.
+  /// Kernel posture is unchanged (B8 still denies direct egress), so
+  /// this is fail-closed.
+  ProxyOff {
+    #[serde(default)]
+    session: Option<SessionId>,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,6 +464,16 @@ impl EventSink {
   }
 
   pub fn emit(&self, kind: &str, path: &str, verdict: &str) -> io::Result<()> {
+    // Cross-process append lock: the spine has multiple concurrent
+    // emitters (daemon audit watcher, launcher broker recorder, proxy
+    // threads) and tip() -> append() is a read-modify-write — without
+    // flock, two emitters interleave and the S1 chain breaks at a
+    // stale `prev` (observed live in p12). The lockfile lives next to
+    // the spine; drop of the guard releases it.
+    let lock_path = self.path.with_extension("jsonl.lock");
+    let lock_file = OpenOptions::new().create(true).write(true).open(&lock_path)?;
+    let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
+      .map_err(|(_, e)| io::Error::from(e))?;
     let mut ev = Event {
       ts: now_unix(),
       session: self.session.clone(),

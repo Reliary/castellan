@@ -294,6 +294,14 @@ pub struct Daemon {
   /// the S0 probe). None = key generation failed; certificates are then
   /// assembled unsigned and say so.
   signing_key: Option<Arc<castellan_proof::signing::SigningKey>>,
+  /// P12: live per-session egress proxies (credential injection). The
+  /// handle's Drop stops the listener; kill removes and drops.
+  proxies: Arc<Mutex<FxHashMap<SessionId, castellan_proxy::ProxyHandle>>>,
+  /// P12: daemon-resident credentials, loaded ONCE at start from
+  /// `$XDG_CONFIG_HOME/castellan/keyring.toml` (outside every envelope).
+  keyring: Arc<castellan_keyring::Keyring>,
+  /// P12: upstream TLS trust for the proxy (system roots).
+  proxy_tls: Arc<rustls::ClientConfig>,
 }
 
 impl Daemon {
@@ -389,6 +397,27 @@ impl Daemon {
       trusted_ttys: Arc::new(Mutex::new(FxHashMap::default())),
       swept: Arc::new(Mutex::new(FxHashSet::default())),
       signing_key,
+      proxies: Arc::new(Mutex::new(FxHashMap::default())),
+      keyring: {
+        let cfgdir = std::env::var("XDG_CONFIG_HOME")
+          .map(PathBuf::from)
+          .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+          });
+        let path = cfgdir.join("castellan/keyring.toml");
+        let k = castellan_keyring::Keyring::load(&path);
+        if k.is_empty() {
+          eprintln!("castellan-daemon: no keyring at {} — proxy runs without injection", path.display());
+        } else {
+          eprintln!(
+            "castellan-daemon: keyring loaded ({} credential(s), sha={})",
+            k.len(),
+            &k.sha()[..12]
+          );
+        }
+        Arc::new(k)
+      },
+      proxy_tls: castellan_proxy::native_tls_config(),
     };
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
@@ -835,6 +864,31 @@ impl Daemon {
         Response::ok().with_extra("channels", serde_json::json!({ "inventory": json }))
       }
       Request::TraceExpose { compromised } => self.trace_expose(&compromised),
+      Request::ProxyStatus => {
+        let m = self.proxies.lock().unwrap();
+        let list: Vec<serde_json::Value> = m
+          .iter()
+          .map(|(sid, h)| serde_json::json!({ "session": sid, "port": h.port }))
+          .collect();
+        Response::ok().with_extra("proxies", serde_json::json!({ "live": list, "keyring_sha": self.keyring.sha(), "credentials": self.keyring.len() }))
+      }
+      Request::ProxyOff { session } => {
+        let mut m = self.proxies.lock().unwrap();
+        let stopped: Vec<String> = match session {
+          Some(sid) => m.remove(&sid).map(|h| { drop(h); sid }).into_iter().collect(),
+          None => {
+            let ids: Vec<String> = m.keys().cloned().collect();
+            for sid in &ids {
+              if let Some(h) = m.remove(sid) {
+                drop(h);
+              }
+            }
+            ids
+          }
+        };
+        Response::ok().with_message(format!("proxy off for {} session(s)", stopped.len()))
+          .with_extra("stopped", serde_json::json!(stopped))
+      }
     }
   }
 
@@ -2691,6 +2745,32 @@ impl Daemon {
     let _ = std::fs::create_dir_all(
       Self::state_dir().join("castellan/sessions").join(&id),
     );
+    // P12: per-session credential-injecting egress proxy. The policy it
+    // enforces IS the session's resolved destination policy (same
+    // allow_hosts the B8 broker gets), so the proxy and the kernel
+    // broker never disagree. A start failure degrades to today's
+    // posture (no proxy env, canaries only) — honest, not fatal.
+    let proxy_port: u16 = {
+      let pcfg = castellan_proxy::ProxyConfig {
+        session: id.clone(),
+        state_dir: Self::state_dir(),
+        allow_hosts: allow_hosts.clone(),
+        restrict: net_restrict,
+        keyring: self.keyring.clone(),
+        client_tls: self.proxy_tls.clone(),
+      };
+      match castellan_proxy::start(pcfg) {
+        Ok(h) => {
+          let port = h.port;
+          self.proxies.lock().unwrap().insert(id.clone(), h);
+          port
+        }
+        Err(e) => {
+          eprintln!("castellan-daemon: egress proxy unavailable for {id} ({e}) — session runs without credential injection");
+          0
+        }
+      }
+    };
     // B7: witness the launcher's terminal at spawn. Only a tty the
     // daemon has seen as a launcher tty (inode-bound) may later run
     // session-less global ops (freeze-all/thaw-all/kill-all) — an
@@ -2749,6 +2829,16 @@ impl Daemon {
       undo,
       net,
     );
+    let ca_cert = if proxy_port > 0 {
+      Self::state_dir()
+        .join("castellan/sessions")
+        .join(&id)
+        .join("ca.pem")
+        .to_string_lossy()
+        .into_owned()
+    } else {
+      String::new()
+    };
     Response::ok()
       .with_message(format!("spawned session {id}"))
       .with_extra(
@@ -2763,6 +2853,9 @@ impl Daemon {
           "cold_forced_undo": cold_trust && granted.is_empty() && !low_trust,
           "tier": tier_str,
           "grants": granted,
+          "proxy_port": proxy_port,
+          "ca_cert": ca_cert,
+          "keyring_sha": self.keyring.sha(),
         }),
       )
   }
@@ -2788,6 +2881,7 @@ impl Daemon {
         "harness": harness,
         "config_sha": config_sha,
         "hub_index_sha": castellan_hub::index_sha(project),
+        "keyring_sha": self.keyring.sha(),
         "command": command,
         "enforce": enforce,
         "undo": undo,
@@ -2884,6 +2978,11 @@ impl Daemon {
     let targets = self.resolve_targets(session);
     let mut msgs = Vec::new();
     for id in targets {
+      // P12: stop the session's egress proxy first (Drop closes the
+      // listener); kernel posture (B8) is unchanged — fail-closed.
+      if let Some(h) = self.proxies.lock().unwrap().remove(&id) {
+        drop(h);
+      }
       let (harness, started_at) = {
         let reg = self.registry.lock().unwrap();
         (reg.get(&id).map(|s| s.harness.clone()), reg.get(&id).map(|s| s.started_at))

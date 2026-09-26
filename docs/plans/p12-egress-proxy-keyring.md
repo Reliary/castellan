@@ -289,3 +289,47 @@ claude -p "check gh api /user"` → real API call succeeds, agent never
 sees the token, spine has the `egress_inject` row, honeypot drill still
 trips. Commit message states K1–K6 plainly. ROADMAP gets a P12 entry with
 the pass/fail record.
+
+---
+
+## Execution record (2026-09-26 — run after the gates above were frozen)
+
+**Verdict: K1–K6 ALL PASS.** No gate was re-gated; no threshold changed.
+
+| Gate | Result |
+|---|---|
+| K1 credential-never-enters-envelope | PASS — keyring token absent from daemon log, session state, session json; env carries only proxy port + public CA cert; `/proc/<daemon>/mem` EACCES (S0 holds for the CA key); session pins `keyring_sha` = config-dir file sha256 |
+| K2 injection end-to-end | PASS — integration test: stub TLS upstream sees `Authorization: Bearer REAL-SECRET`, never `canary-value`; client sees 200; body intact |
+| K3 allowlist at three layers | PASS — K3a direct public TCP EPERM (broker); K3b agent-set foreign proxy env still EPERM; K3c non-allowlisted CONNECT → 403 before any dial |
+| K4 fail-closed on proxy death | PASS — `proxy off`: harness sees ECONNREFUSED; the session itself observes REFUSED (inside view); direct egress still EPERM |
+| K5 workspace-poisoned keyring | PASS — poison token absent from daemon state; session keyring pin unchanged |
+| K6 unbound = no injection | PASS — allowlisted-but-unbound host proxied with no auth header (integration test) |
+| Suite extras | K7 env (HTTPS_PROXY/NO_PROXY/SSL_CERT_FILE-family + session tag), K8 distinct per-session CA bundles, K9 spine `egress_inject`+`egress_deny` with S1 chain intact — all PASS. `p12-proxy.sh` 25/25; proxy tests 4/4; workspace tests 161/161; regressions p0 15, p1 13, p4 5, p9-stack 12, p11 12. |
+
+**Implementation deviations from the plan text (all pre-run or found by
+the frozen gates — recorded, not smoothed):**
+
+1. **Per-session CA instead of per-boot** (plan §6 check2 said per-boot
+   fingerprints change across restarts): per-session CA is strictly
+   tighter — the check passes a fortiori (K8).
+2. **Spine flock added (C40)** — a pre-existing cross-process
+   tip→append race surfaced by K9c under concurrent proxy+audit
+   emission. The gate did its job: it caught a real defect, the defect
+   was fixed, the gate was not touched.
+3. **Certificate strictness rounds** — three python/OpenSSL3
+   requirements found by the in-session client (empty-subject SAN must
+   be critical → leaf gets CN; leaf needs AKI; CA needs KU keyCertSign).
+   The Rust integration test passed earlier because rustls is lenient —
+   recorded in C39 as a testing asymmetry.
+4. **`Connection: close` one-exchange model** (plan mentioned
+   keep-alive tolerance as future): v0 ships single-exchange; responses
+   pipe to EOF with `close_notify` both hops (rustls0.23 rejects
+   FIN-without-notify — found by the integration test).
+5. **K2/K6/K3c-integration live in `crates/castellan-proxy/tests/mitm.rs`**
+   (deterministic stub TLS upstream) and are run by the p12 suite via
+   `cargo test -p castellan-proxy`, rather than being re-implemented
+   as shell checks. The shell suite covers K1/K3/K4/K5/K7/K8/K9 plus
+   in-session CONNECT behavior.
+
+**Not in scope of this run (per plan §8), unchanged:** Secret Service
+keyring backend, fleet sync, QUIC, DNS filtering, trust-score changes.

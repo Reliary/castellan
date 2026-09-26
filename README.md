@@ -51,10 +51,11 @@ only, not read or egress blocking.
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified kernels: 7.0.3 and 7.1.8 (x86_64).
 
 ```sh
-# option 1: prebuilt binary from the GitHub release
-curl -LO <release-binary-url>  # see Releases; or build from source:
-# option 2: from source
-cargo build --release --workspace
+# prebuilt binary from the release (v0.1.0, free, MIT)
+# https://github.com/Reliary/castellan/releases/tag/v0.1.0
+chmod +x castellan && ./castellan preflight
+# or build from source:
+# cargo build --release --workspace
 ./target/release/castellan preflight    # all 6 checks must pass
 ./target/release/castellan daemon &     # or run as a systemd user unit (recommended)
 ```

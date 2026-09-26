@@ -83,3 +83,13 @@ proof-carrying agent actions. All exist in some form.
   doc supersedes those surveys.
 - "OpenAI Linux distro" is **unverified rumor** — no such distro exists
   per this survey. Do not cite it.
+- **Sept 2026 addendum:** `nolabs-ai/nono` (4.2k★, Rust, Sigstore team)
+  now ships a same-story product — zero-setup cross-platform sandbox
+  (macOS/Linux/Windows), credential proxy **with L7 per-method/per-path
+  endpoint policy**, per-command sandboxes, profile registry, enterprise
+  adoption. Claude Code ships a SOCKS5 domain-allowlist proxy
+  harness-level. The §"Genuinely unbuilt" composition claim above is
+  therefore narrowed: what remains plausibly unique is the
+  canary-tripwire-with-freeze, the placebo-controlled trust signal, and
+  the unprivileged desktop-native form — each verifiable in-repo. No
+  "first" language.

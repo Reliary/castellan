@@ -2,7 +2,7 @@
 
 **The OS is the trust boundary for AI agents.**
 
-Castellan is a Linux-native agent safety system that confines, observes, and proves what AI coding agents do on your machine — at the kernel level, where prompt injection cannot reach. It is being designed as a contribution to [Omarchy](https://github.com/basecamp/omarchy) (DHH's Arch + Hyprland distro), but the core is reusable on any systemd + Landlock Linux.
+Castellan is a Linux-native agent safety system that confines, observes, and proves what AI coding agents do on your machine — at the kernel level, where prompt injection cannot reach. It runs on any systemd + Landlock Linux. Free software, MIT licensed.
 
 > **Status: working.** Built and acceptance-tested on Linux 7.x / Landlock ABI 8–9: session substrate + freeze (P0), the envelope floor with audit + enforce launch, now the default (P1/B6), surgical undo + canary credentials (P2), earned autonomy (trust engine + placebo-proof pipeline + bless-broker, P3), proof-carrying sessions with hash-chained spines and ed25519 signing (P4/chapter 5), trust→envelope coupling and the fail-closed floor (P6), the frontier-round socket identity + timer sweep (B7), the seccomp egress broker (B8), the destination-scoped egress floor (P11), and the credential-injecting egress proxy + daemon keyring (P12) — real credentials reach allowlisted hosts without ever entering the envelope. **Demoted honestly:** HV radar shipped then was demoted to advisory-forever by its own kill criterion (47% FP on the scripted corpus, 70% on real sessions); the seq-engine port was killed before building (probe). **Not built:** HV fleet sync, mid-session expansion restart, Merkle transparency log. Every claim below is scoped accordingly; see [docs/ROADMAP.md](docs/ROADMAP.md) for phase status, [docs/PRIOR_ART.md](docs/PRIOR_ART.md) for what already exists elsewhere, and [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for how claims get earned.
 
@@ -46,6 +46,21 @@ session writes invisible to the real project (overlayfs upper layer);
 the narrow-jail product claim is write-containment + undo + canaries
 only, not read or egress blocking.
 
+## Install (free)
+
+Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified kernels: 7.0.3 and 7.1.8 (x86_64).
+
+```sh
+# option 1: prebuilt binary from the GitHub release
+curl -LO <release-binary-url>  # see Releases; or build from source:
+# option 2: from source
+cargo build --release --workspace
+./target/release/castellan preflight    # all 6 checks must pass
+./target/release/castellan daemon &     # or run as a systemd user unit (recommended)
+```
+
+Then see Quickstart below.
+
 ## Quickstart
 
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified kernels: 7.0.3 and 7.1.8 (x86_64).
@@ -66,10 +81,6 @@ castellan verify cert.json                 # re-check the signature + spine chai
 ```
 
 `--harness` is auto-detected from the command (claude, codex, pi, opencode, aider, cursor-agent, gemini, crush); unknown harnesses still get the envelope, just no harness-state protection. `--no-enforce` opts out loudly (audit mode) — for debugging only.
-
-## Why this fits Omarchy
-
-Omarchy already treats agents as first-class (launchers, agents panel, crash diagnosis) but ships no safety story — its manual says "be ready to rollback if the agent makes a mess." Castellan slots onto existing motifs: channels ↔ trust tiers, migrations ↔ session migrations, snapshots ↔ surgical undo, agents panel ↔ freeze toggle. The core is reusable on any systemd + Landlock Linux regardless of whether Omarchy takes it.
 
 ## What we bring
 
@@ -100,7 +111,6 @@ docs/
   PRIMITIVES.md                internal primitive inventory with real-data verdicts
   DESIGN_DECISIONS.md          antagonism record: what died, what hardened, why
   CRATES.md                    Rust workspace layout
-  upstream-strategy.md         Omarchy integration path and PR sequence
   benchmark-methodology.md     cert-evals interleaved + placebo + SHA-256 cert
   glossary.md                  terms
   components/                  per-component design docs with status

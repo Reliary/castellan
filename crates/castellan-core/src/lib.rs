@@ -471,7 +471,7 @@ impl EventSink {
     // stale `prev` (observed live in p12). The lockfile lives next to
     // the spine; drop of the guard releases it.
     let lock_path = self.path.with_extension("jsonl.lock");
-    let lock_file = OpenOptions::new().create(true).write(true).open(&lock_path)?;
+    let lock_file = OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
     let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
       .map_err(|(_, e)| io::Error::from(e))?;
     let mut ev = Event {

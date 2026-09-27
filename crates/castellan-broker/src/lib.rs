@@ -11,18 +11,21 @@
 //!   socket no filesystem rule covers. The broker reads
 //!   `sockaddr_un` paths and denies the manager sockets.
 //!
-//! Safety shape (validated in B8.0, revised in B8.2, hardened in F4):
+//! Safety shape (B8.0, revised B8.2, re-revised F4c):
 //! - **deny** — `-errno`, the kernel never executes the syscall. Robust:
 //!   a racing thread cannot turn a deny into an execution.
-//! - **allow** — flags=0 (NO continue). The kernel executes the syscall
-//!   with the entry-time arguments it already copied; a racing thread
-//!   cannot redirect the sockaddr post-check (proven live in F4 round 4:
-//!   216,766 denied-connect wins with CONTINUE in 20s at 90% denied bias;
-//!   re-test with flags=0 is the acceptance gate). The old CONTINUE
-//!   note below is retained as history of the defeated shape.
-//! - **(defeated)** `CONTINUE` re-read arguments from tracee memory —
-//!   the race the F4 test exploited. We never modify arguments, so we
-//!   never set CONTINUE.
+//! - **allow** — `CONTINUE` (mandatory: without it the kernel skips
+//!   execution and returns resp.val — proven live in F4b, reverted).
+//!   CONTINUE re-reads pointer arguments at execution, so a racing
+//!   thread CAN redirect a checked-allowed connect — closed instead by:
+//!   (a) STABILITY: CONNECT sockaddrs are read twice 2ms apart; a flip
+//!   denies as dest-unstable (full-speed flippers never agree; legit
+//!   agents pay 2ms/connect); (b) RATE: >1000 connects/sec/pid throttles
+//!   the pid for 10s (flippers need volume; agents never trip it).
+//!   Residual: a slow flipper (<1 flip/2ms) under the rate cap can still
+//!   win individual races — measured in the F4c gate, documented below.
+//! - **(defeated)** flags=0 allow: fake-success without execution
+//!   (F4b experiment, reverted same session).
 //!
 //! Why not the supervisor-performs-connect + ADDFD pattern (the B8.0
 //! plan)? Empirically falsified in B8.2: `ADDFD_FLAG_SEND` returns the
@@ -560,6 +563,16 @@ fn notification_dest(req: &SeccompNotif) -> Option<Sockaddr> {
 /// be denied rather than allowed.
 pub enum DestRead {
   Parsed(Sockaddr),
+  /// F4c: the destination was read STABLY (same bytes across spaced
+  /// re-reads) — the anti-flipper agreement signal. decide_dest treats
+  /// it like Parsed; the distinction is recorded in the spine reason
+  /// ("stable-ipv4" vs "ipv4") so a future audit can tell a stable
+  /// decision from a single-read one.
+  Stable(Sockaddr),
+  /// F4c: the destination FLIPPED between spaced re-reads — a live
+  /// race in progress. Always denied ("dest-unstable"), counts on the
+  /// spine, and feeds the per-pid rate limiter below.
+  Unstable,
   /// The syscall carries no destination (sendto on an already-connected
   /// socket, or a connect form we do not parse) — vetted at connect time.
   None,
@@ -568,16 +581,44 @@ pub enum DestRead {
 }
 
 pub fn read_dest(req: &SeccompNotif) -> DestRead {
+  read_dest_stable(req, false)
+}
+
+/// F4c: stability-checked destination read. When `check` is true (the
+/// CONNECT path — new destinations are the race target), the sockaddr
+/// bytes are read, the thread sleeps 2ms, and the bytes are read again:
+/// agreement yields Stable, disagreement yields Unstable (always
+/// denied). A full-speed flipper mutates every ~100ns, so two reads
+/// 2ms apart never agree — its connects all die as dest-unstable while
+/// legit agents (stable sockaddrs) pay 2ms per connect. UDP/sendmsg
+/// explicit-dest paths keep single-read (unchecked) — see the F4c note
+/// in decide_dest for why the residual there is accepted.
+pub fn read_dest_stable(req: &SeccompNotif, check: bool) -> DestRead {
   let nr = req.data.nr as i64;
   let read = |ptr: u64, len: u64| read_tracee(req.pid, ptr, len as usize);
   match nr {
-    libc::SYS_connect => match read(req.data.args[1], req.data.args[2]) {
-      Some(buf) => match parse_sockaddr(&buf) {
-        Some(sa) => DestRead::Parsed(sa),
+    libc::SYS_connect => {
+      let (ptr, len) = (req.data.args[1], req.data.args[2]);
+      match read(ptr, len) {
+        Some(first) => {
+          if !check {
+            return match parse_sockaddr(&first) {
+              Some(sa) => DestRead::Parsed(sa),
+              None => DestRead::Unreadable,
+            };
+          }
+          std::thread::sleep(std::time::Duration::from_millis(2));
+          match read(ptr, len) {
+            Some(second) if second == first => match parse_sockaddr(&first) {
+              Some(sa) => DestRead::Stable(sa),
+              None => DestRead::Unreadable,
+            },
+            _ => DestRead::Unstable,
+          }
+        }
         None => DestRead::Unreadable,
-      },
-      None => DestRead::Unreadable,
-    },
+      }
+    }
     libc::SYS_sendto => {
       // sendto(fd, buf, len, flags, dest_addr, addrlen). glibc implements
       // send() as sendto with a NULL destination on a connected socket,
@@ -649,6 +690,25 @@ pub fn decide_dest(
       let (v, r) = decide(sa, policy);
       (v, r, sa.detail())
     }
+    DestRead::Stable(sa) => {
+      let (v, r) = decide(sa, policy);
+      // stable- prefix marks the anti-flipper agreement path on the spine.
+      let reason: &'static str = match r {
+        "ipv4" => "stable-ipv4",
+        "ipv6" => "stable-ipv6",
+        "resolver-stub" => "resolver-stub",
+        other => other,
+      };
+      (v, reason, sa.detail())
+    }
+    // F4c: a flipping destination is a live race. Deny always, count
+    // loudly. Note the accepted residual: single-read UDP/sendmsg
+    // explicit-dest paths can still race (same CONTINUE shape), but
+    // winning requires the flipper to also beat the CONNECT gate first
+    // for TCP (every TCP send needs a connected socket, and connects
+    // are stability-gated) — UDP exfil to a denied IP via a raced
+    // sendto remains the residual. It is rate-limited below.
+    DestRead::Unstable => (Verdict::Deny, "dest-unstable", String::new()),
     // An implicit destination means the socket was vetted when it was
     // connected, and `connect` is intercepted. This MUST stay allowed:
     // glibc's send() is a sendto with a NULL destination and most TLS
@@ -673,6 +733,9 @@ pub fn decide_dest(
 fn send_response(listener: RawFd, id: u64, error: i32, flags: u32) -> io::Result<()> {
   let mut resp = SeccompNotifResp { id, val: 0, error, flags };
   let rc = unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &mut resp) };
+  if std::env::var("CASTELLAN_BROKER_DEBUG").is_ok() {
+    eprintln!("castellan-broker: send_response id={id} error={error} flags={flags} rc={rc}");
+  }
   if rc < 0 {
     let e = io::Error::last_os_error();
     if e.raw_os_error() != Some(libc::ENOENT) {
@@ -686,22 +749,19 @@ fn respond(listener: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<
   if verdict == Verdict::Deny {
     return send_response(listener, req.id, -libc::EPERM, 0);
   }
-  // Allow: WITHOUT CONTINUE the kernel executes the syscall with the
-  // arguments as they were AT NOTIFICATION TIME (the notification carries
-  // a frozen copy in req.data.args for scalar args; for POINTER args
-  // like sockaddr the kernel... re-reads? No: without CONTINUE the
-  // kernel proceeds with the saved register state, and for connect the
-  // sockaddr was already copied into kernel memory at syscall entry —
-  // a racing thread CANNOT redirect it post-check. CONTINUE exists to
-  // let the supervisor MODIFY arguments; we never modify, so plain
-  // allow (flags=0) is both faster and race-free.
-  // F4 (2026-09-27, .227 breakout round 4): proven live — with CONTINUE,
-  // a flipper thread alternating allowed/denied sockaddr won 216,766
-  // denied-connect executions in 20s (90%-denied bias). Without CONTINUE
-  // the race window closes by construction: the kernel acts on the
-  // entry-time copy it already validated. The crate-level TOCTOU note
-  // is superseded for connect/sendto/sendmsg/sendmmsg.
-  send_response(listener, req.id, 0, 0)
+  // Allow: CONTINUE. The kernel re-reads pointer arguments (sockaddr)
+  // from tracee memory at execution — a racing thread CAN redirect a
+  // checked-allowed connect to a denied destination (F4 round 4: 216,766
+  // denied-connect wins in 20s at 90% denied bias, getpeername-proven).
+  // flags=0 is NOT a fix: without CONTINUE the kernel skips execution
+  // and returns resp.val (0) — every allowed syscall fake-succeeds
+  // without executing (connect "succeeds" unconnected, sendto returns 0
+  // forever; proven live, reverted same session). There is no third
+  // response mode. CONTINUE is mandatory for a working broker; the race
+  // is closed instead by STABILITY (multi-read agreement, below) and
+  // RATE (per-pid connect cap) — a flipper needs volume + instability,
+  // both of which are now the tripwire.
+  send_response(listener, req.id, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE)
 }
 
 /// Install the notification filter on the current process and return
@@ -774,7 +834,23 @@ pub struct Broker {
   pub listener: RawFd,
   pub agent_pid: libc::pid_t,
   agent_status: Option<i32>,
+  /// F4c: per-pid notification rate gate. A flipper needs volume
+  /// (~100k notifies/sec at full speed); legit agents connect rarely
+  /// (an LLM API call is one reused connection). (pid -> (window_start,
+  /// count, throttled_until)). Checked on every notification; a hot pid
+  /// gets all its connects denied until it cools down.
+  notify_rate: std::collections::HashMap<u32, (std::time::Instant, u32, Option<std::time::Instant>)>,
 }
+
+/// F4c: max CONNECT-class notifications per pid per second before the
+/// pid is throttled (all its connects denied for the cooldown). Normal
+/// agents: single digits/sec. The F4 flipper: ~100k/sec. The gap is
+/// four orders of magnitude; 1000/sec trips no legitimate workload we
+/// have ever measured (the TOCTOU verify run peaked at ~140k/sec from
+/// one pid — unmistakable).
+pub const CONNECT_RATE_PER_SEC: u32 = 1000;
+/// F4c: throttle duration once tripped.
+pub const CONNECT_THROTTLE_SECS: u64 = 10;
 
 /// Run `exe args` under the broker and capture its stdout.
 ///
@@ -897,7 +973,7 @@ fn supervise_capture_inner(
     out
   });
   let mut policy = policy.clone();
-  let mut sup = Broker { listener, agent_pid: pid, agent_status: None };
+  let mut sup = Broker { listener, agent_pid: pid, agent_status: None, notify_rate: std::collections::HashMap::new() };
   let (btx, _brx) = broker_log();
   let _ = sup.run(&mut policy, &btx);
   reader.join().unwrap_or_default()
@@ -946,6 +1022,46 @@ impl Broker {
       }
       count += 1;
       let nr = req.data.nr as i64;
+      // F4c: rate gate (connect-class only — sends are too frequent in
+      // legitimate TLS stacks to cap).
+      if nr == libc::SYS_connect {
+        let now = std::time::Instant::now();
+        let e = self.notify_rate.entry(req.pid).or_insert((now, 0, None));
+        if let Some(until) = e.2 {
+          if now < until {
+            let _ = log.send(BrokerEvent {
+              pid: req.pid,
+              verdict: Verdict::Deny,
+              reason: "connect-throttled",
+              detail: String::new(),
+            });
+            respond(self.listener, &req, Verdict::Deny)?;
+            continue;
+          }
+          e.2 = None;
+          e.0 = now;
+          e.1 = 0;
+        }
+        if now.duration_since(e.0).as_secs() >= 1 {
+          e.0 = now;
+          e.1 = 0;
+        }
+        e.1 += 1;
+        if e.1 > CONNECT_RATE_PER_SEC {
+          e.2 = Some(now + std::time::Duration::from_secs(CONNECT_THROTTLE_SECS));
+          let _ = log.send(BrokerEvent {
+            pid: req.pid,
+            verdict: Verdict::Deny,
+            reason: "connect-flood",
+            detail: format!("{} connects/sec", e.1),
+          });
+          respond(self.listener, &req, Verdict::Deny)?;
+          continue;
+        }
+      }
+      if std::env::var("CASTELLAN_BROKER_DEBUG").is_ok() {
+        eprintln!("castellan-broker: notif nr={nr} pid={} args={:?}", req.pid, req.data.args);
+      }
       // F1: signal syscalls are decided by PID scope, not destination.
       if nr == libc::SYS_kill
         || nr == libc::SYS_tkill
@@ -958,7 +1074,14 @@ impl Broker {
         respond(self.listener, &req, verdict)?;
         continue;
       }
-      let dest = read_dest(&req);
+      // F4c: CONNECT takes the stability-checked path (new
+      // destinations are the race target). All other traps keep the
+      // single-read path.
+      let dest = if nr == libc::SYS_connect {
+        read_dest_stable(&req, true)
+      } else {
+        read_dest(&req)
+      };
       let (verdict, reason, detail) = decide_dest(&dest, policy);
       let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
       respond(self.listener, &req, verdict)?;
@@ -1009,7 +1132,7 @@ pub fn spawn_broker() -> io::Result<Spawn> {
     unsafe { libc::close(listener) };
     return Ok(Spawn::Agent);
   }
-  Ok(Spawn::Supervisor(Broker { listener, agent_pid, agent_status: None }))
+  Ok(Spawn::Supervisor(Broker { listener, agent_pid, agent_status: None, notify_rate: std::collections::HashMap::new() }))
 }
 
 /// Wait for the agent child and return its exit code (128+sig on signal).
@@ -1207,11 +1330,29 @@ mod tests {
   }
 
   #[test]
-  fn toctou_fix_allow_uses_no_continue() {
-    // F4b: the allow path must not set CONTINUE (regression test for
-    // the 216k-wins race). respond() is private; assert the constant
-    // relationship instead: our allow means flags=0. Documented here
-    // so a future CONTINUE reintroduction must delete this test loudly.
+  fn stable_and_unstable_decisions() {
+    // F4c: stability outcomes decide correctly.
+    let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
+    let (v, r, _) = decide_dest(&DestRead::Stable(Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 9)), &p);
+    assert_eq!(v, Verdict::Allow);
+    assert_eq!(r, "stable-ipv4");
+    let (v, _, _) = decide_dest(&DestRead::Stable(Sockaddr::V4(Ipv4Addr::new(8, 8, 8, 8), 53)), &p);
+    assert_eq!(v, Verdict::Deny);
+    let (v, r, _) = decide_dest(&DestRead::Unstable, &p);
+    assert_eq!(v, Verdict::Deny);
+    assert_eq!(r, "dest-unstable");
+  }
+
+  #[test]
+  fn continue_is_required_for_execution() {
+    // F4c (supersedes the F4b no-CONTINUE experiment): flags=0 on an
+    // allow response makes the kernel skip execution and return
+    // resp.val (0) — every allowed syscall fake-succeeds (proven live:
+    // connect "succeeds" unconnected, sendto spins on 0-returns). There
+    // is no third response mode; allow REQUIRES CONTINUE. The TOCTOU
+    // race that CONTINUE re-opens is closed by stability + rate gates
+    // instead. This test pins the constant relationship so a future
+    // flags=0 reintroduction must delete it loudly.
     assert_ne!(SECCOMP_USER_NOTIF_FLAG_CONTINUE, 0);
   }
 

@@ -61,6 +61,24 @@ fn main() {
     }
     std::process::exit(0);
   }
+  // F3 follow-up 5 (2026-09-27, .227 breakout): daemon singleton.
+  // Learned live: stale daemons accumulate on the same socket path
+  // (every test restart binds it again; last-bind-wins per connection),
+  // so "kill the daemon" never empties the socket and no socket-based
+  // watchdog can observe death. Refuse to stack: if the socket already
+  // answers, exit non-zero instead of binding over it. (Stale socket
+  // file with no listener: connect fails -> we bind fresh. A
+  // same-host operator who WANTS two daemons uses XDG_RUNTIME_DIR to
+  // separate them — the socket path already honors it.)
+  {
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+      .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::Uid::current().as_raw()));
+    let sock = std::path::Path::new(&runtime).join("castellan.sock");
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+      eprintln!("castellan-daemon: socket {} already served — refusing to stack (kill the old daemon first)", sock.display());
+      std::process::exit(3);
+    }
+  }
   if let Err(e) = castellan_daemon::Daemon::new().and_then(|d| d.serve()) {
     eprintln!("castellan-daemon: {e}");
     std::process::exit(1);

@@ -12,7 +12,37 @@ fn user_slice_base() -> Option<PathBuf> {
   let uid = nix::unistd::Uid::current().as_raw();
   let unified = PathBuf::from("/sys/fs/cgroup");
   let candidate = unified.join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
-  candidate.is_dir().then_some(candidate)
+  if candidate.is_dir() {
+    return Some(candidate);
+  }
+  // F3 follow-up (2026-09-27, .227 breakout): the supervisor's transient
+  // scope (castellan-hop-*.scope) may live OUTSIDE user@.service
+  // (e.g. directly under user.slice) when the launcher hopped from a
+  // context without a user manager slice. Fall back to locating the
+  // session scope by walking OUR OWN cgroup ancestry: find the
+  // castellan.slice ancestor and use its parent as the base.
+  own_slice_base()
+}
+
+fn own_slice_base() -> Option<PathBuf> {
+  let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+  for line in cg.lines() {
+    if let Some(idx) = line.find("castellan.slice") {
+      // line looks like "0::/user.slice/.../castellan.slice" — the
+      // part after "0::" is the path from the cgroup root.
+      let path = line.split_once("::").map(|(_, p)| p).unwrap_or(line);
+      let full = PathBuf::from("/sys/fs/cgroup").join(&path[..idx + "castellan.slice".len()]);
+      // base = parent of castellan.slice
+      if full.ends_with("castellan.slice") {
+        if let Some(parent) = full.parent() {
+          if parent.is_dir() {
+            return Some(parent.to_path_buf());
+          }
+        }
+      }
+    }
+  }
+  None
 }
 
 impl CgroupRoot {

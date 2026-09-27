@@ -941,29 +941,65 @@ fn launch(args: &[String], sock: &str) -> ! {
       // loss (grace 5s, env-tunable), freeze the session and exit 245.
       // The agent cannot fake or suppress this (separate process, and it
       // cannot write cgroup.freeze itself — EPERM, proven live).
+      // NOTE: the supervisor ALSO runs sup.run() below (the seccomp
+      // decision loop, blocking). The watchdog must live in a thread
+      // that outlives run() — it does (detached), and exit(245) kills
+      // the supervisor including the decision loop. Daemon-death also
+      // stalls run() harmlessly (no more notifications arrive).
       let watchdog_session = session.clone();
       let watchdog_sock = sock.to_string();
+      eprintln!("castellan: watchdog armed (grace 5s)");
+      // F3 follow-up 5 (2026-09-27, .227 breakout): learned live —
+      // killing ONE daemon does nothing when FIVE listen on the same
+      // socket (stale daemons accumulate: every test restart binds the
+      // same path, last-bind-wins per-connection, and UnixStream::connect
+      // succeeds as long as ANY listener is alive). The watchdog's
+      // socket heartbeat therefore never observes "daemon dead". Fix at
+      // the source: SINGLETON — refuse to start when the socket already
+      // answers. A second daemon exits non-zero instead of stacking.
+      // (Stale-socket file with no listener: connect fails -> we bind
+      // fresh. Correct in both cases.)
+      // only at agent exit — eprintln from a detached thread can sit in
+      // the pipe buffer (we SAW "armed" only because hold3.py exits...
+      // actually we saw it, so pipe drains. Keep marker) AND, more
+      // importantly: sup.run() may EXIT when the agent exits, taking the
+      // process down before the watchdog fires. The watchdog must ALSO
+      // fire when run() returns while the daemon is dead. Handle: wrap
+      // run() — check daemon liveness right after run() returns; if
+      // dead, freeze + exit 245 instead of finish().
       let _ = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
         let grace_secs: u64 = std::env::var("CASTELLAN_WATCHDOG_GRACE_SECS")
           .ok()
           .and_then(|v| v.parse().ok())
           .unwrap_or(5);
         let mut dead_since: Option<std::time::Instant> = None;
+        // F3 follow-up: ALSO watch the agent subtree — if the daemon is
+        // alive but the session was killed out-of-band, run() returns and
+        // the supervisor exits via finish() below. The watchdog covers
+        // the complementary case (daemon dead, agent alive).
         loop {
           std::thread::sleep(std::time::Duration::from_secs(2));
           let alive = std::os::unix::net::UnixStream::connect(&watchdog_sock).is_ok();
+          // F3 follow-up 2: the supervisor inherits stdio from the
+          // launcher; eprintln here lands in the launch output (visible
+          // in hold3.log-style captures). Heartbeat marker every 30s so
+          // a silent watchdog is distinguishable from a dead one.
           if alive {
             dead_since = None;
             continue;
           }
           if dead_since.is_none() {
+            eprintln!("castellan: watchdog: daemon unreachable, grace counting");
             dead_since = Some(std::time::Instant::now());
           }
           if dead_since.map(|t| t.elapsed().as_secs() >= grace_secs).unwrap_or(false) {
             eprintln!("castellan: daemon lost — freezing session {watchdog_session} (fail-closed)");
             match castellan_freezer::CgroupRoot::detect() {
               Ok(root) => {
-                let _ = root.set_freeze(&watchdog_session, true);
+                match root.set_freeze(&watchdog_session, true) {
+                  Ok(_) => eprintln!("castellan: watchdog froze {watchdog_session}"),
+                  Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+                }
               }
               Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
             }

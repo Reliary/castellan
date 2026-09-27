@@ -923,11 +923,51 @@ fn launch(args: &[String], sock: &str) -> ! {
       // process that can honestly record what the agent attempted. Denies
       // land on the session spine; the ProofCertificate's bounds proof
       // counts them as out-of-bounds attempts.
+      let recorder_session = session.clone();
       let recorder = std::thread::spawn(move || {
-        let sink = castellan_core::EventSink::for_session(&state_dir, &session);
+        let sink = castellan_core::EventSink::for_session(&state_dir, &recorder_session);
         while let Ok(ev) = brx.recv() {
           if let (Ok(sink), Some((kind, detail, verdict))) = (sink.as_ref(), ev.as_spine_row()) {
             let _ = sink.emit(&kind, &detail, verdict);
+          }
+        }
+      });
+      // F3 (2026-09-27, .227 breakout): daemon-death watchdog. A session
+      // whose daemon dies kept running unfrozen (proven live: SIGTERM to
+      // the daemon, session at freeze=0 kept writing). The supervisor is
+      // OUTSIDE the session scope and outside the agent's envelope, so
+      // it can do what the agent cannot: freeze the session scope via a
+      // same-uid cgroup write. Heartbeat the daemon socket; on sustained
+      // loss (grace 5s, env-tunable), freeze the session and exit 245.
+      // The agent cannot fake or suppress this (separate process, and it
+      // cannot write cgroup.freeze itself — EPERM, proven live).
+      let watchdog_session = session.clone();
+      let watchdog_sock = sock.to_string();
+      let _ = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
+        let grace_secs: u64 = std::env::var("CASTELLAN_WATCHDOG_GRACE_SECS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(5);
+        let mut dead_since: Option<std::time::Instant> = None;
+        loop {
+          std::thread::sleep(std::time::Duration::from_secs(2));
+          let alive = std::os::unix::net::UnixStream::connect(&watchdog_sock).is_ok();
+          if alive {
+            dead_since = None;
+            continue;
+          }
+          if dead_since.is_none() {
+            dead_since = Some(std::time::Instant::now());
+          }
+          if dead_since.map(|t| t.elapsed().as_secs() >= grace_secs).unwrap_or(false) {
+            eprintln!("castellan: daemon lost — freezing session {watchdog_session} (fail-closed)");
+            match castellan_freezer::CgroupRoot::detect() {
+              Ok(root) => {
+                let _ = root.set_freeze(&watchdog_session, true);
+              }
+              Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+            }
+            std::process::exit(245);
           }
         }
       });

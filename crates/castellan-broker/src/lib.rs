@@ -35,6 +35,16 @@
 //!
 //! Residual: an fd connected *before* the filter was installed cannot
 //! be revoked (documented C10a). The broker never sees it.
+//!
+//! - **F1 signal scope (cross-session kill, fixed 2026-09-27):**
+//!   `kill(2)` / `tkill(2)` / `tgkill(2)` / `pidfd_send_signal(2)` are
+//!   routed to user-notify and decided by PID scope — a tracee may
+//!   signal only PIDs that sit in its own session scope (read from
+//!   /proc/<tracee>/cgroup at decision time, compared against
+//!   /proc/<target>/cgroup). The supervisor performs no signaling
+//!   itself, so it never notifies itself. Signals to self
+//!   (pid == tracee, tkill/tgkill to own tid) are always allowed —
+//!   runtimes (bash job control, python) use them constantly.
 
 use std::io;
 use std::mem;
@@ -347,11 +357,14 @@ pub struct BrokerEvent {
 impl BrokerEvent {
   /// A deny is an attempted escape, not a note. The supervisor (which
   /// runs outside the agent's envelope) records it to the session spine
-  /// so the ProofCertificate's bounds proof can count it.
+  /// so the ProofCertificate's bounds proof can count it. F1: a denied
+  /// cross-scope signal lands as `signal_deny` (kill-scope violation).
   pub fn as_spine_row(&self) -> Option<(String, String, &'static str)> {
     if self.verdict == Verdict::Deny {
+      let kind =
+        if self.reason.starts_with("signal-") { "signal_deny" } else { "broker_deny" };
       Some((
-        "broker_deny".to_string(),
+        kind.to_string(),
         format!("{} {} pid={}", self.reason, self.detail, self.pid),
         "deny",
       ))
@@ -380,6 +393,127 @@ fn read_tracee(pid: u32, ptr: u64, len: usize) -> Option<Vec<u8>> {
   } else {
     buf.truncate(n as usize);
     Some(buf)
+  }
+}
+
+/// F1: extract the target PID from a signal-syscall notification.
+/// kill(pid,sig): args[0]=pid. tkill(tid,sig): args[0]=tid (own
+/// thread only — always in-scope). tgkill(tgid,tid,sig): args[1]=tid.
+/// pidfd_send_signal(pidfd,sig,...): resolve /proc/self/fd/<pidfd>
+/// (of the TRACEE, not us) — unreadable means deny.
+fn signal_target_pid(req: &SeccompNotif) -> SignalTarget {
+  match req.data.nr as i64 {
+    libc::SYS_kill => {
+      let pid = req.data.args[0] as i64 as i32;
+      SignalTarget::Pid(pid)
+    }
+    libc::SYS_tkill => SignalTarget::SelfThread,
+    libc::SYS_tgkill => {
+      let tid = req.data.args[1] as i64 as i32;
+      SignalTarget::Tid(tid)
+    }
+    libc::SYS_pidfd_send_signal => SignalTarget::Pidfd(req.data.args[0] as i32),
+    _ => SignalTarget::None,
+  }
+}
+
+enum SignalTarget {
+  Pid(i32),
+  Tid(i32),
+  Pidfd(i32),
+  SelfThread,
+  None,
+}
+
+/// F1: read /proc/<pid>/cgroup and return the castellan session scope
+/// id (`s...` after `castellan.slice/`), or None when the process is
+/// not in any session scope / unreadable.
+fn session_scope_of(pid: u32) -> Option<String> {
+  let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+  for line in cg.lines() {
+    if let Some(idx) = line.find("castellan.slice/") {
+      let rest = &line[idx + "castellan.slice/".len()..];
+      let end = rest.find(|c| c == '\n' || c == '/' || c == ' ').unwrap_or(rest.len());
+      let scope = rest[..end].trim_end_matches(".scope").to_string();
+      if !scope.is_empty() {
+        return Some(scope);
+      }
+    }
+  }
+  None
+}
+
+/// F1: resolve a pidfd (in the TRACEE's fd table) to its target pid
+/// via /proc/<tracee>/fdinfo/<fd>. Returns None when unreadable.
+fn pidfd_target(tracee: u32, fd: i32) -> Option<u32> {
+  let info = std::fs::read_to_string(format!("/proc/{tracee}/fdinfo/{fd}")).ok()?;
+  for line in info.lines() {
+    if let Some(rest) = line.strip_prefix("Pid:") {
+      return rest.trim().parse().ok();
+    }
+  }
+  None
+}
+
+/// F1: decide a signal notification. Same-process and same-scope
+/// signals are allowed; cross-scope signals are denied with EPERM
+/// (mirrors the kernel's own errno for a forbidden signal).
+/// Unreadable scope on either side fails closed (deny).
+pub fn decide_signal(req: &SeccompNotif) -> (Verdict, &'static str, String) {
+  let tracee = req.pid;
+  let (target, self_ok): (Option<u32>, bool) = match signal_target_pid(req) {
+    SignalTarget::SelfThread => (None, true),
+    SignalTarget::Pid(pid) => {
+      if pid <= 0 {
+        // kill(0/-pgid): process-group signaling reaches outside any
+        // scope by construction — deny (agents have no legitimate
+        // use; shells use job control on their own pgrp, which is
+        // inside the scope... except kill(0) reaches the whole pgrp
+        // including the supervisor. Deny all non-positive pids).
+        return (Verdict::Deny, "signal-pgrp", format!("pid={pid}"));
+      }
+      (Some(pid as u32), pid as u32 == tracee)
+    }
+    SignalTarget::Tid(tid) => {
+      // tgkill to own tid (thread self-signal, e.g. abort paths).
+      // Cross-thread tgkill within the same process is decided by
+      // process scope below; resolve tid -> tgid via /proc.
+      if tid <= 0 {
+        return (Verdict::Deny, "signal-pgrp", format!("tid={tid}"));
+      }
+      let tgid = std::fs::read_to_string(format!("/proc/{tid}/stat"))
+        .ok()
+        .and_then(|st| st.rsplit_once(')').map(|(_, r)| r.to_string()))
+        .and_then(|r| r.split_whitespace().nth(1).map(String::from))
+        .and_then(|s| s.parse::<u32>().ok());
+      match tgid {
+        Some(g) if g == tracee => (None, true),
+        Some(g) => (Some(g), false),
+        None => return (Verdict::Deny, "signal-unreadable", format!("tid={tid}")),
+      }
+    }
+    SignalTarget::Pidfd(fd) => match pidfd_target(tracee, fd) {
+      Some(p) => (Some(p), p == tracee),
+      None => return (Verdict::Deny, "signal-unreadable", format!("pidfd={fd}")),
+    },
+    SignalTarget::None => return (Verdict::Allow, "signal-other", String::new()),
+  };
+  if self_ok {
+    return (Verdict::Allow, "signal-self", String::new());
+  }
+  let target = match target {
+    Some(t) => t,
+    None => return (Verdict::Allow, "signal-self", String::new()),
+  };
+  match (session_scope_of(tracee), session_scope_of(target)) {
+    (Some(a), Some(b)) if a == b => {
+      (Verdict::Allow, "signal-same-scope", format!("{tracee}->{target} [{a}]"))
+    }
+    (a, b) => (
+      Verdict::Deny,
+      "signal-cross-scope",
+      format!("{tracee}->{target} [{:?}->{:?}]", a.unwrap_or_default(), b.unwrap_or_default()),
+    ),
   }
 }
 
@@ -536,8 +670,9 @@ fn respond(listener: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<
 }
 
 /// Install the notification filter on the current process and return
-/// the listener fd. The filter intercepts only connect/sendto/sendmsg;
-/// everything else falls through to ALLOW.
+/// the listener fd. The filter intercepts connect/sendto/sendmsg (F1:
+/// also kill/tkill/tgkill/pidfd_send_signal); everything else falls
+/// through to ALLOW.
 ///
 /// Callers use `spawn_broker`, which installs this in the SUPERVISOR
 /// and forks the agent — the filter is inherited across fork/exec, so
@@ -547,10 +682,14 @@ fn respond(listener: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<
 pub fn install_listener() -> io::Result<RawFd> {
   let prog = vec![
     bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
-    // Jump table: connect -> 4, sendto -> 4, sendmsg -> 4, else -> 5.
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 2, 0, libc::SYS_connect as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 1, 0, libc::SYS_sendto as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, libc::SYS_sendmsg as u32),
+    // Jump table: connect/sendto/sendmsg/kill/tkill/tgkill/pidfd_send_signal -> NOTIF, else -> ALLOW.
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 6, 0, libc::SYS_connect as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 5, 0, libc::SYS_sendto as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 4, 0, libc::SYS_sendmsg as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 3, 0, libc::SYS_kill as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 2, 0, libc::SYS_tkill as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 1, 0, libc::SYS_tgkill as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, libc::SYS_pidfd_send_signal as u32),
     bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_USER_NOTIF),
     bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_ALLOW),
   ];
@@ -762,6 +901,19 @@ impl Broker {
         }
       }
       count += 1;
+      let nr = req.data.nr as i64;
+      // F1: signal syscalls are decided by PID scope, not destination.
+      if nr == libc::SYS_kill
+        || nr == libc::SYS_tkill
+        || nr == libc::SYS_tgkill
+        || nr == libc::SYS_pidfd_send_signal
+      {
+        let (verdict, reason, detail) = decide_signal(&req);
+        let _ =
+          log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
+        respond(self.listener, &req, verdict)?;
+        continue;
+      }
       let dest = read_dest(&req);
       let (verdict, reason, detail) = decide_dest(&dest, policy);
       let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
@@ -985,5 +1137,40 @@ mod tests {
       Sockaddr::Unix(p) => assert_eq!(p, b"/run/systemd/private"),
       _ => panic!("expected unix"),
     }
+  }
+
+  #[test]
+  fn signal_pgrp_denied() {
+    let req = SeccompNotif {
+      id: 0,
+      pid: 100,
+      flags: 0,
+      data: SeccompData { nr: libc::SYS_kill as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
+    };
+    assert_eq!(decide_signal(&req).0, Verdict::Deny);
+  }
+
+  #[test]
+  fn signal_self_allowed_without_proc() {
+    // tkill is always own-thread: allowed even when /proc is odd.
+    let req = SeccompNotif {
+      id: 0,
+      pid: 1,
+      flags: 0,
+      data: SeccompData { nr: libc::SYS_tkill as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
+    };
+    assert_eq!(decide_signal(&req).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn signal_unknown_nr_falls_through() {
+    let req = SeccompNotif {
+      id: 0,
+      pid: 1,
+      flags: 0,
+      data: SeccompData { nr: libc::SYS_getpid as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
+    };
+    // not a signal nr: decide_signal treats it as non-signal.
+    assert_eq!(decide_signal(&req).1, "signal-other");
   }
 }

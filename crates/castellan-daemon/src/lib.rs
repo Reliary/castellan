@@ -289,6 +289,12 @@ pub struct Daemon {
   /// "session:unit" so a persistent unit is reported once, not every
   /// sweep.
   swept: Arc<Mutex<FxHashSet<String>>>,
+  /// F2 (2026-09-27, .227 breakout): reserved for the freeze-through
+  /// path. The trip closure captures the cgroup root directly (see
+  /// Daemon::new); this handle stays for future trip-time actions
+  /// that need daemon state. Unused for now.
+  #[allow(dead_code)]
+  freeze_on_trip: Arc<dyn Fn(&str) + Send + Sync>,
   /// S2 (chapter 5): ed25519 signing key, generated at daemon start and
   /// held only in memory (the process is made non-dumpable first, per
   /// the S0 probe). None = key generation failed; certificates are then
@@ -334,9 +340,28 @@ impl Daemon {
     let registry: Arc<Mutex<Registry>> = Arc::new(Mutex::new(Registry::default()));
     let trust_cb = Arc::clone(&trust);
     let reg_cb = Arc::clone(&registry);
+    // F2: freeze-through-daemon. The root is detected ONCE here, in the
+    // daemon's own context, and shared with the trip closure — the old
+    // path re-detected it inside the honeypot thread and failed ENOENT.
+    let root_for_trip = match CgroupRoot::detect() {
+      Ok(r) => Some(Arc::new(r)),
+      Err(e) => {
+        eprintln!("castellan-daemon: cgroup root unavailable ({e}) — canary auto-freeze disabled");
+        None
+      }
+    };
+    let root_cb = root_for_trip.clone();
     let honeypot = match castellan_canary::Honeypot::start_with_callback(
       &state,
       Arc::new(move |session: &str| {
+        // F2: freeze FIRST (containment), then score. The session id is
+        // the one the honeypot attributed from its secret registry.
+        if let Some(root) = root_cb.as_ref() {
+          match root.set_freeze(&session.to_string(), true) {
+            Ok(_) => eprintln!("castellan-daemon: canary trip — session {session} frozen"),
+            Err(e) => eprintln!("castellan-daemon: canary trip freeze failed for {session}: {e:?}"),
+          }
+        }
         // canary hit: apply the negative trust signal to the session's
         // project. Live registry first, then the durable session json —
         // trips can land after kill. No "/" fallback: an unattributable
@@ -396,6 +421,7 @@ impl Daemon {
       voice: Arc::new(Mutex::new(FxHashMap::default())),
       trusted_ttys: Arc::new(Mutex::new(FxHashMap::default())),
       swept: Arc::new(Mutex::new(FxHashSet::default())),
+      freeze_on_trip: Arc::new(|_: &str| {}),
       signing_key,
       proxies: Arc::new(Mutex::new(FxHashMap::default())),
       keyring: {

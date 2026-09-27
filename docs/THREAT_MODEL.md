@@ -2,6 +2,20 @@
 
 Three threat classes, antagonised in order. Each attack vector is marked with its status: **closed** (mitigated by construction or commitment), **mitigated** (reduced but not eliminated), or **residual** (documented, cannot be closed without larger architecture changes).
 
+## Read this first — the boundary is the launch path, not the process
+
+**Every confinement claim in this document is conditional on the agent being launched through castellan.** Castellan confines what *it* starts. A harness started any other way — a plain `claude` in a terminal, a cron job, a second agent, a script that shells out — runs **completely unconfined**, with full filesystem and network access as your own user, and no castellan process, ledger row or freeze will ever see it.
+
+This is a design position, not a defect, and it is the single most important thing to understand before trusting any other claim here:
+
+- It is **why** the security arguments are about the kernel (Landlock, seccomp, cgroups) rather than about the harness. A prompt-injected harness is confined; an un-launched one is not, and no in-process defense can fix that.
+- It is **why** `castellan siblings` exists. It detects untagged harness processes so the boundary violation is *visible*. It is advisory — it reports, it cannot prevent.
+- It is **why** the signing key is memory-only and the daemon non-dumpable (chapter 5 / S0). Since we cannot control which same-uid processes exist, we made the thing an unconfined sibling would most want — the signing key — unreachable by any path we could find, rather than relying on the sibling's absence.
+
+The consequence to hold onto: **confidentiality is not in scope for same-uid siblings, and integrity of the evidence rests on Landlock write-denial rather than on the sibling not existing.** A non-castellan process can read `trust.db`, the event spine, other sessions' state, and the keyring file. Every other residual in this document is smaller than that one, and none of them can be honestly closed without a second uid or a VM boundary — both of which are architectural changes, not bugs.
+
+Ruled out so far, by live measurement, for an *unconfined* same-uid sibling: it cannot read the ed25519 signing key (memory-only + non-dumpable, `/proc/<daemon>/*` root-owned, no core on abort), and it cannot modify the spine or `trust.db` (they are outside every write root under enforce). What it can do is *read* them.
+
 ## Found-then-fixed (full audit, Aug 2026)
 
 A full code audit after P0–P4 found four real vectors in the daemon's trusted-path plumbing. All are fixed; recorded here so the mistakes are not repeated.
@@ -156,13 +170,16 @@ Fixed by making the hook compile-time: `castellan_core::fault_injected()` is gat
 **residual, detected post-hoc.** An attack split across sessions/days defeats per-session spines and per-session detection. Mitigation (built 2026-08-27): longitudinal project-level correlation (N1) — maximal-run campaign detector over the cross-session trust-event stream (castellan-campaign). The planned seq-engine structural layer was KILLed by probe (tautological expectations on event-derived tokens, zero expectations on composite-only encoding, no fingerprint separation on real spines) — see PRIMITIVES.md. P8.2 (built 2026-08-27) adds scale-invariant campaign signatures: per-kind time-histograms over normalized time (discrete Mellin-domain sampling) — dilation-invariant (a 3-hour attack and its 3-week dilation produce the same signature) and discriminative (probe-validated: cross-dilation cosine 0.87-0.99, cross-family 0.29-0.35). Advisory-only: signatures annotate, never auto-enforce.
 
 ### C12. Detection-oracle probing (T2)
-**mitigated by design (N2, designed not built).** Every observable response (freeze, deny) is a side channel for mapping detection rules. Two-tier response: low-confidence signals log silently; only high-confidence (canary trip, hard-deny write, membership drift) freeze.
+**mitigated (N2, built).** Every observable response (freeze, deny) is a side channel for mapping detection rules. Two-tier response: low-confidence signals log silently; only high-confidence (canary trip, hard-deny write, membership drift) freeze.
 
 ### C13. Mimicry + prototype poisoning (T3)
-**mitigated by design (N3, designed not built).** Radar prototypes update only on `keep`/`clean_session` (human-validated sessions); poisoning then requires also fooling the human review. P8.1 (built 2026-08-27) extends the same principle to the immune memory: incident writes are daemon-only (drills + kernel-witnessed incidents), self (tolerance) shapes are written only on human keep — the agent has no write path to the memory.
+**mitigated by design (N3, designed not built); the P8.1 extension is built.** Radar prototypes update only on `keep`/`clean_session` (human-validated sessions); poisoning then requires also fooling the human review. P8.1 (built 2026-08-27) extends the same principle to the immune memory: incident writes are daemon-only (drills + kernel-witnessed incidents), self (tolerance) shapes are written only on human keep — the agent has no write path to the memory.
 
 ### C14. The unprotected sibling (T5)
-**residual, narrowed by chapter 5 (2026-09-17).** Any process not launched via castellan (plain harness run, cron, another agent) can READ trust.db and the spine (read roots are `/`; reads were never denied). It can no longer read the *signing key*: the key is memory-only and the daemon is non-dumpable (`/proc/<daemon>/*` is root-owned; no core on abort — S0 probe), so a same-uid sibling has no path to it. Integrity of trust.db and the spine against modification rests on Landlock write-denial, not on the sibling's absence. All castellan claims remain conditional on launch-path exclusivity for *confinement* (a sibling runs unconfined). Mitigation: sibling detector (N5, built — `castellan siblings` scans for untagged harness processes; advisory, detects the boundary violation, cannot prevent it).
+**residual, and the governing one — see "Read this first" at the top of this document.** Any process not launched via castellan (plain harness run, cron, another agent) can READ trust.db and the spine (read roots are `/`; reads were never denied). It can no longer read the *signing key*: the key is memory-only and the daemon is non-dumpable (`/proc/<daemon>/*` is root-owned; no core on abort — S0 probe), so a same-uid sibling has no path to it. Integrity of trust.db and the spine against modification rests on Landlock write-denial, not on the sibling's absence. All castellan claims are conditional on launch-path exclusivity for *confinement* (a sibling runs unconfined). Mitigation: sibling detector (N5, **built** — `castellan siblings` scans for untagged harness processes; advisory, detects the boundary violation, cannot prevent it).
+
+**Why this is not closed, stated plainly:** reads were never denied because the agent must be able to read the repository, the harness state and the toolchain. Denying them would break the product. Closing confidentiality for a same-uid sibling needs a second uid or a VM boundary, not a better filter.
+
 
 ### C15. Post-session persistence (T6)
 **mitigated by N6 (built).** Processes surviving past kill act after cert issuance (TOCTOU on certificates). Session-end orphan census + kill closes the window; cert carries a "no surviving processes" attestation.
@@ -236,8 +253,11 @@ Fixed by making the hook compile-time: `castellan_core::fault_injected()` is gat
 
 ## Residual risks summary
 
+Ordered by how much they matter. C14 is first because it governs the rest: it is the condition under which every other row's mitigation is real.
+
 | Risk | Status | Mitigation |
 |---|---|---|
+| **Unconfined same-uid processes (C14)** | **residual — governing boundary** | Confidentiality is out of reach for a non-castellan same-uid process; it can read state. Signing key made unreachable instead (S0). `castellan siblings` makes the violation visible, cannot prevent it. Close with a second uid or a VM, not a filter. |
 | C10 escape + journal nonce fishing = full self-approval (C32) | **fixed 2026-08-31 (36291ba)** — tty-gated approve, nonce delivered nowhere; residuals: dead-tty and headless sessions lose bless | second factor for headless pending |
 | Patient trust-gaming → egress | residual | ceiling + deny-list + egress proxy limit reach |
 | relay-vuln false negatives | residual | proof labeled "best-effort detection," not "proven safe" |
@@ -248,9 +268,9 @@ Fixed by making the hook compile-time: `castellan_core::fault_injected()` is gat
 | Cgroup-hop escape (C10) | residual | orphan census bounds blast radius; kernel closes self-migration |
 | Exfil channels (C10a) | residual, narrowed | D6 census re-measured 2026-09-17 in both postures: the tier floor's destination policy DENIES public TCP, public UDP, and DNS (the resolver-stub hole found and closed in the same pass); loopback UDP, inherited fds, and the broker's documented CONTINUE TOCTOU remain open |
 | Slow-drip campaigns (C11) | residual | campaign detector + scale-invariant signatures built (P8.2) |
-| Detection-oracle probing (C12) | mitigated by design | two-tier response designed, not built |
+| Detection-oracle probing (C12) | mitigated by design | two-tier response routing built (`ResponseTier`, N2) |
 | Mimicry + prototype poisoning (C13) | mitigated by design | kept-only folding designed, not built; immune memory daemon-only writes built (P8.1) |
-| Unprotected sibling (C14) | residual | sibling detector designed, not built |
+| Unprotected sibling (C14) | residual — **governing boundary** | sibling detector built (N5, `castellan siblings`); advisory, detects only. |
 | Post-session persistence (C15) | mitigated | orphan census built (N6) |
 | Prose-encoded persistence (C16) | residual | accepted limit, documented |
 | Dilution attacks (C17) | residual | rate-normalized patterns designed, not built |

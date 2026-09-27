@@ -287,6 +287,10 @@ struct ReqHead {
   chunked: bool,
 }
 
+/// R6: all trailers are dropped structurally (dechunk never forwards
+/// them), so no STRIP-class header can smuggle past the head filter via
+/// trailers. No allowlist needed — trailers carry no legitimate proxy
+/// function.
 fn rewrite_request(raw: &[u8], host: &str, cfg: &ProxyConfig) -> std::io::Result<ReqHead> {
   let mut headers = [httparse::EMPTY_HEADER; 64];
   let mut req = httparse::Request::new(&mut headers);
@@ -299,7 +303,13 @@ fn rewrite_request(raw: &[u8], host: &str, cfg: &ProxyConfig) -> std::io::Result
   let mut out = format!("{method} {target} HTTP/1.1\r\n");
   let mut seen_host = false;
   let mut content_length = None;
-  let mut chunked = false;
+  let mut content_length_seen = 0u32;
+  let mut was_chunked = false;
+  // R6 (ninja review): normalize framing. Duplicate Content-Length is a
+  // classic desync vector (first-vs-last); Transfer-Encoding + CL cohabit
+  // is another; trailers can smuggle STRIP-class headers past the head
+  // filter. Policy: reject duplicate CL (400-class InvalidData), drop TE
+  // entirely (de-chunk to identity below), strip trailers.
   for h in req.headers.iter() {
     let name = h.name.to_ascii_lowercase();
     if STRIP.contains(&name.as_str()) {
@@ -309,10 +319,23 @@ fn rewrite_request(raw: &[u8], host: &str, cfg: &ProxyConfig) -> std::io::Result
       seen_host = true;
     }
     if name == "content-length" {
+      content_length_seen += 1;
+      if content_length_seen > 1 {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::InvalidData,
+          "duplicate content-length",
+        ));
+      }
       content_length = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok());
     }
     if name == "transfer-encoding" {
-      chunked = std::str::from_utf8(h.value).map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
+      if std::str::from_utf8(h.value).map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false) {
+        was_chunked = true;
+      }
+      continue;
+    }
+    if name == "trailer" {
+      continue;
     }
     if name == "connection" {
       continue;
@@ -328,13 +351,19 @@ fn rewrite_request(raw: &[u8], host: &str, cfg: &ProxyConfig) -> std::io::Result
   if let Some((name, value, _)) = cfg.keyring.inject_for(host) {
     out.push_str(&format!("{name}: {value}\r\n"));
   }
-  out.push_str("Connection: close\r\n\r\n");
+  out.push_str("Connection: close\r\n");
+  // R6: when chunked, the head stays UNTERMINATED here — forward_body
+  // appends the single Content-Length + blank line after de-chunking.
+  // Identity bodies terminate the head normally.
+  if !was_chunked {
+    out.push_str("\r\n");
+  }
   Ok(ReqHead {
     method,
     target,
     head: out.into_bytes(),
     content_length,
-    chunked,
+    chunked: was_chunked,
   })
 }
 
@@ -345,7 +374,18 @@ fn forward_body<R: Read, W: Write>(
   prefix: &[u8],
 ) -> std::io::Result<()> {
   if req.chunked {
-    return forward_chunked(client, up, prefix);
+    // R6: de-chunk to identity upstream. The head was already written
+    // by exchange() — but with TE dropped and no CL. Reframe: decode
+    // here and emit a single Content-Length BEFORE the body. Since the
+    // head is already on the wire, de-chunking requires head buffering —
+    // handled in exchange(): when chunked, exchange() buffers via this
+    // path returning the body length first. Simpler honest shape: decode
+    // the body, then write a fresh framing line + CL + body.
+    let body = dechunk(client, prefix)?;
+    up.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())?;
+    up.write_all(&body)?;
+    up.flush()?;
+    return Ok(());
   }
   if let Some(n) = req.content_length {
     let mut left = n;
@@ -382,7 +422,12 @@ fn forward_body<R: Read, W: Write>(
   Ok(())
 }
 
-fn forward_chunked<R: Read, W: Write>(client: &mut R, up: &mut W, prefix: &[u8]) -> std::io::Result<()> {
+/// R6: decode a chunked body into raw bytes. Trailers are parsed;
+/// STRIP-class trailer headers are dropped (they never reach upstream);
+/// anything else in trailers is dropped too (upstreams that merge
+/// trailers are attacker-influenced). Caps total at 32MB.
+fn dechunk<R: Read>(client: &mut R, prefix: &[u8]) -> std::io::Result<Vec<u8>> {
+  const CAP: usize = 32 << 20;
   let mut pending = prefix.to_vec();
   let mut scratch = [0u8; 1];
   macro_rules! next_byte {
@@ -399,6 +444,7 @@ fn forward_chunked<R: Read, W: Write>(client: &mut R, up: &mut W, prefix: &[u8])
       }
     };
   }
+  let mut body = Vec::new();
   loop {
     let mut size_line = Vec::new();
     loop {
@@ -411,24 +457,32 @@ fn forward_chunked<R: Read, W: Write>(client: &mut R, up: &mut W, prefix: &[u8])
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size"));
       }
     }
-    up.write_all(&size_line)?;
     let text = String::from_utf8_lossy(&size_line);
     let size = usize::from_str_radix(text.trim().split(';').next().unwrap_or("").trim(), 16)
       .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size"))?;
     if size == 0 {
+      // consume trailers to the blank line, dropping all of them: after
+      // the 0-size line, trailers are 0+ lines ending in one blank line.
+      // (Trailer contents are never forwarded, so no per-header scan is
+      // needed — the drop is structural.)
+      let mut line = Vec::new();
       loop {
         let b = next_byte!();
-        up.write_all(&[b])?;
-        if b == b'\n' && size_line.last() == Some(&b'\n') {
-          break;
+        line.push(b);
+        if line.ends_with(b"\r\n") || line.ends_with(b"\n") {
+          if line == b"\r\n" || line == b"\n" {
+            break;
+          }
+          line.clear();
         }
-        size_line.push(b);
-        if size_line.ends_with(b"\r\n\r\n") || size_line.ends_with(b"\n\n") {
-          break;
+        if line.len() > 8192 {
+          return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "trailers"));
         }
       }
-      up.flush()?;
-      return Ok(());
+      return Ok(body);
+    }
+    if body.len() + size > CAP {
+      return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk cap"));
     }
     let mut left = size + 2;
     let mut buf = [0u8; 8192];
@@ -437,7 +491,7 @@ fn forward_chunked<R: Read, W: Write>(client: &mut R, up: &mut W, prefix: &[u8])
       let mut got = 0;
       if !pending.is_empty() {
         let take = pending.len().min(want);
-        up.write_all(&pending[..take])?;
+        body.extend_from_slice(&pending[..take]);
         pending.drain(..take);
         got += take;
       } else {
@@ -445,11 +499,15 @@ fn forward_chunked<R: Read, W: Write>(client: &mut R, up: &mut W, prefix: &[u8])
         if r == 0 {
           return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "chunk"));
         }
-        up.write_all(&buf[..r])?;
+        body.extend_from_slice(&buf[..r]);
         got += r;
       }
       left -= got;
     }
+    // strip the trailing CRLF of the chunk data: we appended size+2
+    // bytes, of which the last 2 are CRLF.
+    let n = body.len();
+    body.truncate(n.saturating_sub(2));
   }
 }
 
@@ -487,15 +545,35 @@ fn exchange(
   forward_body(client, up, &req, prefix)?;
   up.flush()?;
 
+  // R6 (ninja review): response-side secret redaction. The proxy injects
+  // the real credential upstream; an echo/reflect endpoint would hand it
+  // back to the untrusted agent. Buffer the response (cap 32MB), scan
+  // for the injected secret bytes, and terminate with an error (the tunnel drops) rather than rather than
+  // deliver a secret-bearing body downstream. No secret injected for
+  // this host (cred=none) -> passthrough, nothing to redact.
+  let secret: Option<Vec<u8>> = cfg.keyring.inject_for(host).map(|(_, v, _)| v.as_bytes().to_vec());
+  let mut resp = Vec::new();
   let mut buf = [0u8; 8192];
   loop {
     match up.read(&mut buf) {
       Ok(0) => break,
-      Ok(n) => client.write_all(&buf[..n])?,
+      Ok(n) => {
+        resp.extend_from_slice(&buf[..n]);
+        if resp.len() > (32 << 20) {
+          return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "response cap"));
+        }
+      }
       Err(e) if is_clean_eof(&e) => break,
       Err(e) => return Err(e),
     }
   }
+  if let Some(sec) = secret.as_ref() {
+    if !sec.is_empty() && resp.windows(sec.len()).any(|w| w == sec.as_slice()) {
+      emit(spine, "egress_secret_reflect", host, "redacted");
+      return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "upstream reflected credential"));
+    }
+  }
+  client.write_all(&resp)?;
   up.conn.send_close_notify();
   client.conn.send_close_notify();
   client.flush()?;
@@ -513,6 +591,7 @@ fn is_clean_eof(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::io::Cursor;
 
   fn cfg_with(hosts: &[&str], restrict: bool) -> ProxyConfig {
     ProxyConfig {
@@ -583,5 +662,40 @@ mod tests {
     let head = String::from_utf8_lossy(&req.head).to_string();
     assert!(!head.to_lowercase().contains("authorization"), "{head}");
     assert!(!head.contains("Bearer"), "{head}");
+  }
+
+
+  #[test]
+  fn duplicate_cl_rejected() {
+    let cfg = cfg_with(&[], false);
+    let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc";
+    assert!(rewrite_request(raw, "h", &cfg).is_err());
+  }
+
+  #[test]
+  fn te_dropped_and_dechunked() {
+    let cfg = cfg_with(&[], false);
+    let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let req = rewrite_request(raw, "h", &cfg).unwrap();
+    assert!(req.chunked);
+    assert!(!req.head.windows(17).any(|w| w == b"Transfer-Encoding"));
+    // de-chunk "3\r\nabc\r\n0\r\n\r\n" -> body abc, single CL downstream
+    let mut up = Vec::new();
+    let mut client = std::io::Cursor::new(b"3\r\nabc\r\n0\r\n\r\n".to_vec());
+    forward_body(&mut client, &mut up, &req, &[]).unwrap();
+    assert!(up.starts_with(b"Content-Length: 3\r\n\r\n"));
+    assert!(up.ends_with(b"abc"));
+  }
+
+  #[test]
+  fn trailer_auth_dropped() {
+    let cfg = cfg_with(&[], false);
+    let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let req = rewrite_request(raw, "h", &cfg).unwrap();
+    let mut up = Vec::new();
+    let mut client = std::io::Cursor::new(b"1\r\na\r\n0\r\nAuthorization: smuggled\r\n\r\n".to_vec());
+    forward_body(&mut client, &mut up, &req, &[]).unwrap();
+    assert!(!up.windows(13).any(|w| w == b"Authorization"));
+    assert!(up.ends_with(b"a"));
   }
 }

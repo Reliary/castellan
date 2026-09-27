@@ -27,7 +27,8 @@ fn main() {
       // Resolvers are allowed by default (DNS survival); empty here to
       // keep the probe deterministic on machines with unusual resolvers.
       policy.resolver_ips.clear();
-      let n = broker.run(&mut policy, &tx).expect("supervise");
+      let drops = DropCount::default();
+      let n = broker.run(&mut policy, &tx, &drops).expect("supervise");
       let code = broker.finish();
       let events: Vec<BrokerEvent> = rx.try_iter().collect();
       println!("--- broker decisions ({} notifications) ---", n);

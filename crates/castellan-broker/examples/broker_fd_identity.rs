@@ -42,7 +42,8 @@ fn main() {
       let mut policy = EgressPolicy::new();
       policy.restrict_ip = false;
       let (_tx, rx) = broker_log();
-      let _ = broker.run(&mut policy, &_tx).expect("run");
+      let drops = DropCount::default();
+      let _ = broker.run(&mut policy, &_tx, &drops).expect("run");
       let code = broker.finish();
       // reap the echo server
       unsafe {

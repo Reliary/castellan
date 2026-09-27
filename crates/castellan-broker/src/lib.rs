@@ -52,7 +52,7 @@ use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::os::fd::RawFd;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 
 pub const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 pub const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_uint = 8;
@@ -270,11 +270,18 @@ pub fn evaluate_v6(ip: Ipv6Addr, policy: &EgressPolicy) -> Verdict {
   }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sockaddr {
   V4(Ipv4Addr, u16),
   V6(Ipv6Addr, u16),
   Unix(Vec<u8>),
+  /// R4: abstract/autobind unix socket — unnameable, always denied.
+  Abstract,
   Other(i32),
+}
+
+fn sockaddr_eq(a: &Sockaddr, b: &Sockaddr) -> bool {
+  a == b
 }
 
 impl Sockaddr {
@@ -283,6 +290,7 @@ impl Sockaddr {
       Sockaddr::V4(ip, port) => format!("{ip}:{port}"),
       Sockaddr::V6(ip, port) => format!("[{ip}]:{port}"),
       Sockaddr::Unix(p) => format!("unix:{}", String::from_utf8_lossy(p)),
+      Sockaddr::Abstract => "unix:abstract".to_string(),
       Sockaddr::Other(f) => format!("family={f}"),
     }
   }
@@ -312,6 +320,12 @@ pub fn parse_sockaddr(buf: &[u8]) -> Option<Sockaddr> {
     }
     libc::AF_UNIX => {
       let path = &buf[2..];
+      // R4 (ninja review): abstract sockets (sun_path[0]==NUL) have no
+      // filesystem identity to allowlist — fail closed. Empty paths
+      // (autobind/unnamed) likewise.
+      if path.is_empty() || path[0] == 0 {
+        return Some(Sockaddr::Abstract);
+      }
       let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
       Some(Sockaddr::Unix(path[..end].to_vec()))
     }
@@ -335,6 +349,7 @@ pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
       }
       (evaluate_v6(*ip, policy), "ipv6")
     }
+    Sockaddr::Abstract => (Verdict::Deny, "abstract-socket"),
     Sockaddr::Unix(path) => {
       if policy.deny_systemd_sockets && is_manager_socket(path) {
         (Verdict::Deny, "systemd-socket")
@@ -376,9 +391,37 @@ impl BrokerEvent {
   }
 }
 
-pub type BrokerLog = (Sender<BrokerEvent>, Receiver<BrokerEvent>);
+pub type BrokerLog = (std::sync::mpsc::SyncSender<BrokerEvent>, Receiver<BrokerEvent>);
+/// R8 (ninja review): bounded recorder channel. The F4c backlog shape
+/// (2.78M queued denies) showed an unbounded mpsc lets a flipper grow
+/// the supervisor RSS until OOM. sync_channel(4096) back-pressures the
+/// DECISION loop instead — but the decision loop must never block on
+/// logging (a blocked loop stalls the tracee's syscalls), so all sends
+/// use try_send and count drops (see BrokerEvent::dropped / log_drop).
+/// Deny events are never dropped (they are the evidence); allow events
+/// are the first shed under pressure.
 pub fn broker_log() -> BrokerLog {
-  std::sync::mpsc::channel()
+  std::sync::mpsc::sync_channel(4096)
+}
+
+/// R8: drop counter, shared by the run loop (increments) and the
+/// recorder (drains into a spine row). Lock-free enough: updated only
+/// in run(), read by the recorder thread between recvs.
+#[derive(Debug, Default)]
+pub struct DropCount(pub std::sync::atomic::AtomicU64);
+
+/// R8: verdict-aware logging. Denies are evidence — blocking send
+/// (the 4096 buffer drains via the recorder thread; a full buffer
+/// means the recorder died, i.e. the session is ending anyway).
+/// Allows are shed with try_send + drop counting (the decision loop
+/// must never block on logging — a blocked loop stalls tracee
+/// syscalls, which is exactly the px-stall shape).
+pub fn log_event(log: &std::sync::mpsc::SyncSender<BrokerEvent>, drops: &DropCount, ev: BrokerEvent) {
+  if ev.verdict == Verdict::Deny {
+    let _ = log.send(ev);
+  } else if log.try_send(ev).is_err() {
+    drops.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
 }
 
 fn read_tracee(pid: u32, ptr: u64, len: usize) -> Option<Vec<u8>> {
@@ -415,6 +458,11 @@ fn signal_target_pid(req: &SeccompNotif) -> SignalTarget {
       SignalTarget::Tid(tid)
     }
     libc::SYS_pidfd_send_signal => SignalTarget::Pidfd(req.data.args[0] as i32),
+    // R1 (ninja review): rt_sigqueueinfo(pid,sig,uinfo) delivers any
+    // signal incl. SIGKILL with same-uid creds — same gate as kill.
+    // rt_tgsigqueueinfo(tgid,tid,sig,uinfo): gate on the tid like tgkill.
+    libc::SYS_rt_sigqueueinfo => SignalTarget::Pid(req.data.args[0] as i64 as i32),
+    libc::SYS_rt_tgsigqueueinfo => SignalTarget::Tid(req.data.args[1] as i64 as i32),
     _ => SignalTarget::None,
   }
 }
@@ -435,7 +483,7 @@ fn session_scope_of(pid: u32) -> Option<String> {
   for line in cg.lines() {
     if let Some(idx) = line.find("castellan.slice/") {
       let rest = &line[idx + "castellan.slice/".len()..];
-      let end = rest.find(|c| c == '\n' || c == '/' || c == ' ').unwrap_or(rest.len());
+      let end = rest.find(['\n', '/', ' ']).unwrap_or(rest.len());
       let scope = rest[..end].trim_end_matches(".scope").to_string();
       if !scope.is_empty() {
         return Some(scope);
@@ -561,8 +609,16 @@ fn notification_dest(req: &SeccompNotif) -> Option<Sockaddr> {
 /// destination argument at all): a failed read means we cannot prove
 /// where the packet is going, and under a destination policy that must
 /// be denied rather than allowed.
+/// F4/R2: max sendmmsg batch elements examined per decision. Past
+/// this the batch is Unreadable (fail-closed under restriction).
+pub const MAX_SENDMMSG_ELEMS: usize = 16;
+
 pub enum DestRead {
   Parsed(Sockaddr),
+  /// F4/R2: sendmmsg batch — per-element explicit dest (None element =
+  /// implicit/connected). decide_dest denies the batch if ANY explicit
+  /// element denies or is unreadable-at-element.
+  Batch(Vec<Option<Sockaddr>>),
   /// F4c: the destination was read STABLY (same bytes across spaced
   /// re-reads) — the anti-flipper agreement signal. decide_dest treats
   /// it like Parsed; the distinction is recorded in the spine reason
@@ -626,32 +682,77 @@ pub fn read_dest_stable(req: &SeccompNotif, check: bool) -> DestRead {
       if req.data.args[4] == 0 {
         return DestRead::None;
       }
+      // R3 (ninja review): explicit-dest sends are the UDP-exfil race
+      // surface (no prior connect to gate). Stability-check like connect.
       match read(req.data.args[4], req.data.args[5]) {
-        Some(buf) => match parse_sockaddr(&buf) {
-          Some(sa) => DestRead::Parsed(sa),
-          None => DestRead::Unreadable,
-        },
+        Some(first) => {
+          if !check {
+            return match parse_sockaddr(&first) {
+              Some(sa) => DestRead::Parsed(sa),
+              None => DestRead::Unreadable,
+            };
+          }
+          std::thread::sleep(std::time::Duration::from_millis(2));
+          match read(req.data.args[4], req.data.args[5]) {
+            Some(second) if second == first => match parse_sockaddr(&first) {
+              Some(sa) => DestRead::Stable(sa),
+              None => DestRead::Unreadable,
+            },
+            _ => DestRead::Unstable,
+          }
+        }
         None => DestRead::Unreadable,
       }
     }
-    libc::SYS_sendmsg => read_msghdr_dest(read, req.data.args[1]),
-    // F4: sendmmsg(fd, msgvec, vlen, flags): msgvec is an array of
-    // mmsg_hdr { struct msghdr msg_hdr; unsigned int msg_len }. Read
-    // the FIRST element's msghdr and decide on it; a mixed batch with a
-    // denied first dest is denied outright, and an unreadable vec is
-    // Unreadable (fail-closed under restriction). Per-element precision
-    // would need CONTINUE+rewrite, which the kernel does not offer —
-    // denying the batch is the honest fail-closed shape.
+    libc::SYS_sendmsg => {
+      // R3: same stability treatment when checked and a name is present.
+      // read_msghdr_dest has no check param; wrap: single-read first,
+      // and on explicit-dest + check, re-read the name bytes for agreement.
+      match read_msghdr_dest(&read, req.data.args[1]) {
+        DestRead::Parsed(sa) if check => {
+          std::thread::sleep(std::time::Duration::from_millis(2));
+          match read_msghdr_dest(&read, req.data.args[1]) {
+            DestRead::Parsed(sa2) if sockaddr_eq(&sa, &sa2) => DestRead::Stable(sa),
+            DestRead::Stable(sa2) if sockaddr_eq(&sa, &sa2) => DestRead::Stable(sa),
+            _ => DestRead::Unstable,
+          }
+        }
+        other => other,
+      }
+    }
+    // F4/R2: sendmmsg(fd, msgvec, vlen, flags): msgvec is an array
+    // of mmsg_hdr { struct msghdr msg_hdr; unsigned int msg_len }
+    // (32 bytes on x86_64). R2 (ninja review): first-element-decides
+    // is fail-OPEN for tails — [allowed, denied] delivers element 1.
+    // Read ALL elements (cap below) and deny the batch if ANY element
+    // is denied or unreadable. Fail-closed, atomic-deny shape.
     libc::SYS_sendmmsg => {
-      let vec = match read(req.data.args[1], 32) {
-        Some(h) if h.len() >= 32 => h,
-        _ => return DestRead::Unreadable,
-      };
-      let msg_ptr = u64::from_ne_bytes(vec[0..8].try_into().unwrap());
-      if msg_ptr == 0 {
+      let vlen = (req.data.args[2] as usize).min(MAX_SENDMMSG_ELEMS + 1);
+      if vlen == 0 {
         return DestRead::Unreadable;
       }
-      read_msghdr_dest(read, msg_ptr)
+      if vlen > MAX_SENDMMSG_ELEMS {
+        // Absurd batch: fail closed under restriction rather than
+        // paying an unbounded read loop in the decision path.
+        return DestRead::Unreadable;
+      }
+      let raw = match read(req.data.args[1], (vlen * 32) as u64) {
+        Some(h) if h.len() >= vlen * 32 => h,
+        _ => return DestRead::Unreadable,
+      };
+      let mut elems: Vec<Option<Sockaddr>> = Vec::with_capacity(vlen);
+      for i in 0..vlen {
+        let msg_ptr = u64::from_ne_bytes(raw[i * 32..i * 32 + 8].try_into().unwrap());
+        if msg_ptr == 0 {
+          return DestRead::Unreadable;
+        }
+        match read_msghdr_dest(&read, msg_ptr) {
+          DestRead::None => elems.push(None),
+          DestRead::Parsed(sa) => elems.push(Some(sa)),
+          _ => return DestRead::Unreadable,
+        }
+      }
+      DestRead::Batch(elems)
     }
     // F4: recvmmsg has no destination (receive side) — vetted at bind/
     // connect time like any receive. Explicit arm (not silent fallthrough).
@@ -660,7 +761,7 @@ pub fn read_dest_stable(req: &SeccompNotif, check: bool) -> DestRead {
   }
 }
 
-fn read_msghdr_dest(read: impl Fn(u64, u64) -> Option<Vec<u8>>, msg_ptr: u64) -> DestRead {
+fn read_msghdr_dest(read: &dyn Fn(u64, u64) -> Option<Vec<u8>>, msg_ptr: u64) -> DestRead {
   // sendmsg(fd, msg, flags): msghdr.msg_name at offset 0,
   // msg_namelen at offset 8 on x86_64.
   let hdr = match read(msg_ptr, 16) {
@@ -709,6 +810,28 @@ pub fn decide_dest(
     // are stability-gated) — UDP exfil to a denied IP via a raced
     // sendto remains the residual. It is rate-limited below.
     DestRead::Unstable => (Verdict::Deny, "dest-unstable", String::new()),
+    DestRead::Batch(elems) => {
+      let mut saw_explicit = false;
+      for (i, el) in elems.iter().enumerate() {
+        match el {
+          None => {}
+          Some(sa) => {
+            saw_explicit = true;
+            let (v, r) = decide(sa, policy);
+            if v == Verdict::Deny {
+              return (Verdict::Deny, "batch-denied", format!("elem{i}:{r} {}", sa.detail()));
+            }
+          }
+        }
+      }
+      if saw_explicit {
+        let first = elems.iter().flatten().next().unwrap();
+        let (v, r) = decide(first, policy);
+        (v, r, first.detail())
+      } else {
+        (Verdict::Allow, "implicit-dest", String::new())
+      }
+    }
     // An implicit destination means the socket was vetted when it was
     // connected, and `connect` is intercepted. This MUST stay allowed:
     // glibc's send() is a sendto with a NULL destination and most TLS
@@ -785,15 +908,17 @@ pub fn install_listener() -> io::Result<RawFd> {
     // read_dest handles them through the same path (args[1]=msgvec,
     // args[2]=vlen; first-element dest decides, fail-closed on
     // unreadable — a mixed batch with ANY denied dest is denied).
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 8, 0, libc::SYS_connect as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 7, 0, libc::SYS_sendto as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 6, 0, libc::SYS_sendmsg as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 5, 0, libc::SYS_sendmmsg as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 4, 0, libc::SYS_recvmmsg as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 3, 0, libc::SYS_kill as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 2, 0, libc::SYS_tkill as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 1, 0, libc::SYS_tgkill as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, libc::SYS_pidfd_send_signal as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 10, 0, libc::SYS_connect as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 9, 0, libc::SYS_sendto as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 8, 0, libc::SYS_sendmsg as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 7, 0, libc::SYS_sendmmsg as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 6, 0, libc::SYS_recvmmsg as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 5, 0, libc::SYS_kill as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 4, 0, libc::SYS_tkill as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 3, 0, libc::SYS_tgkill as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 2, 0, libc::SYS_pidfd_send_signal as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 1, 0, libc::SYS_rt_sigqueueinfo as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, libc::SYS_rt_tgsigqueueinfo as u32),
     bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_USER_NOTIF),
     bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_ALLOW),
   ];
@@ -986,9 +1111,22 @@ fn supervise_capture_inner(
     out
   });
   let mut policy = policy.clone();
-  let mut sup = Broker { listener, agent_pid: pid, agent_status: None, notify_rate: std::collections::HashMap::new(), unstable_rate: std::collections::HashMap::new() };
+  let mut sup = Broker {
+    listener,
+    agent_pid: pid,
+    agent_status: None,
+    notify_rate: std::collections::HashMap::new(),
+    unstable_rate: std::collections::HashMap::new(),
+  };
   let (btx, _brx) = broker_log();
-  let _ = sup.run(&mut policy, &btx);
+  let drops = DropCount::default();
+  let _ = sup.run(&mut policy, &btx, &drops);
+  if drops.0.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+    eprintln!(
+      "broker: shed {} allow-events under pressure",
+      drops.0.load(std::sync::atomic::Ordering::Relaxed)
+    );
+  }
   reader.join().unwrap_or_default()
 }
 
@@ -1004,7 +1142,12 @@ impl Broker {
   /// NOTIF_RECV never returns ENOENT while the supervisor (itself a
   /// tracee) holds the listener open, even after the agent is gone.
   /// Exit detection is therefore poll(200ms) + waitpid(WNOHANG).
-  pub fn run(&mut self, policy: &mut EgressPolicy, log: &Sender<BrokerEvent>) -> io::Result<u64> {
+  pub fn run(
+    &mut self,
+    policy: &mut EgressPolicy,
+    log: &std::sync::mpsc::SyncSender<BrokerEvent>,
+    drops: &DropCount,
+  ) -> io::Result<u64> {
     let mut count = 0u64;
     loop {
       let mut pfd = libc::pollfd { fd: self.listener, events: libc::POLLIN, revents: 0 };
@@ -1042,7 +1185,7 @@ impl Broker {
         let e = self.notify_rate.entry(req.pid).or_insert((now, 0, None));
         if let Some(until) = e.2 {
           if now < until {
-            let _ = log.send(BrokerEvent {
+            log_event(log, drops, BrokerEvent {
               pid: req.pid,
               verdict: Verdict::Deny,
               reason: "connect-throttled",
@@ -1062,7 +1205,7 @@ impl Broker {
         e.1 += 1;
         if e.1 > CONNECT_RATE_PER_SEC {
           e.2 = Some(now + std::time::Duration::from_secs(CONNECT_THROTTLE_SECS));
-          let _ = log.send(BrokerEvent {
+          log_event(log, drops, BrokerEvent {
             pid: req.pid,
             verdict: Verdict::Deny,
             reason: "connect-flood",
@@ -1080,17 +1223,24 @@ impl Broker {
         || nr == libc::SYS_tkill
         || nr == libc::SYS_tgkill
         || nr == libc::SYS_pidfd_send_signal
+        || nr == libc::SYS_rt_sigqueueinfo
+        || nr == libc::SYS_rt_tgsigqueueinfo
       {
         let (verdict, reason, detail) = decide_signal(&req);
-        let _ =
-          log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
+        log_event(log, drops, BrokerEvent { pid: req.pid, verdict, reason, detail });
         respond(self.listener, &req, verdict)?;
         continue;
       }
-      // F4c: CONNECT takes the stability-checked path (new
-      // destinations are the race target). All other traps keep the
-      // single-read path.
-      let dest = if nr == libc::SYS_connect {
+      // F4c+R3: CONNECT and explicit-dest SENDs take the
+      // stability-checked path (new destinations are the race target).
+      // Implicit (connected-socket) sends return before any sleep, so
+      // the common TLS-send path pays nothing. recvmmsg/kill-class keep
+      // the single-read path.
+      let dest = if nr == libc::SYS_connect
+        || nr == libc::SYS_sendto
+        || nr == libc::SYS_sendmsg
+        || nr == libc::SYS_sendmmsg
+      {
         read_dest_stable(&req, true)
       } else {
         read_dest(&req)
@@ -1104,7 +1254,7 @@ impl Broker {
         let e = self.unstable_rate.entry(req.pid).or_insert((now, 0, None));
         if let Some(until) = e.2 {
           if now < until {
-            let _ = log.send(BrokerEvent {
+            log_event(log, drops, BrokerEvent {
               pid: req.pid,
               verdict: Verdict::Deny,
               reason: "unstable-throttled",
@@ -1124,7 +1274,7 @@ impl Broker {
           e.1 += 1;
           if e.1 >= UNSTABLE_MAX_PER_WINDOW {
             e.2 = Some(now + std::time::Duration::from_secs(UNSTABLE_THROTTLE_SECS));
-            let _ = log.send(BrokerEvent {
+            log_event(log, drops, BrokerEvent {
               pid: req.pid,
               verdict: Verdict::Deny,
               reason: "unstable-flood",
@@ -1140,7 +1290,7 @@ impl Broker {
       if nr == libc::SYS_connect {
         if let Some((_, _, Some(until))) = self.unstable_rate.get(&req.pid) {
           if std::time::Instant::now() < *until {
-            let _ = log.send(BrokerEvent {
+            log_event(log, drops, BrokerEvent {
               pid: req.pid,
               verdict: Verdict::Deny,
               reason: "unstable-throttled",
@@ -1152,7 +1302,7 @@ impl Broker {
         }
       }
       let (verdict, reason, detail) = decide_dest(&dest, policy);
-      let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
+      log_event(log, drops, BrokerEvent { pid: req.pid, verdict, reason, detail });
       respond(self.listener, &req, verdict)?;
     }
   }
@@ -1384,6 +1534,56 @@ mod tests {
       data: SeccompData { nr: libc::SYS_kill as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
     };
     assert_eq!(decide_signal(&req).0, Verdict::Deny);
+  }
+
+  #[test]
+  fn abstract_socket_denied() {
+    // R4: abstract (leading NUL) and empty unix paths deny.
+    let p = EgressPolicy::new();
+    let mut buf = vec![1u8, 0, 0, b'x'];
+    match parse_sockaddr(&buf).unwrap() {
+      Sockaddr::Abstract => {}
+      other => panic!("expected Abstract, got {other:?}"),
+    }
+    let (v, r, _) = decide_dest(&DestRead::Parsed(Sockaddr::Abstract), &p);
+    assert_eq!(v, Verdict::Deny);
+    assert_eq!(r, "abstract-socket");
+  }
+
+  #[test]
+  fn batch_any_denied_denies() {
+    // R2: [allowed, denied] and [denied, allowed] both deny.
+    use std::net::IpAddr;
+    let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
+    let lo = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 9);
+    let pub1 = Sockaddr::V4(Ipv4Addr::new(8, 8, 8, 8), 53);
+    let (v, r, _) = decide_dest(&DestRead::Batch(vec![Some(lo.clone()), Some(pub1.clone())]), &p);
+    assert_eq!(v, Verdict::Deny);
+    assert_eq!(r, "batch-denied");
+    let (v, _, _) = decide_dest(&DestRead::Batch(vec![Some(pub1), Some(lo.clone())]), &p);
+    assert_eq!(v, Verdict::Deny);
+    let (v, _, _) = decide_dest(&DestRead::Batch(vec![Some(lo.clone()), Some(lo)]), &p);
+    assert_eq!(v, Verdict::Allow);
+    let (v, r, _) = decide_dest(&DestRead::Batch(vec![]), &p);
+    assert_eq!(v, Verdict::Allow);
+    assert_eq!(r, "implicit-dest");
+    let _ = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+  }
+
+  #[test]
+  fn signal_cookie_pair_gated() {
+    // R1: rt_sigqueueinfo routes to Pid, rt_tgsigqueueinfo to Tid.
+    let req = SeccompNotif {
+      id: 0, pid: 100, flags: 0,
+      data: SeccompData { nr: libc::SYS_rt_sigqueueinfo as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
+    };
+    // pid 0 = pgrp signaling -> deny
+    assert_eq!(decide_signal(&req).0, Verdict::Deny);
+    let req2 = SeccompNotif {
+      id: 0, pid: 100, flags: 0,
+      data: SeccompData { nr: libc::SYS_rt_tgsigqueueinfo as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
+    };
+    assert_eq!(decide_signal(&req2).0, Verdict::Deny);
   }
 
   #[test]

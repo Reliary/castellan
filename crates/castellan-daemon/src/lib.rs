@@ -289,6 +289,8 @@ pub struct Daemon {
   /// "session:unit" so a persistent unit is reported once, not every
   /// sweep.
   swept: Arc<Mutex<FxHashSet<String>>>,
+  /// R7: spawn rate buckets per project path (fork-bomb guard).
+  spawn_rate: Arc<Mutex<FxHashMap<String, (std::time::Instant, u32)>>>,
   /// F2 (2026-09-27, .227 breakout): reserved for the freeze-through
   /// path. The trip closure captures the cgroup root directly (see
   /// Daemon::new); this handle stays for future trip-time actions
@@ -421,6 +423,7 @@ impl Daemon {
       voice: Arc::new(Mutex::new(FxHashMap::default())),
       trusted_ttys: Arc::new(Mutex::new(FxHashMap::default())),
       swept: Arc::new(Mutex::new(FxHashSet::default())),
+      spawn_rate: Arc::new(Mutex::new(FxHashMap::default())),
       freeze_on_trip: Arc::new(|_: &str| {}),
       signing_key,
       proxies: Arc::new(Mutex::new(FxHashMap::default())),
@@ -635,6 +638,11 @@ impl Daemon {
       | Request::Thaw { session: Some(session) }
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
+      | Request::JoinSession { session, .. }
+      // R7 (ninja review): JoinSession was ungated — any
+      // Human-classified escaped process (tty 0 falls through to the
+      // headless branch) could pull itself into a victim scope. Same
+      // rule as Adopt now.
       // Cert/Radar/MemoryRecall/Replay are read-only evidence and
       // agent-allowed. The tty gate applied only to human callers, but
       // it protected nothing — the agent can call these anyway without
@@ -2657,6 +2665,47 @@ impl Daemon {
     grants: Vec<String>,
     launcher_tty: u64,
   ) -> Response {
+    // C7 (ninja review): refuse projects that contain the daemon's own
+    // state/config (project = $HOME or an ancestor of $STATE/$CONFIG):
+    // trust.db, keyring.toml, spines and canary ledgers would land
+    // inside the agent's write roots (full trust + credential forgery).
+    // Canonicalize (follows symlinks); normalize() only strips `.`.
+    {
+      let canon = project.canonicalize().unwrap_or_else(|_| project.clone());
+      let state = Self::state_dir();
+      let cfgdir = std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+          std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        });
+      let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+      let bad = state
+        .starts_with(&canon)
+        || cfgdir.starts_with(&canon)
+        || canon == home
+        || canon == std::path::PathBuf::from("/");
+      if bad {
+        return Response::err(
+          "project contains daemon state/config (refusing: trust.db and keyring would be agent-writable)",
+        );
+      }
+    }
+    // R7 (ninja review): per-project spawn rate limit (fork-bomb via an
+    // escaped Human caller: each spawn grows registry + proxy listener).
+    // 10 spawns per project per 60s; excess refused (fail-closed, loud).
+    {
+      let mut rl = self.spawn_rate.lock().unwrap();
+      let now = std::time::Instant::now();
+      let e = rl.entry(project.to_string_lossy().into_owned()).or_insert((now, 0));
+      if now.duration_since(e.0).as_secs() >= 60 {
+        e.0 = now;
+        e.1 = 0;
+      }
+      e.1 += 1;
+      if e.1 > 10 {
+        return Response::err("spawn rate limited (10/min per project)");
+      }
+    }
     let id = new_session_id();
     if let Err(e) = self.root.create_session(&id) {
       return Response::err(format!("cgroup create failed: {e}"));

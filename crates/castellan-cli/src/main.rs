@@ -758,7 +758,6 @@ fn launch(args: &[String], sock: &str) -> ! {
   // the scope exists). If missing, freeze_fd is None and the watchdog
   // falls back to path resolution.
   let freeze_fd: Option<std::os::unix::io::RawFd> = (|| {
-    use std::os::unix::io::AsRawFd as _;
     let scope = castellan_freezer::CgroupRoot::detect()
       .ok()?
       .session_dir(&session);
@@ -766,7 +765,6 @@ fn launch(args: &[String], sock: &str) -> ! {
       return None;
     }
     let file = std::fs::File::open(&scope).ok()?;
-    let fd = file.as_raw_fd();
     // Detach the fd from the File without closing: into_raw_fd.
     // CLOEXEC: File::open sets it by default on Linux — the agent's
     // exec will close it. The supervisor's fork inherits it. Exactly
@@ -774,9 +772,6 @@ fn launch(args: &[String], sock: &str) -> ! {
     use std::os::unix::io::IntoRawFd as _;
     Some(file.into_raw_fd())
   })();
-  {
-    let _ = &freeze_fd;
-  }
   // undo overlay FIRST: setup enters a user+mount namespace and mounts
   // the overlay. The envelope's seccomp filter blocks mount(2), so
   // applying the envelope before the overlay would break forced
@@ -912,7 +907,7 @@ fn launch(args: &[String], sock: &str) -> ! {
             // OUTSIDE the merged view — target goes to the session
             // scratch, which is discarded with the session unless
             // kept (fresh rebuild per session; honest trade).
-            std::env::set_var("CARGO_TARGET_DIR", &format!("{s}/cargo-target"));
+            std::env::set_var("CARGO_TARGET_DIR", format!("{s}/cargo-target"));
           }
         }
       }
@@ -1067,9 +1062,26 @@ fn launch(args: &[String], sock: &str) -> ! {
           }
         }
       });
-      let _ = sup.run(&mut bpolicy, &btx);
+      let drops = castellan_broker::DropCount::default();
+      let _ = sup.run(&mut bpolicy, &btx, &drops);
       drop(btx);
       let _ = recorder.join();
+      let shed = drops.0.load(std::sync::atomic::Ordering::Relaxed);
+      if shed > 0 {
+        // R8: shed allow-events are themselves a signal (pressure =
+        // flood shape). Record the count on the spine so the census
+        // sees it even though the individual allows are gone.
+        let shed_state_dir = std::env::var("XDG_STATE_HOME")
+          .map(std::path::PathBuf::from)
+          .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+          });
+        if let Ok(sink) =
+          castellan_core::EventSink::for_session(&shed_state_dir, &session)
+        {
+          let _ = sink.emit("broker_shed", &format!("{shed} allow-events shed"), "deny");
+        }
+      }
       std::process::exit(sup.finish());
     }
     Ok(castellan_broker::Spawn::Agent) => {

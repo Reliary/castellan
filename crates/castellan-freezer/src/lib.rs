@@ -4,16 +4,26 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct CgroupRoot {
   base: PathBuf,
 }
 
+fn sys_roots() -> Vec<PathBuf> {
+  // F3 follow-up 9: the supervisor may live in the launcher's mount ns
+  // (overlay setup unshares BEFORE spawn_broker forks), where /sys does
+  // not show the host cgroup tree. /proc/1/root always escapes to the
+  // host view (same-uid read of our own init symlink — no privilege).
+  vec![PathBuf::from("/sys/fs/cgroup"), PathBuf::from("/proc/1/root/sys/fs/cgroup")]
+}
+
 fn user_slice_base() -> Option<PathBuf> {
   let uid = nix::unistd::Uid::current().as_raw();
-  let unified = PathBuf::from("/sys/fs/cgroup");
-  let candidate = unified.join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
-  if candidate.is_dir() {
-    return Some(candidate);
+  for unified in sys_roots() {
+    let candidate = unified.join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
+    if candidate.is_dir() {
+      return Some(candidate);
+    }
   }
   // F3 follow-up (2026-09-27, .227 breakout): the supervisor's transient
   // scope (castellan-hop-*.scope) may live OUTSIDE user@.service
@@ -32,14 +42,19 @@ fn own_slice_base() -> Option<PathBuf> {
   // search the known parent tree for ANY castellan.slice scope dir and
   // use its parent. Walk: user.slice, user-1000.slice, user@.service,
   // session-*.scope (the supervisor may live in any of these).
+  // F3 follow-up 8: hardcoding uid 1000 breaks every other user (and
+  // the supervisor's own uid is RIGHT THERE in getuid — use it).
+  let uid = nix::unistd::Uid::current().as_raw();
   for base in [
-    "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
-    "/sys/fs/cgroup/user.slice/user-1000.slice",
-    "/sys/fs/cgroup/user.slice",
+    format!("user.slice/user-{uid}.slice/user@{uid}.service"),
+    format!("user.slice/user-{uid}.slice"),
+    "user.slice".to_string(),
   ] {
-    let slice = PathBuf::from(base).join("castellan.slice");
-    if slice.is_dir() {
-      return Some(PathBuf::from(base));
+    for unified in sys_roots() {
+      let slice = unified.join(&base).join("castellan.slice");
+      if slice.is_dir() {
+        return Some(unified.join(&base));
+      }
     }
   }
   None

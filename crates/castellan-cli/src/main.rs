@@ -736,6 +736,47 @@ fn launch(args: &[String], sock: &str) -> ! {
     );
   }
   let _ = &session;
+  // F3 follow-up 10 (2026-09-27, .227 breakout): the watchdog needs a
+  // freeze handle that survives the launcher's mount-ns entry (overlay
+  // setup unshares BEFORE spawn_broker forks the supervisor, so the
+  // supervisor's /sys view cannot resolve the session scope — proven
+  // live, twice). Open the session scope dir FD HERE, in the host mount
+  // ns, and leak it to the supervisor via fork inheritance. Fds
+  // transcend mount namespaces. The agent inherits it too — the worst
+  // it can do is freeze its OWN scope (self-DoS) since the fd is
+  // scope-specific. Record the fd number in an env var the supervisor
+  // reads (fds above 2 are otherwise closed in the agent branch, but
+  // the SUPERVISOR branch keeps everything).
+  // F3 follow-up 10 (see watchdog below): open BEFORE overlay setup
+  // (host mount ns). Returns the raw fd, kept open in the launcher;
+  // the supervisor inherits it via fork. CLOEXEC stays SET so the
+  // AGENT branch (which execs) never sees it — fork keeps it, exec
+  // drops it. Scope-specific: even a leaked handle can only freeze
+  // this one session (self-DoS at worst).
+  // NOTE: the session scope dir may not exist yet at this point (the
+  // daemon creates it at spawn... actually spawn already ran above and
+  // the scope exists). If missing, freeze_fd is None and the watchdog
+  // falls back to path resolution.
+  let freeze_fd: Option<std::os::unix::io::RawFd> = (|| {
+    use std::os::unix::io::AsRawFd as _;
+    let scope = castellan_freezer::CgroupRoot::detect()
+      .ok()?
+      .session_dir(&session);
+    if !scope.is_dir() {
+      return None;
+    }
+    let file = std::fs::File::open(&scope).ok()?;
+    let fd = file.as_raw_fd();
+    // Detach the fd from the File without closing: into_raw_fd.
+    // CLOEXEC: File::open sets it by default on Linux — the agent's
+    // exec will close it. The supervisor's fork inherits it. Exactly
+    // the split we want.
+    use std::os::unix::io::IntoRawFd as _;
+    Some(file.into_raw_fd())
+  })();
+  {
+    let _ = &freeze_fd;
+  }
   // undo overlay FIRST: setup enters a user+mount namespace and mounts
   // the overlay. The envelope's seccomp filter blocks mount(2), so
   // applying the envelope before the overlay would break forced
@@ -979,15 +1020,49 @@ fn launch(args: &[String], sock: &str) -> ! {
           }
           if dead_since.map(|t| t.elapsed().as_secs() >= grace_secs).unwrap_or(false) {
             eprintln!("castellan: daemon lost — freezing session {watchdog_session} (fail-closed)");
-            match castellan_freezer::CgroupRoot::detect() {
-              Ok(root) => {
-                match root.set_freeze(&watchdog_session, true) {
-                  Ok(_) => eprintln!("castellan: watchdog froze {watchdog_session}"),
-                  Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+            // F3 follow-up 10: freeze via the pre-opened scope fd (opened
+            // in the host mount ns before overlay setup; fds transcend
+            // mount namespaces). Path resolution (CgroupRoot::detect) is
+            // unreliable here — the supervisor's /sys view differs. The
+            // fd is scope-specific: worst case the agent holds it too and
+            // can only freeze ITSELF (self-DoS, harmless).
+            let mut froze = false;
+            if let Some(fd) = freeze_fd {
+              // openat(cgroup.freeze, O_WRONLY) relative to the scope fd,
+              // then write "1". Borrow the fd without closing (forget the
+              // File to keep the original fd alive for the supervisor).
+              let path = format!("/proc/self/fd/{fd}/cgroup.freeze");
+              match std::fs::write(&path, b"1\n") {
+                Ok(()) => {
+                  eprintln!("castellan: watchdog froze {watchdog_session} (via scope fd)");
+                  froze = true;
                 }
+                Err(e) => eprintln!("castellan: watchdog fd-freeze failed: {e}"),
               }
-              Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
             }
+            if !froze {
+              match castellan_freezer::CgroupRoot::detect() {
+                Ok(root) => {
+                  match root.set_freeze(&watchdog_session, true) {
+                    Ok(_) => {
+                      eprintln!("castellan: watchdog froze {watchdog_session}");
+                      froze = true;
+                    }
+                    Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+                  }
+                }
+                Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+              }
+            }
+            // F3 follow-up 11: eprintln to a pipe can sit in Rust's
+            // stdio buffer; process::exit does not flush it (the 'froze'
+            // confirmation was lost live on .227 while the freeze itself
+            // landed). Flush explicitly before exiting.
+            use std::io::Write as _;
+            let _ = std::io::stderr().flush();
+            // Belt and suspenders: the freeze state is the ground truth
+            // (verified via cgroup.freeze read), not this log line.
+            let _ = froze;
             std::process::exit(245);
           }
         }

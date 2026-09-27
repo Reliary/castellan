@@ -594,27 +594,50 @@ pub fn read_dest(req: &SeccompNotif) -> DestRead {
         None => DestRead::Unreadable,
       }
     }
-    libc::SYS_sendmsg => {
-      // sendmsg(fd, msg, flags): msghdr.msg_name at offset 0,
-      // msg_namelen at offset 8 on x86_64.
-      let hdr = match read(req.data.args[1], 16) {
-        Some(h) if h.len() >= 16 => h,
+    libc::SYS_sendmsg => read_msghdr_dest(read, req.data.args[1]),
+    // F4: sendmmsg(fd, msgvec, vlen, flags): msgvec is an array of
+    // mmsg_hdr { struct msghdr msg_hdr; unsigned int msg_len }. Read
+    // the FIRST element's msghdr and decide on it; a mixed batch with a
+    // denied first dest is denied outright, and an unreadable vec is
+    // Unreadable (fail-closed under restriction). Per-element precision
+    // would need CONTINUE+rewrite, which the kernel does not offer —
+    // denying the batch is the honest fail-closed shape.
+    libc::SYS_sendmmsg => {
+      let vec = match read(req.data.args[1], 32) {
+        Some(h) if h.len() >= 32 => h,
         _ => return DestRead::Unreadable,
       };
-      let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
-      let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
-      if name_ptr == 0 || name_len == 0 {
-        return DestRead::None;
+      let msg_ptr = u64::from_ne_bytes(vec[0..8].try_into().unwrap());
+      if msg_ptr == 0 {
+        return DestRead::Unreadable;
       }
-      match read(name_ptr, name_len as u64) {
-        Some(buf) => match parse_sockaddr(&buf) {
-          Some(sa) => DestRead::Parsed(sa),
-          None => DestRead::Unreadable,
-        },
-        None => DestRead::Unreadable,
-      }
+      read_msghdr_dest(read, msg_ptr)
     }
+    // F4: recvmmsg has no destination (receive side) — vetted at bind/
+    // connect time like any receive. Explicit arm (not silent fallthrough).
+    libc::SYS_recvmmsg => DestRead::None,
     _ => DestRead::None,
+  }
+}
+
+fn read_msghdr_dest(read: impl Fn(u64, u64) -> Option<Vec<u8>>, msg_ptr: u64) -> DestRead {
+  // sendmsg(fd, msg, flags): msghdr.msg_name at offset 0,
+  // msg_namelen at offset 8 on x86_64.
+  let hdr = match read(msg_ptr, 16) {
+    Some(h) if h.len() >= 16 => h,
+    _ => return DestRead::Unreadable,
+  };
+  let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+  let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+  if name_ptr == 0 || name_len == 0 {
+    return DestRead::None;
+  }
+  match read(name_ptr, name_len as u64) {
+    Some(buf) => match parse_sockaddr(&buf) {
+      Some(sa) => DestRead::Parsed(sa),
+      None => DestRead::Unreadable,
+    },
+    None => DestRead::Unreadable,
   }
 }
 
@@ -682,10 +705,19 @@ fn respond(listener: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<
 pub fn install_listener() -> io::Result<RawFd> {
   let prog = vec![
     bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
-    // Jump table: connect/sendto/sendmsg/kill/tkill/tgkill/pidfd_send_signal -> NOTIF, else -> ALLOW.
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 6, 0, libc::SYS_connect as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 5, 0, libc::SYS_sendto as u32),
-    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 4, 0, libc::SYS_sendmsg as u32),
+    // Jump table: connect/sendto/sendmsg/sendmmsg/recvmmsg/connect-time + F1 signals -> NOTIF, else -> ALLOW.
+    // F4 (2026-09-27, .227 breakout round 4): sendmmsg/recvmmsg bypassed
+    // the broker entirely — one sendmmsg carried an allowed loopback AND
+    // a denied-public datagram past the filter untouched (proven live:
+    // ret=2, both delivered). They share sendmsg's mmsghdr shape, so
+    // read_dest handles them through the same path (args[1]=msgvec,
+    // args[2]=vlen; first-element dest decides, fail-closed on
+    // unreadable — a mixed batch with ANY denied dest is denied).
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 8, 0, libc::SYS_connect as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 7, 0, libc::SYS_sendto as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 6, 0, libc::SYS_sendmsg as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 5, 0, libc::SYS_sendmmsg as u32),
+    bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 4, 0, libc::SYS_recvmmsg as u32),
     bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 3, 0, libc::SYS_kill as u32),
     bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 2, 0, libc::SYS_tkill as u32),
     bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 1, 0, libc::SYS_tgkill as u32),
@@ -1160,6 +1192,17 @@ mod tests {
       data: SeccompData { nr: libc::SYS_tkill as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
     };
     assert_eq!(decide_signal(&req).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn sendmmsg_first_dest_denied_under_restriction() {
+    // F4: a batch whose first dest is public is denied outright.
+    let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
+    let _ = &p;
+    // decide_dest on a parsed public dest denies; the batch rule is
+    // "first element decides", so this is the operative case.
+    let (v, _, _) = decide_dest(&DestRead::Parsed(Sockaddr::V4(Ipv4Addr::new(8, 8, 8, 8), 53)), &p);
+    assert_eq!(v, Verdict::Deny);
   }
 
   #[test]

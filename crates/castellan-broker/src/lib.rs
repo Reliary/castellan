@@ -840,17 +840,30 @@ pub struct Broker {
   /// count, throttled_until)). Checked on every notification; a hot pid
   /// gets all its connects denied until it cools down.
   notify_rate: std::collections::HashMap<u32, (std::time::Instant, u32, Option<std::time::Instant>)>,
+  /// F4c round 2: per-pid unstable-read cluster gate.
+  /// (pid -> (window_start, unstable_count, throttled_until)).
+  unstable_rate: std::collections::HashMap<u32, (std::time::Instant, u32, Option<std::time::Instant>)>,
 }
 
 /// F4c: max CONNECT-class notifications per pid per second before the
 /// pid is throttled (all its connects denied for the cooldown). Normal
-/// agents: single digits/sec. The F4 flipper: ~100k/sec. The gap is
-/// four orders of magnitude; 1000/sec trips no legitimate workload we
-/// have ever measured (the TOCTOU verify run peaked at ~140k/sec from
-/// one pid — unmistakable).
-pub const CONNECT_RATE_PER_SEC: u32 = 1000;
+/// agents: single digits/sec (an LLM API call is one reused connection;
+/// even aypytest burst stays <50/sec). The F4 flipper: ~100k/sec. The
+/// gap is three orders of magnitude; 200/sec trips no legitimate
+/// workload we have ever measured and bites flippers 5x sooner.
+pub const CONNECT_RATE_PER_SEC: u32 = 200;
 /// F4c: throttle duration once tripped.
 pub const CONNECT_THROTTLE_SECS: u64 = 10;
+/// F4c round 2: unstable-cluster gate. Legit agents generate ZERO
+/// unstable reads (a stable sockaddr agrees with itself across 2ms).
+/// ANY unstable read is racer-signature (or a genuine memory race).
+/// N unstable reads within the window throttles the pid for the long
+/// cooldown — a full-speed flipper trips this in under a millisecond;
+/// a slow flipper must keep flips rarer than ~1 per window-quota to
+/// stay under, which bounds its win rate (see the F4c gate numbers).
+pub const UNSTABLE_WINDOW_SECS: u64 = 5;
+pub const UNSTABLE_MAX_PER_WINDOW: u32 = 10;
+pub const UNSTABLE_THROTTLE_SECS: u64 = 60;
 
 /// Run `exe args` under the broker and capture its stdout.
 ///
@@ -973,7 +986,7 @@ fn supervise_capture_inner(
     out
   });
   let mut policy = policy.clone();
-  let mut sup = Broker { listener, agent_pid: pid, agent_status: None, notify_rate: std::collections::HashMap::new() };
+  let mut sup = Broker { listener, agent_pid: pid, agent_status: None, notify_rate: std::collections::HashMap::new(), unstable_rate: std::collections::HashMap::new() };
   let (btx, _brx) = broker_log();
   let _ = sup.run(&mut policy, &btx);
   reader.join().unwrap_or_default()
@@ -1082,6 +1095,62 @@ impl Broker {
       } else {
         read_dest(&req)
       };
+      // F4c round 2: unstable-cluster throttle. Any Unstable outcome
+      // feeds the per-pid cluster gate; a hot cluster denies (already
+      // denied by decide_dest — this extends the denial to ALL of the
+      // pid's connects for the long cooldown).
+      if nr == libc::SYS_connect && matches!(dest, DestRead::Unstable) {
+        let now = std::time::Instant::now();
+        let e = self.unstable_rate.entry(req.pid).or_insert((now, 0, None));
+        if let Some(until) = e.2 {
+          if now < until {
+            let _ = log.send(BrokerEvent {
+              pid: req.pid,
+              verdict: Verdict::Deny,
+              reason: "unstable-throttled",
+              detail: String::new(),
+            });
+          } else {
+            e.2 = None;
+            e.0 = now;
+            e.1 = 0;
+          }
+        }
+        if e.2.is_none() {
+          if now.duration_since(e.0).as_secs() >= UNSTABLE_WINDOW_SECS {
+            e.0 = now;
+            e.1 = 0;
+          }
+          e.1 += 1;
+          if e.1 >= UNSTABLE_MAX_PER_WINDOW {
+            e.2 = Some(now + std::time::Duration::from_secs(UNSTABLE_THROTTLE_SECS));
+            let _ = log.send(BrokerEvent {
+              pid: req.pid,
+              verdict: Verdict::Deny,
+              reason: "unstable-flood",
+              detail: format!("{} unstable/{}s", e.1, UNSTABLE_WINDOW_SECS),
+            });
+          }
+        }
+      }
+      // A pid under unstable-throttle gets everything denied even if
+      // this particular read was stable (the flipper parks allowed
+      // between flips — stable-allowed reads during a throttle window
+      // are untrustworthy by construction).
+      if nr == libc::SYS_connect {
+        if let Some((_, _, Some(until))) = self.unstable_rate.get(&req.pid) {
+          if std::time::Instant::now() < *until {
+            let _ = log.send(BrokerEvent {
+              pid: req.pid,
+              verdict: Verdict::Deny,
+              reason: "unstable-throttled",
+              detail: String::new(),
+            });
+            respond(self.listener, &req, Verdict::Deny)?;
+            continue;
+          }
+        }
+      }
       let (verdict, reason, detail) = decide_dest(&dest, policy);
       let _ = log.send(BrokerEvent { pid: req.pid, verdict, reason, detail });
       respond(self.listener, &req, verdict)?;
@@ -1132,7 +1201,7 @@ pub fn spawn_broker() -> io::Result<Spawn> {
     unsafe { libc::close(listener) };
     return Ok(Spawn::Agent);
   }
-  Ok(Spawn::Supervisor(Broker { listener, agent_pid, agent_status: None, notify_rate: std::collections::HashMap::new() }))
+  Ok(Spawn::Supervisor(Broker { listener, agent_pid, agent_status: None, notify_rate: std::collections::HashMap::new(), unstable_rate: std::collections::HashMap::new() }))
 }
 
 /// Wait for the agent child and return its exit code (128+sig on signal).

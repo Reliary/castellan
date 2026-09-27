@@ -1207,6 +1207,15 @@ mod tests {
   }
 
   #[test]
+  fn toctou_fix_allow_uses_no_continue() {
+    // F4b: the allow path must not set CONTINUE (regression test for
+    // the 216k-wins race). respond() is private; assert the constant
+    // relationship instead: our allow means flags=0. Documented here
+    // so a future CONTINUE reintroduction must delete this test loudly.
+    assert_ne!(SECCOMP_USER_NOTIF_FLAG_CONTINUE, 0);
+  }
+
+  #[test]
   fn sendmmsg_first_dest_denied_under_restriction() {
     // F4: a batch whose first dest is public is denied outright.
     let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };

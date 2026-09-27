@@ -25,21 +25,21 @@ fn user_slice_base() -> Option<PathBuf> {
 }
 
 fn own_slice_base() -> Option<PathBuf> {
-  let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-  for line in cg.lines() {
-    if let Some(idx) = line.find("castellan.slice") {
-      // line looks like "0::/user.slice/.../castellan.slice" — the
-      // part after "0::" is the path from the cgroup root.
-      let path = line.split_once("::").map(|(_, p)| p).unwrap_or(line);
-      let full = PathBuf::from("/sys/fs/cgroup").join(&path[..idx + "castellan.slice".len()]);
-      // base = parent of castellan.slice
-      if full.ends_with("castellan.slice") {
-        if let Some(parent) = full.parent() {
-          if parent.is_dir() {
-            return Some(parent.to_path_buf());
-          }
-        }
-      }
+  // F3 follow-up 7: the SUPERVISOR (which runs the watchdog) is NOT in
+  // any session scope — it forked before the agent joined. Its own
+  // cgroup ancestry has no castellan.slice. But the SESSION ID is known
+  // to the caller... except detect() takes no session. So instead:
+  // search the known parent tree for ANY castellan.slice scope dir and
+  // use its parent. Walk: user.slice, user-1000.slice, user@.service,
+  // session-*.scope (the supervisor may live in any of these).
+  for base in [
+    "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+    "/sys/fs/cgroup/user.slice/user-1000.slice",
+    "/sys/fs/cgroup/user.slice",
+  ] {
+    let slice = PathBuf::from(base).join("castellan.slice");
+    if slice.is_dir() {
+      return Some(PathBuf::from(base));
     }
   }
   None

@@ -31,3 +31,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
+
+  # Kernel-drift gate for the seccomp denylist.
+  #
+  # The filter is a denylist (commitment #8), so its risk is not a
+  # mistake in today's list but a kernel upgrade that adds a syscall
+  # nobody enumerated. This reads the capability-class table in
+  # crates/castellan-envelope/src/syscall_classes.rs, checks the table
+  # and the filter agree in BOTH directions against the running
+  # kernel's own syscall table, and fails if a Hard class claims a
+  # closure the filter does not have, a blocked syscall has no class,
+  # a class member is not a real syscall, or a Probed class gains a
+  # member its written residual does not cover.
+  syscall-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p castellan-envelope --example syscall-classes
+      - run: bash test/syscall-drift.sh
+
+  # Workload-syscall probe.
+  #
+  # A Hard class is only safe to block if the workload does not need it.
+  # Today that is an argument (git needs chmod, cargo needs utime) whose
+  # supporting measurement was a one-off. This re-derives it on every
+  # run: a ptrace-based probe (no strace) traces eight representative
+  # workloads — including a real `rustc -O` compile and a real
+  # `git commit` — and fails if any of them needs a Hard-class syscall.
+  workload-syscalls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p castellan-envelope --example syscall-probe
+      - run: python3 test/workload-syscalls.py

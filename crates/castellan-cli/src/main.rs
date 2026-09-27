@@ -949,24 +949,9 @@ fn launch(args: &[String], sock: &str) -> ! {
       let watchdog_session = session.clone();
       let watchdog_sock = sock.to_string();
       eprintln!("castellan: watchdog armed (grace 5s)");
-      // F3 follow-up 5 (2026-09-27, .227 breakout): learned live —
-      // killing ONE daemon does nothing when FIVE listen on the same
-      // socket (stale daemons accumulate: every test restart binds the
-      // same path, last-bind-wins per-connection, and UnixStream::connect
-      // succeeds as long as ANY listener is alive). The watchdog's
-      // socket heartbeat therefore never observes "daemon dead". Fix at
-      // the source: SINGLETON — refuse to start when the socket already
-      // answers. A second daemon exits non-zero instead of stacking.
-      // (Stale-socket file with no listener: connect fails -> we bind
-      // fresh. Correct in both cases.)
-      // only at agent exit — eprintln from a detached thread can sit in
-      // the pipe buffer (we SAW "armed" only because hold3.py exits...
-      // actually we saw it, so pipe drains. Keep marker) AND, more
-      // importantly: sup.run() may EXIT when the agent exits, taking the
-      // process down before the watchdog fires. The watchdog must ALSO
-      // fire when run() returns while the daemon is dead. Handle: wrap
-      // run() — check daemon liveness right after run() returns; if
-      // dead, freeze + exit 245 instead of finish().
+      // F3 follow-up 5: daemon singleton (see daemon main.rs) is the
+      // structural fix for stacked listeners; the watchdog covers the
+      // true single-daemon death.
       let _ = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
         let grace_secs: u64 = std::env::var("CASTELLAN_WATCHDOG_GRACE_SECS")
           .ok()

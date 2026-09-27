@@ -19,7 +19,17 @@ fn main() {
     _ => {}
   }
   let request = match args[0].as_str() {
-    "status" => serde_json::json!({"op": "status"}),
+    "status" => {
+      // A drills build can disable defenses; never let one be mistaken
+      // for production in the operator's own status output.
+      if castellan_core::drills_enabled() {
+        eprintln!(
+          "castellan: WARNING — this binary was built with --features drills. \
+           Defense fault-injection is compiled in. Not a production build."
+        );
+      }
+      serde_json::json!({"op": "status"})
+    }
     "freeze" => freeze_req(&args[1..], "freeze"),
     "thaw" => freeze_req(&args[1..], "thaw"),
     "kill" => freeze_req(&args[1..], "kill"),

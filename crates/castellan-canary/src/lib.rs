@@ -103,8 +103,8 @@ impl Honeypot {
 
   pub fn start_with_callback(state_home: &Path, on_trip: TripCallback) -> io::Result<Self> {
     // P8 fault injection: the D2 drill must fail loudly when the
-    // honeypot is down. Test-only, env-gated.
-    if std::env::var("CASTELLAN_TEST_DISABLE_HONEYPOT").is_ok() {
+    // honeypot is down. Compile-time hook only.
+    if castellan_core::fault_injected("honeypot") {
       return Self::detached_ok();
     }
     let listener = TcpListener::bind(("127.0.0.1", 0))?;

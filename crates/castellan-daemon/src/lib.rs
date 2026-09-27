@@ -1935,8 +1935,8 @@ impl Daemon {
   /// floor the project's trust at 0 (forged_nonce signal).
   fn bless_approve(&self, nonce: &str) -> Response {
     // P8 fault injection: the D3 drill must fail loudly when the bless
-    // floor is bypassed. Test-only, env-gated.
-    if std::env::var("CASTELLAN_TEST_DISABLE_BLESS").is_ok() {
+    // floor is bypassed. Compile-time hook only.
+    if castellan_core::fault_injected("bless") {
       return Response::ok().with_message("granted (injected bypass)");
     }
     let req = {

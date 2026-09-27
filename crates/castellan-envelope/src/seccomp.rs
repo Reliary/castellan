@@ -82,8 +82,8 @@ pub fn seccomp_program() -> Vec<libc::sock_filter> {
 
 pub fn seccomp_apply() -> io::Result<()> {
   // P8 fault injection: the D4 drill must fail loudly when seccomp is
-  // dropped. Test-only, env-gated — the daemon's env is not agent-set.
-  if std::env::var("CASTELLAN_TEST_DISABLE_SECCOMP").is_ok() {
+  // dropped. Compile-time hook only — a release build cannot skip this.
+  if castellan_core::fault_injected("seccomp") {
     return Ok(());
   }
   let prog = seccomp_program();

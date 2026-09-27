@@ -20,3 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 nix = { workspace = true }
+
+[features]
+# Forwards the P8 drill fault-injection hook (see castellan-core).
+drills = ["castellan-envelope/drills"]

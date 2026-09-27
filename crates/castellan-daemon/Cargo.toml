@@ -43,3 +43,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 nix = { workspace = true }
 rustc-hash = { workspace = true }
+
+[features]
+# Forwards the P8 drill fault-injection hook (see castellan-core).
+drills = ["castellan-core/drills"]

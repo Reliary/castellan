@@ -11,3 +11,8 @@ serde_json = { workspace = true }
 rustc-hash = { workspace = true }
 nix = { workspace = true }
 sha2 = "0.10"
+
+[features]
+# P8 drill fault injection. Off by default; a release build cannot
+# disable any defense at runtime. See `fault_injected` in src/lib.rs.
+drills = []

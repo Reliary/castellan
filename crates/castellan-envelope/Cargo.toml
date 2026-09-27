@@ -14,3 +14,7 @@ sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[features]
+# Forwards the P8 drill fault-injection hook (see castellan-core).
+drills = ["castellan-core/drills"]

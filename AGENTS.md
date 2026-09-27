@@ -30,6 +30,7 @@ Conventions for AI agents (and humans) working on castellan.
 - `cargo clippy --workspace --all-targets` — must be clean
 - `cargo test --workspace` — unit tests
 - `test/shell.d/p0-freeze.sh`, `test/shell.d/p1-envelope.sh` — acceptance suites (local desktop Linux only; need real user cgroup slices)
+- `test/drill-gate-prod.sh <prod_cli> <drill_cli>` — asserts a release build cannot disable any defense via `CASTELLAN_TEST_DISABLE_*`, and that a `--features drills` build still can. Needs a tty (the R7 launcher-tty gate rejects a launch with no `tty_nr`) and a real user cgroup slice, so it runs on the exercise box, not locally. `test/shell.d/p8-drills.sh` requires a drills build and refuses to run otherwise.
 
 ## Architecture
 

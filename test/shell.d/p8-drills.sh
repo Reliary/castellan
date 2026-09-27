@@ -4,6 +4,17 @@
 # known defense regressions and verify the drill suite fails loudly
 # for exactly the injected one. Then 20 clean cycles with zero false
 # alarms.
+#
+# REQUIRES A DRILLS BUILD. The fault-injection hooks are the compile-time
+# `drills` feature (castellan-core::fault_injected), so a plain
+# release build cannot inject anything and this suite would be vacuous:
+#
+#   cargo build --release -p castellan-cli -p castellan-daemon \
+#     --features castellan-cli/drills,castellan-daemon/drills
+#
+# test/drill-gate-prod.sh asserts the other direction — that a release
+# build ignores the same variables and stays fully enforcing.
+# Restore a plain release build before publishing.
 
 set -u
 
@@ -13,6 +24,14 @@ FAIL=0
 
 ok() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
+
+# Refuse to run against a non-drills build: the injections below would be
+# silently ignored and the whole suite would report false confidence.
+if ! strings -a "$BIN/castellan-daemon" | grep -q "FAULT INJECTION ACTIVE"; then
+  echo "  FAIL: $BIN/castellan-daemon is not a drills build (no injection hook)."
+  echo "        Build with --features castellan-cli/drills,castellan-daemon/drills"
+  exit 1
+fi
 
 cleanup() {
   [[ -n "${DAPID:-}" ]] && kill "$DAPID" 2>/dev/null

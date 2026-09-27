@@ -203,8 +203,8 @@ pub fn read_roots_for_envelope() -> Vec<PathBuf> {
 
 pub fn apply_envelope(policy: &Policy) -> io::Result<()> {
   // P8 fault injection: the D4 drill must fail loudly when Landlock is
-  // dropped. Test-only, env-gated — the daemon's env is not agent-set.
-  if std::env::var("CASTELLAN_TEST_DISABLE_LANDLOCK").is_ok() {
+  // dropped. Compile-time hook only — a release build cannot skip this.
+  if castellan_core::fault_injected("landlock") {
     return Ok(());
   }
   let abi = landlock_abi()

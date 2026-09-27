@@ -103,8 +103,8 @@ impl CgroupRoot {
 
   pub fn set_freeze(&self, session: &SessionId, freeze: bool) -> io::Result<FreezeState> {
     // P8 fault injection: the D5 drill must fail loudly when the
-    // freezer is muted. Test-only, env-gated.
-    if std::env::var("CASTELLAN_TEST_DISABLE_FREEZE").is_ok() {
+    // freezer is muted. Compile-time hook only.
+    if castellan_core::fault_injected("freeze") {
       return Ok(FreezeState::Thawed);
     }
     fs::write(
@@ -166,8 +166,8 @@ impl CgroupRoot {
   /// Bounds the blast radius to the session window; not a guarantee.
   pub fn orphan_census(&self, session: &SessionId, session_start_unix: u64) -> Vec<u32> {
     // fault injection (P8 drill suite): the census is disabled, so the
-    // D1 drill must fail loudly. Env-gated, daemon-launcher-only.
-    if std::env::var("CASTELLAN_TEST_DISABLE_CENSUS").is_ok() {
+    // D1 drill must fail loudly. Compile-time hook only.
+    if castellan_core::fault_injected("census") {
       return Vec::new();
     }
     let _scope = self.session_dir(session);

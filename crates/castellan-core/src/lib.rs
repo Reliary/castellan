@@ -650,6 +650,44 @@ pub fn project_key(realpath: &Path) -> String {
   digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Single chokepoint for P8 drill fault injection.
+///
+/// The P8 acceptance suite must be able to mutate each defense and see
+/// the matching drill fail (Koch criterion: a self-test that cannot
+/// fail is not a test). That need used to be served by
+/// `CASTELLAN_TEST_DISABLE_*` env reads sitting in the enforcement path
+/// of Landlock, seccomp, the freezer, the canary and bless_approve —
+/// a defense that returns "success" while doing nothing.
+///
+/// A runtime env read is the wrong mechanism there: read roots are `/`,
+/// so a session can read the daemon's `/proc/<pid>/environ`, and the
+/// launcher CLI inherits the operator's shell. The hook is therefore
+/// compiled in, not switched on: a release build cannot disable any
+/// defense at runtime, and the env var name is only honoured in a
+/// `--features drills` build, which also announces itself on stderr so
+/// a drill binary can never be mistaken for a production one.
+pub fn fault_injected(defense: &str) -> bool {
+  if !cfg!(feature = "drills") {
+    return false;
+  }
+  let var = format!("CASTELLAN_TEST_DISABLE_{}", defense.to_ascii_uppercase());
+  if std::env::var_os(&var).is_none() {
+    return false;
+  }
+  eprintln!(
+    "castellan: FAULT INJECTION ACTIVE — defense '{defense}' is disabled via ${var}. \
+     This binary was built with --features drills and is NOT a production build."
+  );
+  true
+}
+
+/// True when this binary was built with drill fault injection compiled
+/// in. Surfaces in `castellan doctor` so the condition is visible in
+/// the operator's own output rather than only in a drill log.
+pub fn drills_enabled() -> bool {
+  cfg!(feature = "drills")
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

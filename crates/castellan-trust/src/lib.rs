@@ -60,6 +60,13 @@ pub enum Signal {
   /// op over the socket (self-keep/thaw/spawn, direct trust farming,
   /// evidence poisoning, sabotage, canary oracle).
   ForgedSocketOp,
+  /// B: scope-creep — the session's code change touched many
+  /// functions or files. Advisory at high tiers (ledger row, no tier
+  /// force); the tier floor already forces fail-closed expansion at
+  /// tiers 0-1, so the decrement bites hardest where it matters.
+  /// Findings-only-negative in the scan sense is NOT claimed: a narrow
+  /// delta earns nothing, a broad one costs.
+  ScopeCreep,
 }
 
 impl Signal {
@@ -74,6 +81,7 @@ impl Signal {
       Signal::ForgedNonce => f64::NEG_INFINITY,
       Signal::VulnIntroduced => -15.0,
       Signal::ForgedSocketOp => -25.0,
+      Signal::ScopeCreep => -8.0,
     }
   }
 
@@ -88,6 +96,7 @@ impl Signal {
       Signal::ForgedNonce => "forged_nonce",
       Signal::VulnIntroduced => "vuln_introduced",
       Signal::ForgedSocketOp => "forged_socket_op",
+      Signal::ScopeCreep => "scope_creep",
     }
   }
 }
@@ -337,6 +346,7 @@ pub fn signal_from_str(s: &str) -> Signal {
     "forged_nonce" => Signal::ForgedNonce,
     "vuln_introduced" => Signal::VulnIntroduced,
     "forged_socket_op" => Signal::ForgedSocketOp,
+    "scope_creep" => Signal::ScopeCreep,
     _ => Signal::ForgedNonce,
   }
 }
@@ -406,6 +416,7 @@ mod tests {
       Signal::ForgedNonce,
       Signal::VulnIntroduced,
       Signal::ForgedSocketOp,
+      Signal::ScopeCreep,
     ];
     for sig in signals {
       assert_eq!(signal_from_str(sig.as_str()), sig, "round-trip for {}", sig.as_str());

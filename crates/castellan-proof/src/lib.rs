@@ -10,6 +10,7 @@
 
 pub mod certificate;
 pub mod signing;
+pub mod structural;
 
 use castellan_ledger::diff_upper;
 use serde::{Deserialize, Serialize};

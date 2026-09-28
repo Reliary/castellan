@@ -2235,6 +2235,26 @@ impl Daemon {
       proofs.iter().filter(|p| p.passed).collect();
     match castellan_ledger::commit(&project, &upper) {
       Ok(applied) => {
+        // A/B (diff-trust): structural blast + scope-creep, computed
+        // from the session's upper layer BEFORE commit materializes it
+        // (same pre-commit window as the placebo proofs). Owned
+        // grammar-free code in castellan-proof::structural — no index
+        // daemon, no new deps. Emits one `structural_blast` spine event
+        // (the cert's A factor reads it) and, when scope_creep, one
+        // ScopeCreep trust signal (-8, advisory at high tiers).
+        let blast = castellan_proof::structural::blast_for_session(&project, &upper);
+        if let Ok(sink) = EventSink::for_session(&Self::state_dir(), session) {
+          if !blast.touched_fns.is_empty() || !blast.files.is_empty() {
+            let body = serde_json::json!({
+              "files": blast.files,
+              "touched_fns": blast.touched_fns,
+              "callees": blast.callees,
+              "caller_hits": blast.caller_hits,
+              "scope_creep": blast.scope_creep,
+            });
+            let _ = sink.emit("structural_blast", &body.to_string(), "measured");
+          }
+        }
         let _ = castellan_ledger::discard(&upper, &work);
         // P9.4: blast-radius weight for this session's touches. The
         // stria index may not exist (async build, never blocks) —
@@ -2270,6 +2290,23 @@ impl Daemon {
         };
         // user kept the session: positive trust signal
         let mut db = self.trust.lock().unwrap();
+        if blast.scope_creep {
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: session.to_string(),
+              signal: Signal::ScopeCreep,
+              evidence: format!(
+                "broad code delta: {} fn(s) across {} file(s); callers {}; callees {}",
+                blast.touched_fns.len(),
+                blast.files.len(),
+                blast.caller_hits,
+                blast.callees.len(),
+              ),
+            },
+          );
+        }
         let _ = db.apply_weighted(
           &project,
           &TrustEvent {

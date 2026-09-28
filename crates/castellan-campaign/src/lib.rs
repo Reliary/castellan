@@ -54,6 +54,7 @@ fn outcome(signal: Signal) -> Outcome {
     | Signal::EnvelopeEscape
     | Signal::AuditMismatch
     | Signal::VulnIntroduced
+    | Signal::ScopeCreep
     | Signal::ForgedSocketOp => Outcome::Bad,
     Signal::ForgedNonce => Outcome::Bad,
   }
@@ -65,7 +66,7 @@ fn signal_rank(signal: Signal) -> u8 {
   match signal {
     Signal::CanaryHit | Signal::EnvelopeEscape => 3,
     Signal::ForgedNonce | Signal::ForgedSocketOp => 2,
-    Signal::UserRevert | Signal::AuditMismatch | Signal::VulnIntroduced => 1,
+    Signal::UserRevert | Signal::AuditMismatch | Signal::VulnIntroduced | Signal::ScopeCreep => 1,
     Signal::ProofPassed | Signal::CleanSession => 0,
   }
 }

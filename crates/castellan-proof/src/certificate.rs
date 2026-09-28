@@ -52,6 +52,21 @@ pub struct ArtifactScan {
   pub scope: String,
 }
 
+/// A: structural blast-radius factor (diff-trust). Grammar-free,
+/// findings-only-negative in the artifact-scan sense: an empty delta
+/// (docs-only change, no code functions) is None (no claim either way);
+/// a code delta is Some with the measured scope. The cert states what
+/// the scan CANNOT see, never "safe" — absence of callers is not
+/// evidence of isolation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralBlast {
+  pub files: Vec<String>,
+  pub touched_fns: Vec<String>,
+  pub callees: Vec<String>,
+  pub caller_hits: usize,
+  pub scope_creep: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofCertificate {
   pub session: String,
@@ -74,6 +89,11 @@ pub struct ProofCertificate {
   /// verified; `broken_at` names the first edited/deleted line, if any.
   #[serde(default)]
   pub spine_chain: Option<ChainEvidence>,
+  /// A: structural blast factor. None = no code delta (docs-only or
+  /// empty change — no scope claim either way). Some = the measured
+  /// scope of the session's code change.
+  #[serde(default)]
+  pub structural_blast: Option<StructuralBlast>,
   /// S2: detached ed25519 signature over `cert_canonical(self)`. None
   /// = the daemon has no signing key (unsigned cert — recorded
   /// honestly, never implied to be signed).
@@ -160,7 +180,6 @@ fn assemble_certificate_inner(
   // Findings-only-negative: only a finding delta produces a factor;
   // a clean delta or no scan = None (no claim either way).
   let artifact_scan = read_artifact_scan(state_dir, session);
-
   // S1: verify the spine hash chain. Include the verdict when at least
   // one event was checked OR a break was found — a break on the very
   // first line has checked==0 and must NOT be reported as "no chain".
@@ -176,6 +195,11 @@ fn assemble_certificate_inner(
     }
     _ => None,
   };
+
+  // A: structural blast factor. Read the blast evidence the daemon
+  // recorded at keep (`structural_blast` spine event); a code delta
+  // produces a factor, a docs-only or empty change = None.
+  let structural_blast = read_structural_blast(state_dir, session);
 
   let quality_label = match (bounds_verdict, proofs_passed, test_rerun_passed, spine_exists) {
     ("STAYED_IN_BOUNDS", p, t, true) if p > 0 && t => "STRONG",
@@ -202,6 +226,7 @@ fn assemble_certificate_inner(
     census,
     artifact_scan,
     spine_chain,
+    structural_blast,
     signature: None,
     quality_label: quality_label.to_string(),
   };
@@ -237,9 +262,18 @@ fn read_artifact_scan(state_dir: &Path, session: &str) -> Option<ArtifactScan> {
   })
 }
 
+/// Read the A structural-blast factor the daemon recorded at keep.
+/// The daemon emits one `structural_blast` spine event per kept session
+/// with the measured scope as JSON in the path field; absence = None.
+fn read_structural_blast(state_dir: &Path, session: &str) -> Option<StructuralBlast> {
+  let sink = EventSink::for_session(state_dir, session).ok()?;
+  let events = sink.read_all().ok()?;
+  let ev = events.iter().rev().find(|e| e.kind == "structural_blast")?;
+  serde_json::from_str(&ev.path).ok()
+}
+
 /// Read the N6 census attestation file written by the daemon at kill.
-fn read_census(state_dir: &Path, session: &str) -> Option<(usize, usize)> {
-  let path = state_dir.join("castellan/sessions").join(format!("{session}.census"));
+fn read_census(state_dir: &Path, session: &str) -> Option<(usize, usize)> {  let path = state_dir.join("castellan/sessions").join(format!("{session}.census"));
   let raw = std::fs::read_to_string(path).ok()?;
   let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
   let found = v.get("orphans_found")?.as_u64()? as usize;

@@ -1,0 +1,29 @@
+name: Binary size
+
+on:
+  push:
+    branches: [main, quattro, diff-trust]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release -p castellan-cli -p castellan-daemon
+      - name: Report size
+        run: |
+          ls -lh target/release/castellan target/release/castellan-daemon
+          SIZE=$(stat -c %s target/release/castellan-daemon)
+          echo "Daemon size (bytes): $SIZE"
+          MAX=15728640 # 15 MB budget, same as sibling projects
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "Daemon exceeded 15MB budget"
+            exit 1
+          fi

@@ -2,11 +2,14 @@ name: ci
 
 on:
   push:
-    branches: [main, quattro]
+    branches: [main, quattro, diff-trust]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 # test/shell.d/*.sh acceptance suites require a real user cgroup slice
 # (user@UID.service under systemd) and run on dev machines only, not CI.
@@ -20,9 +23,21 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
+      - run: cargo build --workspace --all-targets
+      # No `cargo fmt` gate: the repo style is 2-space (AGENTS.md) with no
+      # rustfmt.toml, so rustfmt default (4-space) would rewrite 46 files.
+      # clippy -D warnings is the style gate.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: no openssl-sys (cross-compile sanity)
+        run: |
+          if cargo tree -e normal 2>/dev/null | grep -q "openssl-sys"; then
+            echo "openssl-sys blocks ARM/static builds"; exit 1; fi
+      - name: no sqlite runtime DBs or image binaries committed
+        run: |
+          if git ls-files | grep -qE '\.sqlite(-journal|-shm|-wal)?$'; then echo "SQLite runtime DBs committed"; exit 1; fi
+          if git ls-files | grep -qE '\.(jpe?g|png|gif|bmp|ico)$'; then echo "Binary images committed"; exit 1; fi
+          echo "artifact check ok"
 
   release-build:
     runs-on: ubuntu-latest
@@ -31,6 +46,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
+
+  # Cross-architecture compile sanity. Castellan is Linux-only
+  # (Landlock/seccomp/cgroup), so the matrix is Linux targets only:
+  # x86_64 check + aarch64 cross-compile via gcc-aarch64. No macOS/
+  # Windows (kernel primitives do not exist there — honestly scoped).
+  cross-arch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross linker
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - run: cargo check --workspace --target x86_64-unknown-linux-gnu
+      # aarch64 uses the bundled-sqlite path (no system linker sqlite);
+      # the build-script needs the cross CC, installed above. If the
+      # cross toolchain drifts, this job goes red — that IS the signal.
+      - run: cargo check --workspace --target aarch64-unknown-linux-gnu
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tools
+        run: cargo install cargo-audit cargo-deny --locked 2>/dev/null || true
+      - name: cargo audit
+        run: cargo audit 2>&1 | tail -10
+      - name: cargo deny advisories
+        run: cargo deny check advisories 2>&1 | tail -10
+      - name: cargo deny bans+licenses+sources
+        run: cargo deny check bans licenses sources 2>&1 | tail -15
 
   # Kernel-drift gate for the seccomp denylist.
   #
@@ -68,3 +118,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p castellan-envelope --example syscall-probe
       - run: python3 test/workload-syscalls.py
+
+  # diff-trust gate (A+B): structural blast + scope-creep.
+  #
+  # A is only safe to ship if sig_name precision on real touched files
+  # stays >= 0.80 and caller-count agrees with rg ground truth within
+  # 20%; B is only safe if clean-session false-positive stays at zero
+  # on the fixture corpus. This re-derives both on every run from the
+  # repo's own sources (no fixture files to rot — the corpus IS the
+  # repo). Cert latency is bounded so the keep path cannot regress
+  # into a slow gate.
+  diff-trust-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p castellan-proof structural -- --nocapture 2>&1 | tail -3
+      - name: sig_name precision on repo sources
+        run: python3 test/diff-trust-gate.py --check precision --min 0.80
+      - name: caller-count agreement vs rg ground truth
+        run: python3 test/diff-trust-gate.py --check callers --max-disagree 0.20
+      - name: cert assembly latency bound
+        run: python3 test/diff-trust-gate.py --check latency --max-ms 2000

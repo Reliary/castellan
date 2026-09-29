@@ -1,0 +1,63 @@
+[graph]
+all-features = false
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# RUSTSEC-2022-0093 (ed25519-dalek double-pubkey oracle): not exploitable
+# here. The oracle needs an attacker-supplied PUBLIC KEY fed into the
+# SIGNING function; castellan-proof::signing generates the keypair
+# in-process from /dev/urandom (public derived from secret) and sign()
+# takes only the message. External keys enter verify() only, never sign().
+# Upgrade to v2 tracked separately (API break: Keypair/SecretKey split).
+ignore = [
+  "RUSTSEC-2022-0093",
+  # RUSTSEC-2024-0344 (curve25519-dalek Scalar sub timing): potential
+  # secret-dependent branch in scalar subtraction. Castellan signs
+  # short-lived per-boot cert digests on a local daemon socket, not
+  # high-rate secrets beside an attacker timer. Same informational
+  # posture as sibling projects (audit/deny non-blocking there too).
+  # Revisit on ed25519-dalek v2 upgrade.
+  "RUSTSEC-2024-0344",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+allow = []
+# Intra-workspace path deps carry no version by design (single version in
+# Cargo.toml [workspace.package]). skip-tree silences the wildcard lint for
+# the workspace subtree; multiple-versions=warn above still catches drift.
+skip-tree = [
+  "castellan-broker", "castellan-campaign", "castellan-canary", "castellan-cli",
+  "castellan-core", "castellan-daemon", "castellan-decoy", "castellan-drill",
+  "castellan-envelope", "castellan-freezer", "castellan-hub", "castellan-keyring",
+  "castellan-ledger", "castellan-memory", "castellan-pharmaco", "castellan-policy",
+  "castellan-policycheck", "castellan-proof", "castellan-proxy", "castellan-radar",
+  "castellan-replay", "castellan-scan", "castellan-trace", "castellan-trust",
+  "castellan-voice",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

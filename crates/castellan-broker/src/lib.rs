@@ -109,6 +109,13 @@ pub struct EgressPolicy {
   /// Used for the systemd-resolved stub (127.0.0.53:53), which is a
   /// relay to the real upstream: allowing it is an unmonitored egress
   /// path and a DNS-tunnel channel. Empty by default (audit posture).
+  /// Also used for loopback SSH (HN ssh-localhost escape, 2026-09-30):
+  /// `ssh localhost <cmd>` splits into an allowed client connect to
+  /// 127.0.0.1:22 plus an UNCONFINED server child forked by sshd — the
+  /// child never inherits seccomp/Landlock/cgroup, so the session's
+  /// three layers are all bypassed at once. Denying the client connect
+  /// closes the LLM-obvious door; cron/at/remote-ssh remain (B, the
+  /// exclusion-census follow-up).
   pub denied_loopback: Vec<(IpAddr, u16)>,
   /// Deny the systemd user-manager sockets (T4). Default true.
   pub deny_systemd_sockets: bool,
@@ -167,10 +174,14 @@ impl EgressPolicy {
   /// stub 127.0.0.53. The stub is loopback, so the blanket loopback
   /// allowance passes it, and the stub forwards to the real upstream.
   /// `deny_resolver_stub` closes that; it is applied automatically.
+  /// Loopback SSH (`deny_loopback_ssh`, same mechanism) is applied
+  /// automatically too — same relay shape: the server child is outside
+  /// every layer.
   pub fn with_llm_only(mut self, hosts: &[String]) -> Self {
     self.restrict_ip = true;
     self.resolver_ips.clear();
     self.deny_resolver_stub();
+    self.deny_loopback_ssh();
     self.with_hosts(hosts)
   }
 
@@ -190,6 +201,40 @@ impl EgressPolicy {
       let entry = (IpAddr::V4(Ipv4Addr::new(127, 0, 0, octet)), 53u16);
       if !self.denied_loopback.contains(&entry) {
         self.denied_loopback.push(entry);
+      }
+    }
+  }
+
+  /// Under a destination policy, DENY loopback SSH even though it is
+  /// loopback. `ssh localhost <cmd>` is a full three-layer escape: the
+  /// client connect to 127.0.0.1:22 is inside the session (allowed by
+  /// the blanket loopback rule), but the command runs in a child forked
+  /// by sshd — outside the session cgroup, outside the Landlock domain,
+  /// outside the seccomp filter. The N6 orphan census cannot see it
+  /// (ppid is system sshd, not the user manager) and the sibling
+  /// detector never matches `sshd:/bin/sh` basenames, so without this
+  /// deny the escape is silent: no spine row, no freeze, no trust hit.
+  ///
+  /// Denied ports: 22 (sshd default) plus the common alternates 2222
+  /// and 2200. A non-loopback ssh (remote host) is a public destination
+  /// and already denied under restrict_ip; audit posture (no
+  /// restrict_ip) leaves ssh exactly as the system configures it. The
+  /// canary honeypot (an arbitrary loopback port) is unaffected — this
+  /// denies specific (ip, port) pairs, not loopback.
+  ///
+  /// Honest limit: port lists are enumerable, and cron/at need no TCP
+  /// at all. This closes the LLM-obvious door, not the class — the
+  /// exclusion-census (B) closes the class.
+  pub fn deny_loopback_ssh(&mut self) {
+    for port in [22u16, 2222, 2200] {
+      for ip in [
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+      ] {
+        let entry = (ip, port);
+        if !self.denied_loopback.contains(&entry) {
+          self.denied_loopback.push(entry);
+        }
       }
     }
   }
@@ -339,13 +384,18 @@ pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
   match sa {
     Sockaddr::V4(ip, port) => {
       if policy.loopback_denied(&IpAddr::V4(*ip), *port) {
-        return (Verdict::Deny, "resolver-stub");
+        // Reason names the closed relay: resolver-stub (DNS) vs
+        // loopback-ssh (HN escape). Both ride denied_loopback; the port
+        // tells them apart (53 = stub, 22/2222/2200 = ssh).
+        let reason = if *port == 53 { "resolver-stub" } else { "loopback-ssh" };
+        return (Verdict::Deny, reason);
       }
       (evaluate_v4(*ip, policy), "ipv4")
     }
     Sockaddr::V6(ip, port) => {
       if policy.loopback_denied(&IpAddr::V6(*ip), *port) {
-        return (Verdict::Deny, "resolver-stub");
+        let reason = if *port == 53 { "resolver-stub" } else { "loopback-ssh" };
+        return (Verdict::Deny, reason);
       }
       (evaluate_v6(*ip, policy), "ipv6")
     }
@@ -1464,6 +1514,36 @@ mod tests {
     assert_eq!(decide(&sa, &p).0, Verdict::Allow);
     // The honeypot's own loopback address and port still works.
     let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 44407);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn llm_only_denies_loopback_ssh() {
+    // HN ssh-localhost escape (2026-09-30): `ssh localhost <cmd>` runs
+    // the command in an sshd child outside all three layers. The client
+    // connect must die at the broker. Audit posture leaves ssh alone.
+    let p = EgressPolicy::new().with_llm_only(&[]);
+    for port in [22u16, 2222, 2200] {
+      let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), port);
+      let (v, reason) = decide(&sa, &p);
+      assert_eq!(v, Verdict::Deny, "127.0.0.1:{port} must deny");
+      assert_eq!(reason, "loopback-ssh");
+      let sa = Sockaddr::V6(Ipv6Addr::LOCALHOST, port);
+      assert_eq!(decide(&sa, &p).0, Verdict::Deny, "[::1]:{port} must deny");
+    }
+    // Non-ssh loopback (honeypot, discard port) still allowed.
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 9);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 44407);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn loopback_ssh_allowed_under_audit_posture() {
+    // Same scoping rule as the resolver stub: the denial is a
+    // destination-policy behavior, not a blanket one.
+    let p = EgressPolicy::new();
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 22);
     assert_eq!(decide(&sa, &p).0, Verdict::Allow);
   }
 

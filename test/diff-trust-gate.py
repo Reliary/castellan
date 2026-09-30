@@ -118,7 +118,7 @@ def rg_callers(name, root):
   for line in r.stdout.splitlines():
     try:
       _, rest = line.split(":", 1)
-    except Value:  # noqa
+    except ValueError:
       continue
     code = rest.split(":", 1)[-1] if rest.count(":") >= 1 else rest
     s = code.strip()

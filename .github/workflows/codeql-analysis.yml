@@ -21,11 +21,16 @@ jobs:
       matrix:
         language: ['rust']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
+      # NOTE: CodeQL's Rust support is immature (no dataflow queries for
+      # Rust as of 2026 — it runs build-tracing + a small query pack).
+      # Kept as a hygiene signal, not a gate: clippy -D warnings and the
+      # shell acceptance suites are the real gates. If CodeQL-for-Rust
+      # stays query-poor, replace with a second clippy config (pedantic).
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:

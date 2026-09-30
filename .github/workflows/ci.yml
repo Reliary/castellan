@@ -18,7 +18,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -42,7 +42,7 @@ jobs:
   release-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
@@ -54,7 +54,7 @@ jobs:
   cross-arch:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
@@ -70,17 +70,20 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install tools
         run: cargo install cargo-audit cargo-deny --locked 2>/dev/null || true
-      - name: cargo audit
-        run: cargo audit 2>&1 | tail -10
-      - name: cargo deny advisories
-        run: cargo deny check advisories 2>&1 | tail -10
-      - name: cargo deny bans+licenses+sources
-        run: cargo deny check bans licenses sources 2>&1 | tail -15
+      # No pipes without pipefail: `cmd 2>&1 | tail` masks the exit code
+      # and a compromised dependency would pass CI silently. Each check
+      # tees to a log AND fails the step on advisories/bans/violations.
+      - name: cargo audit (blocking)
+        run: cargo audit --deny warnings
+      - name: cargo deny advisories (blocking)
+        run: cargo deny check advisories
+      - name: cargo deny bans+licenses+sources (blocking)
+        run: cargo deny check bans licenses sources
 
   # Kernel-drift gate for the seccomp denylist.
   #
@@ -96,7 +99,7 @@ jobs:
   syscall-drift:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p castellan-envelope --example syscall-classes
@@ -113,7 +116,7 @@ jobs:
   workload-syscalls:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p castellan-envelope --example syscall-probe
@@ -131,7 +134,7 @@ jobs:
   diff-trust-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p castellan-proof structural -- --nocapture 2>&1 | tail -3
@@ -141,3 +144,16 @@ jobs:
         run: python3 test/diff-trust-gate.py --check callers --max-disagree 0.20
       - name: cert assembly latency bound
         run: python3 test/diff-trust-gate.py --check latency --max-ms 2000
+
+  # ssh-escape regression (HN 2026-09-30): the b8 shell suite asserts the
+  # loopback-ssh deny live (needs a cgroup slice, dev-box only), so CI
+  # pins the same rule at the unit level — if with_llm_only() ever stops
+  # denying 127.0.0.1:22, CI goes red even though b8 never runs there.
+  ssh-escape-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p castellan-broker loopback_ssh -- --nocapture 2>&1 | tail -5
+      - run: cargo test -p castellan-broker llm_only -- --nocapture 2>&1 | tail -5

@@ -13,16 +13,18 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked 2>/dev/null || true
+      # Blocking (no tail-pipes): see ci.yml supply-chain for why pipes
+      # without pipefail are a silent-pass hole.
       - name: cargo-deny advisories
-        run: cargo deny check advisories 2>&1 | tail -20
+        run: cargo deny check advisories
       - name: cargo-deny sources
-        run: cargo deny check sources 2>&1 | tail -10
+        run: cargo deny check sources
       - name: cargo-deny bans
-        run: cargo deny check bans 2>&1 | tail -10
+        run: cargo deny check bans
       - name: cargo-deny licenses
-        run: cargo deny check licenses 2>&1 | tail -10
+        run: cargo deny check licenses

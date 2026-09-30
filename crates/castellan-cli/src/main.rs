@@ -709,6 +709,41 @@ fn launch(args: &[String], sock: &str) -> ! {
   if !consumed.is_empty() {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
   }
+  // P13 E-h/E-e advisories: the envelope cannot fix either (host-config
+  // facts, not kernel gaps), so they surface where the other forced-
+  // posture warnings already print. Both are within steelman tolerance —
+  // advisory only, never a launch block.
+  if enforce {
+    let proj = std::fs::canonicalize(&project).unwrap_or_else(|_| project.clone());
+    if let Ok(home) = std::env::var("HOME") {
+      let home = std::fs::canonicalize(&home).unwrap_or_else(|_| std::path::PathBuf::from(home));
+      // An ancestor project (project==HOME, or project=/) puts shell rc,
+      // .ssh/authorized_keys and .git/hooks inside the write roots —
+      // deferred execution outside the session when the human's own
+      // tooling runs them next.
+      if home.starts_with(&proj) {
+        eprintln!(
+          "castellan: WARNING: project {} contains $HOME — agent writes reach shell rc/.ssh/.git-hooks (P13 E-h)",
+          proj.display()
+        );
+      }
+    }
+    // E-e: NOPASSWD sudo makes the uid boundary decorative — one exec
+    // from the session is root. `-n` never prompts, so this fails fast
+    // on password-required hosts (measured: rc=1, no hang).
+    let nopasswd = std::process::Command::new("sudo")
+      .args(["-n", "true"])
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .status()
+      .map(|s| s.success())
+      .unwrap_or(false);
+    if nopasswd {
+      eprintln!(
+        "castellan: WARNING: `sudo -n` succeeds (NOPASSWD) — session uid boundary does not imply unprivileged (P13 E-e)"
+      );
+    }
+  }
   // P12: point the session at its egress proxy. The CA bundle the
   // session trusts is daemon-minted per session (system roots +
   // session CA); SSL_CERT_FILE et al. steer OpenSSL/curl, Node, Python

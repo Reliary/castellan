@@ -96,7 +96,7 @@ pub enum Verdict {
 }
 
 /// Per-session egress policy. Destination-based, not port-based.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EgressPolicy {
   /// Extra hosts/IPs allowed beyond loopback (bless grants, provider).
   /// Hostnames are resolved ONCE at construction (before the filter is
@@ -131,6 +131,36 @@ pub struct EgressPolicy {
   /// is denied, so denying the private socket alone closes nothing.
   /// The bus must be denied too.
   pub deny_user_bus: bool,
+  /// Deny container/host-control deputy sockets. Default true.
+  ///
+  /// P13 E-b probed live 2026-09-30: `/run/docker.sock` CONNECTED from
+  /// inside an enforced session (uid in the docker group; Landlock does
+  /// not gate unix connect; the verdict denylist did not name it). A
+  /// single POST /containers/create with a `/:/host` bind is root —
+  /// one-shot, zero-cost, outside steelman tolerance. Same shape as the
+  /// systemd fix: deny the deputy socket by default, legit use becomes
+  /// an explicit grant. Podman/lxd/libvirt paths included by pattern so
+  /// the next install does not need a code change.
+  pub deny_deputy_sockets: bool,
+  /// Deny the SYSTEM bus (`/run/dbus/system_bus_socket`). Default true.
+  ///
+  /// P13 E-c probed 2026-09-30: the socket is world-rw, matched neither
+  /// the systemd predicate nor the user-bus predicate, and pkcheck
+  /// returned rc=0 (authorized WITHOUT authentication) for both
+  /// `org.freedesktop.udisks2.loop-setup` and
+  /// `org.freedesktop.udisks2.filesystem-mount` for an active session —
+  /// a root daemon (UID 0, running) acting on the agent's behalf with no
+  /// polkit challenge. That is the frozen plan's one-shot-class gate, so
+  /// the bus denies by default. `org.freedesktop.systemd1.manage-units`
+  /// measured auth_admin_keep (rc=2) — the systemd1 system route is NOT
+  /// the trigger; udisks2 is.
+  ///
+  /// Same scope note as the user bus: this carries ordinary desktop
+  /// traffic too, and denying it can break harnesses that probe
+  /// hardware over D-Bus. Breaking is visible (tool errors), denial is
+  /// default-on, opt-out is this flag — same posture as the other unix
+  /// denies, none of which carry runtime grants either.
+  pub deny_system_bus: bool,
   /// When false (default), non-loopback IPs are allowed — the broker
   /// only closes the unix/systemd-socket hole and leaves egress alone.
   /// When true, only loopback + extra_ips + resolver_ips are allowed, and
@@ -141,12 +171,27 @@ pub struct EgressPolicy {
 
 impl EgressPolicy {
   pub fn new() -> Self {
-    Self {
+    // Constructed field-by-field on purpose: `Default` routes through
+    // this fn (P13: the derived Default silently skipped the ssh and
+    // deputy denies), so new() must not use ..Default::default().
+    let mut p = Self {
+      extra_ips: Vec::new(),
+      resolver_ips: resolver_ips(),
+      denied_loopback: Vec::new(),
       deny_systemd_sockets: true,
       deny_user_bus: true,
-      resolver_ips: resolver_ips(),
-      ..Default::default()
-    }
+      deny_deputy_sockets: true,
+      deny_system_bus: true,
+      restrict_ip: false,
+    };
+    // Escape channels deny by default (systemd-socket precedent): ssh
+    // localhost runs its command in an sshd child outside every layer —
+    // same class as systemd-run, so it does not wait for a destination
+    // policy. P13 E-a probed live 2026-09-30: default --enforce posture
+    // connected to 127.0.0.1:22 from inside a session (fix-scoped-to-
+    // with_llm_only was the bug; the first fix only covered the floor).
+    p.deny_loopback_ssh();
+    p
   }
 
   /// Resolve hostnames into extra_ips now, before any filter exists.
@@ -205,26 +250,29 @@ impl EgressPolicy {
     }
   }
 
-  /// Under a destination policy, DENY loopback SSH even though it is
-  /// loopback. `ssh localhost <cmd>` is a full three-layer escape: the
-  /// client connect to 127.0.0.1:22 is inside the session (allowed by
-  /// the blanket loopback rule), but the command runs in a child forked
-  /// by sshd — outside the session cgroup, outside the Landlock domain,
-  /// outside the seccomp filter. The N6 orphan census cannot see it
-  /// (ppid is system sshd, not the user manager) and the sibling
-  /// detector never matches `sshd:/bin/sh` basenames, so without this
-  /// deny the escape is silent: no spine row, no freeze, no trust hit.
+  /// DENY loopback SSH. `ssh localhost <cmd>` is a full three-layer
+  /// escape: the client connect to 127.0.0.1:22 is inside the session
+  /// (allowed by the blanket loopback rule), but the command runs in a
+  /// child forked by sshd — outside the session cgroup, outside the
+  /// Landlock domain, outside the seccomp filter. The N6 orphan census
+  /// cannot see it (ppid is system sshd, not the user manager) and the
+  /// sibling detector never matches `sshd:/bin/sh` basenames, so without
+  /// this deny the escape is silent: no spine row, no freeze, no trust
+  /// hit.
   ///
   /// Denied ports: 22 (sshd default) plus the common alternates 2222
-  /// and 2200. A non-loopback ssh (remote host) is a public destination
-  /// and already denied under restrict_ip; audit posture (no
-  /// restrict_ip) leaves ssh exactly as the system configures it. The
-  /// canary honeypot (an arbitrary loopback port) is unaffected — this
-  /// denies specific (ip, port) pairs, not loopback.
+  /// and 2200. The canary honeypot (an arbitrary loopback port) is
+  /// unaffected — this denies specific (ip, port) pairs, not loopback.
   ///
-  /// Honest limit: port lists are enumerable, and cron/at need no TCP
-  /// at all. This closes the LLM-obvious door, not the class — the
-  /// exclusion-census (B) closes the class.
+  /// Applied in `new()` (default posture) as well as `with_llm_only()`:
+  /// P13 E-a probed 2026-09-30 and the first fix — scoped to the floor
+  /// only — left the default --enforce posture connecting to :22 live.
+  /// Escape channels deny by default; the destination policy is a
+  /// separate axis.
+  ///
+  /// Honest limit: port lists are enumerable, and remote ssh / cron / at
+  /// need no loopback TCP at all. This closes the LLM-obvious door, not
+  /// the class — the exclusion-census (B) closes the class.
   pub fn deny_loopback_ssh(&mut self) {
     for port in [22u16, 2222, 2200] {
       for ip in [
@@ -259,6 +307,16 @@ impl EgressPolicy {
   }
 }
 
+impl Default for EgressPolicy {
+  /// Routes through `new()` so the escape-channel denies (loopback ssh,
+  /// deputy sockets, systemd) are never silently skipped. The derived
+  /// Default would have zeroed every deny flag — found by P13 while
+  /// making the ssh deny default-on.
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// Parse nameserver lines from /etc/resolv.conf. The file is readable
 /// in the envelope (read roots are `/`), but this runs in the
 /// supervisor which is outside the notif filter anyway.
@@ -281,11 +339,11 @@ pub fn resolver_ips() -> Vec<IpAddr> {
 /// the user manager to act. C25/T4: `systemd-run` needs no cgroup write
 /// and no unit-file write — it talks to the manager over these sockets.
 ///
-/// Scope note (B8.2): only the manager's private control socket and the
-/// cgroup socket are denied by default. The general session bus
-/// (`/run/user/N/bus`) is deliberately NOT denied — it carries ordinary
-/// desktop/harness traffic and denying it is a high false-block risk;
-/// `systemd-run --user` reaches the manager directly, not via the bus.
+/// Scope note: the manager's private control socket and the cgroup
+/// socket deny by default. The session bus (`/run/user/N/bus`) denies by
+/// default too (B8.2 route 2: `org.freedesktop.systemd1` is exported
+/// there and StartTransientUnit over it escapes — verified live
+/// 2026-09-15), with `deny_user_bus` as the opt-out.
 pub fn is_manager_socket(path: &[u8]) -> bool {
   let s = String::from_utf8_lossy(path);
   s.starts_with("/run/systemd/private")
@@ -297,6 +355,31 @@ pub fn is_manager_socket(path: &[u8]) -> bool {
 pub fn is_user_bus(path: &[u8]) -> bool {
   let s = String::from_utf8_lossy(path);
   s.ends_with("/bus") && s.contains("/run/user/")
+}
+
+/// Container/host-control deputy sockets (P13 E-b). Connecting to any of
+/// these hands the caller the service's full API: docker.sock is root by
+/// contract (`POST /containers/create` + `/:/host` bind), the libvirt
+/// sock can define a domain with host-filesystem passthrough. Matched by
+/// suffix so the common install paths (/run, /var/run) both hit, and the
+/// matched set stays explicit — no wildcard on ".sock" (that would eat
+/// wayland, pipewire and every benign desktop socket).
+pub fn is_deputy_socket(path: &[u8]) -> bool {
+  let s = String::from_utf8_lossy(path);
+  s.ends_with("/docker.sock")
+    || s.ends_with("/podman/podman.sock")
+    || s.ends_with("/lxd/unix.socket")
+    || s.ends_with("/lxd.socket")
+    || s.ends_with("/libvirt/libvirt-sock")
+    || s.ends_with("/libvirt/libvirt-sock-ro")
+}
+
+/// The system bus path class (P13 E-c). Suffix match covers /run and
+/// /var/run installs; kept separate from `is_user_bus` so each deny has
+/// its own flag and its own measured trigger.
+pub fn is_system_bus(path: &[u8]) -> bool {
+  let s = String::from_utf8_lossy(path);
+  s.ends_with("/dbus/system_bus_socket")
 }
 
 pub fn evaluate_v4(ip: Ipv4Addr, policy: &EgressPolicy) -> Verdict {
@@ -405,6 +488,10 @@ pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
         (Verdict::Deny, "systemd-socket")
       } else if policy.deny_user_bus && is_user_bus(path) {
         (Verdict::Deny, "session-bus")
+      } else if policy.deny_system_bus && is_system_bus(path) {
+        (Verdict::Deny, "system-bus")
+      } else if policy.deny_deputy_sockets && is_deputy_socket(path) {
+        (Verdict::Deny, "deputy-socket")
       } else {
         (Verdict::Allow, "unix")
       }
@@ -1539,12 +1626,72 @@ mod tests {
   }
 
   #[test]
-  fn loopback_ssh_allowed_under_audit_posture() {
-    // Same scoping rule as the resolver stub: the denial is a
-    // destination-policy behavior, not a blanket one.
+  fn loopback_ssh_denied_by_default() {
+    // P13 E-a (probed live 2026-09-30): the first fix scoped the deny
+    // to with_llm_only, so the default --enforce posture still
+    // connected to 127.0.0.1:22. Escape channels deny by default now
+    // (systemd-socket precedent); egress policy is a separate axis.
     let p = EgressPolicy::new();
     let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 22);
+    assert_eq!(decide(&sa, &p).0, Verdict::Deny);
+    let sa = Sockaddr::V6(Ipv6Addr::LOCALHOST, 22);
+    assert_eq!(decide(&sa, &p).0, Verdict::Deny);
+    // Non-ssh loopback is untouched (the deny is port-scoped).
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 9);
     assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn system_bus_denied_by_default() {
+    // P13 E-c (probed 2026-09-30): world-rw socket, matched neither
+    // prior predicate, pkcheck rc=0 for udisks2 loop-setup + mount.
+    let p = EgressPolicy::new();
+    for path in [
+      &b"/run/dbus/system_bus_socket"[..],
+      b"/var/run/dbus/system_bus_socket",
+    ] {
+      assert_eq!(
+        decide(&Sockaddr::Unix(path.to_vec()), &p).0,
+        Verdict::Deny,
+        "{path:?} must deny"
+      );
+    }
+    // The opt-out exists (audit posture), same as the other unix denies.
+    let mut audit = EgressPolicy::new();
+    audit.deny_system_bus = false;
+    let sa = Sockaddr::Unix(b"/run/dbus/system_bus_socket".to_vec());
+    assert_eq!(decide(&sa, &audit).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn deputy_sockets_denied_by_default() {
+    // P13 E-b (probed live 2026-09-30): docker.sock CONNECTED from an
+    // enforced session — one-shot root via container bind-mount.
+    let p = EgressPolicy::new();
+    for path in [
+      &b"/run/docker.sock"[..],
+      b"/var/run/docker.sock",
+      b"/run/podman/podman.sock",
+      b"/var/lib/libvirt/libvirt-sock",
+    ] {
+      assert_eq!(
+        decide(&Sockaddr::Unix(path.to_vec()), &p).0,
+        Verdict::Deny,
+        "{path:?} must deny"
+      );
+    }
+    // Benign desktop sockets must survive (wayland/pipewire/bus-adjacent).
+    for path in [
+      &b"/run/user/1000/wayland-0"[..],
+      b"/run/user/1000/pipewire-0",
+      b"/run/user/1000/gnupg/S.gpg-agent",
+    ] {
+      assert_eq!(
+        decide(&Sockaddr::Unix(path.to_vec()), &p).0,
+        Verdict::Allow,
+        "{path:?} must allow"
+      );
+    }
   }
 
   #[test]

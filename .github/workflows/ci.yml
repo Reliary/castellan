@@ -145,11 +145,13 @@ jobs:
       - name: cert assembly latency bound
         run: python3 test/diff-trust-gate.py --check latency --max-ms 2000
 
-  # ssh-escape regression (HN 2026-09-30): the b8 shell suite asserts the
-  # loopback-ssh deny live (needs a cgroup slice, dev-box only), so CI
-  # pins the same rule at the unit level — if with_llm_only() ever stops
-  # denying 127.0.0.1:22, CI goes red even though b8 never runs there.
-  ssh-escape-regression:
+  # ssh/deputy/system-bus escape regressions (P13 C37): the b8 shell
+  # suite asserts all three live (needs a cgroup slice, dev-box only), so
+  # CI pins the same rules at unit level — if `new()` ever stops denying
+  # loopback ssh, docker.sock, or the system bus, CI goes red even
+  # though b8 never runs there. E-d (TCP control plane) was refuted by
+  # code: the daemon binds only a unix socket.
+  escape-regression:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -157,3 +159,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p castellan-broker loopback_ssh -- --nocapture 2>&1 | tail -5
       - run: cargo test -p castellan-broker llm_only -- --nocapture 2>&1 | tail -5
+      - run: cargo test -p castellan-broker deputy -- --nocapture 2>&1 | tail -5
+      - run: cargo test -p castellan-broker system_bus -- --nocapture 2>&1 | tail -5

@@ -92,13 +92,10 @@ except PermissionError:
 except OSError:
     print("LOOP_OK")
 
-# HN ssh-localhost escape (2026-09-30): the broker under --net-restrict
-# (with_llm_only) must deny the client connect to loopback ssh ports —
-# the command would run in an sshd child outside all three layers.
-# Audit posture (this suite's default launch: --enforce without --net)
-# leaves ssh alone, so this probe documents the posture boundary rather
-# than asserting a deny here; the deny itself is asserted live in the
-# --net-restrict section below and in broker unit tests.
+# P13 E-a: loopback ssh under the DEFAULT posture (no --net flags). The
+# first fix scoped the deny to with_llm_only, so this launch connected
+# to 127.0.0.1:22 live (probed 2026-09-30). Escape channels now deny in
+# EgressPolicy::new(); assert the flip here, not just under --net-restrict.
 for port in (22, 2222, 2200):
     s = socket.socket(); s.settimeout(2)
     try:
@@ -135,6 +132,16 @@ grep -q ROUTE2_BLOCKED "$WORK/t4.out" && ok "route 2 (session bus StartTransient
 grep -q UNIX_OK "$WORK/t4.out" && ok "ordinary unix socket still allowed" || bad "ordinary unix socket wrongly denied"
 grep -q LOOP_OK "$WORK/t4.out" && ok "loopback TCP still allowed" || bad "loopback TCP wrongly denied"
 grep -q GIT_OK "$WORK/t4.out" && ok "git workflow survives" || bad "git broken"
+# P13 E-a: default posture must deny loopback ssh (escape channels deny
+# by default). SSH22_OTHER (ECONNREFUSED on a host with no sshd) is also
+# a pass — the broker denied the connect, so nothing reached the port.
+for port in 22 2222 2200; do
+  if grep -q "SSH22_DENIED_$port" "$WORK/t4.out" || grep -q "SSH22_OTHER_$port" "$WORK/t4.out"; then
+    ok "default posture denies loopback ssh 127.0.0.1:$port"
+  else
+    bad "default posture left loopback ssh 127.0.0.1:$port open — sshd-child escape works"
+  fi
+done
 # A launched unit would leave a job on the manager; assert none.
 if systemctl --user is-active castellan-esc-accept.service >/dev/null 2>&1; then
   bad "escaped transient unit is active"

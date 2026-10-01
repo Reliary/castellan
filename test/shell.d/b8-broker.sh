@@ -96,6 +96,12 @@ except OSError:
 # first fix scoped the deny to with_llm_only, so this launch connected
 # to 127.0.0.1:22 live (probed 2026-09-30). Escape channels now deny in
 # EgressPolicy::new(); assert the flip here, not just under --net-restrict.
+#
+# P13 ninja F5: ONLY PermissionError (seccomp EPERM) proves the broker
+# denied. ECONNREFUSED (SSH22_OTHER) means the connect EXECUTED and the
+# kernel found nothing listening — i.e. the broker allowed it; accepting
+# it made the assertion vacuous on hosts without sshd. CONNECTED is the
+# same failure with sshd present.
 for port in (22, 2222, 2200):
     s = socket.socket(); s.settimeout(2)
     try:
@@ -133,13 +139,16 @@ grep -q UNIX_OK "$WORK/t4.out" && ok "ordinary unix socket still allowed" || bad
 grep -q LOOP_OK "$WORK/t4.out" && ok "loopback TCP still allowed" || bad "loopback TCP wrongly denied"
 grep -q GIT_OK "$WORK/t4.out" && ok "git workflow survives" || bad "git broken"
 # P13 E-a: default posture must deny loopback ssh (escape channels deny
-# by default). SSH22_OTHER (ECONNREFUSED on a host with no sshd) is also
-# a pass — the broker denied the connect, so nothing reached the port.
+# by default). P13 ninja F5: ONLY SSH22_DENIED (PermissionError =
+# seccomp EPERM) counts. SSH22_OTHER is ECONNREFUSED — the connect
+# EXECUTED (broker allowed it) and only then found no listener; on a
+# host WITH sshd it would be CONNECTED. Accepting OTHER made this
+# vacuous exactly where sshd is absent.
 for port in 22 2222 2200; do
-  if grep -q "SSH22_DENIED_$port" "$WORK/t4.out" || grep -q "SSH22_OTHER_$port" "$WORK/t4.out"; then
+  if grep -q "SSH22_DENIED_$port" "$WORK/t4.out"; then
     ok "default posture denies loopback ssh 127.0.0.1:$port"
   else
-    bad "default posture left loopback ssh 127.0.0.1:$port open — sshd-child escape works"
+    bad "default posture left loopback ssh 127.0.0.1:$port open — sshd-child escape works ($(grep "SSH22_" "$WORK/t4.out" | tr '\n' ' '))"
   fi
 done
 # A launched unit would leave a job on the manager; assert none.

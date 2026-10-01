@@ -2707,19 +2707,27 @@ impl Daemon {
     // trust.db, keyring.toml, spines and canary ledgers would land
     // inside the agent's write roots (full trust + credential forgery).
     // Canonicalize (follows symlinks); normalize() only strips `.`.
+    // P13 ninja F8: home/state/cfg are canonicalized too — a symlinked
+    // HOME made `canon == home` compare canonical-project against raw
+    // $HOME and miss, which was the hole the launcher-side advisory
+    // existed to catch. The refusal is the primary control; the
+    // advisory stays as second net for layouts this still misses.
     {
       let canon = project.canonicalize().unwrap_or_else(|_| project.clone());
       let state = Self::state_dir();
+      let state = state.canonicalize().unwrap_or(state);
       let cfgdir = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
           std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
         });
+      let cfgdir = cfgdir.canonicalize().unwrap_or(cfgdir);
       let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+      let home = home.canonicalize().unwrap_or(home);
       let bad = state
         .starts_with(&canon)
         || cfgdir.starts_with(&canon)
-        || canon == home
+        || home.starts_with(&canon)
         || canon == std::path::PathBuf::from("/");
       if bad {
         return Response::err(

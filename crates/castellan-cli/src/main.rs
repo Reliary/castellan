@@ -729,16 +729,11 @@ fn launch(args: &[String], sock: &str) -> ! {
       }
     }
     // E-e: NOPASSWD sudo makes the uid boundary decorative — one exec
-    // from the session is root. `-n` never prompts, so this fails fast
-    // on password-required hosts (measured: rc=1, no hang).
-    let nopasswd = std::process::Command::new("sudo")
-      .args(["-n", "true"])
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null())
-      .status()
-      .map(|s| s.success())
-      .unwrap_or(false);
-    if nopasswd {
+    // from the session is root. P13 ninja F9 hardening: stdin severed
+    // (never inherit the launch tty), 1s hard timeout (sudo can block
+    // in PAM/NSS), and the RESULT is cached for 24h so a password-
+    // required host logs one sudo line per day, not per launch.
+    if sudo_nopasswd_cached() {
       eprintln!(
         "castellan: WARNING: `sudo -n` succeeds (NOPASSWD) — session uid boundary does not imply unprivileged (P13 E-e)"
       );
@@ -973,6 +968,22 @@ fn launch(args: &[String], sock: &str) -> ! {
   // the agent; the agent inherits the notif filter and then applies the
   // envelope. On spawn failure we fall through to a plain exec (honest
   // degradation — the envelope still applies).
+  //
+  // P13 ninja F12: PLAIN audit mode (--no-enforce without an explicit
+  // destination policy) must not install the filter at all — the banner
+  // above promises "observation only, no containment", and every broker
+  // deny (escape ports, systemd, buses, deputies) is containment.
+  // WOULD-DENY writes are recorded daemon-side by the AuditWatcher,
+  // which never needed the broker; with a permissive policy the broker
+  // would record nothing anyway and cost a notification round-trip per
+  // connect. An explicit --net-restrict still spawns it (operator-
+  // requested destination policy) on an EgressPolicy::audit() base so
+  // the default unix/escape denies stay off under the audit banner.
+  if !enforce && !net_restrict {
+    let err = execvp(&cmd);
+    eprintln!("exec failed: {err}");
+    std::process::exit(127);
+  }
   let broker = castellan_broker::spawn_broker();
   match broker {
     Ok(castellan_broker::Spawn::Supervisor(mut sup)) => {
@@ -981,7 +992,15 @@ fn launch(args: &[String], sock: &str) -> ! {
       // restrict_ip; the operator's allowlist is the LLM provider plus
       // anything else declared. An empty allowlist under restrict_ip is
       // deny-all-by-exception, and that is the honest fail-closed state.
-      let mut bpolicy = castellan_broker::EgressPolicy::new();
+      //
+      // P13 ninja F12: under --no-enforce the base is EgressPolicy::audit()
+      // (all default denies off — the banner); an explicit net_restrict
+      // then layers the operator-requested destination policy on top.
+      let mut bpolicy = if enforce {
+        castellan_broker::EgressPolicy::new()
+      } else {
+        castellan_broker::EgressPolicy::audit()
+      };
       if net_restrict {
         bpolicy = bpolicy.with_llm_only(&allow_hosts);
         if !allow_hosts.is_empty() {
@@ -1143,6 +1162,66 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::process::exit(127);
     }
   }
+}
+
+/// P13 E-e advisory probe with F9 hardening: cached 24h, bounded 1s,
+/// stdin/stdout/stderr severed. Returns the last observed answer.
+fn sudo_nopasswd_cached() -> bool {
+  let stamp = {
+    let base = std::env::var("XDG_STATE_HOME")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+      });
+    base.join("castellan/sudo-probe")
+  };
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_secs())
+    .unwrap_or(0);
+  if let Ok(text) = std::fs::read_to_string(&stamp) {
+    let mut lines = text.lines();
+    let cached = lines.next().map(|l| l == "1").unwrap_or(false);
+    let ts = lines.next().and_then(|l| l.parse::<u64>().ok()).unwrap_or(0);
+    if now.saturating_sub(ts) < 24 * 3600 {
+      return cached;
+    }
+  }
+  // `-n` never prompts; the timeout guards PAM/NSS stalls (LDAP etc).
+  let mut child = std::process::Command::new("sudo")
+    .args(["-n", "true"])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .ok();
+  let mut result = false;
+  if let Some(c) = child.as_mut() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+      match c.try_wait() {
+        Ok(Some(status)) => {
+          result = status.success();
+          break;
+        }
+        Ok(None) => {
+          if std::time::Instant::now() >= deadline {
+            let _ = c.kill();
+            let _ = c.wait();
+            eprintln!("castellan: sudo probe timed out after 1s — NOPASSWD check skipped");
+            break;
+          }
+          std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Err(_) => break,
+      }
+    }
+  }
+  if let Some(parent) = stamp.parent() {
+    let _ = std::fs::create_dir_all(parent);
+  }
+  let _ = std::fs::write(&stamp, format!("{}\n{now}\n", if result { 1 } else { 0 }));
+  result
 }
 
 /// B6 phase 4: the launcher's kernel tty_nr, read from /proc/self/stat

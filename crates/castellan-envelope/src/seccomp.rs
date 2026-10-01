@@ -3,6 +3,18 @@ use std::io;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const EPERM_U: u32 = 1;
+/// SECCOMP_RET_KILL_PROCESS — arch/x32 mismatch (P13 ninja F3).
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+/// seccomp_data.arch for the native target. i386 syscall numbers mean
+/// different syscalls, so without this gate a compat tracee's
+/// `mount`/`ptrace`/`bpf` never match the denylist and fall to ALLOW.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7;
+/// x32 sets bit 30 on every nr while reporting the native arch; any nr
+/// above this bound is x32/unsupported and cannot match the table.
+const X32_NR_BOUND: u32 = 0x3fff_ffff;
 
 #[rustfmt::skip]
 fn blocked_syscalls() -> &'static [libc::c_long] {
@@ -58,6 +70,10 @@ fn ld_abs_nr() -> libc::sock_filter {
   f(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0)
 }
 
+fn ld_abs_arch() -> libc::sock_filter {
+  f(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 4)
+}
+
 fn ret(k: u32) -> libc::sock_filter {
   f(libc::BPF_RET | libc::BPF_K, 0, 0, k)
 }
@@ -69,10 +85,46 @@ fn jeq_kill(nr: libc::c_long) -> [libc::sock_filter; 2] {
   ]
 }
 
+/// Program layout (P13 ninja F3): 6-instruction arch/x32 prologue,
+/// then the denylist pairs, then ALLOW.
+///
+/// ```text
+/// 0  LD  [4]                 arch
+/// 1  JEQ NATIVE  jt=1 jf=0   native → 3, foreign → 2
+/// 2  RET KILL_PROCESS        compat nrs mean different syscalls
+/// 3  LD  [0]                 nr
+/// 4  JGT X32_NR_BOUND jt=0 jf=1  x32 → 5, native → 6
+/// 5  RET KILL_PROCESS        x32 nrs never match the table below
+/// 6+ (JEQ, RET EPERM) pairs ...
+///    RET ALLOW
+/// ```
+///
+/// Without the gate a 32-bit compat process bypasses the entire
+/// denylist: its syscall numbers are the i386 table, so no JEQ matches
+/// and every syscall (mount, ptrace, bpf — the Hard class) falls
+/// through to ALLOW. KILL_PROCESS on mismatch is the libseccomp
+/// standard: a process whose ABI we cannot evaluate does not run.
+/// The tests below index pairs starting at PROLOGUE_LEN.
 pub fn seccomp_program() -> Vec<libc::sock_filter> {
+  const PROLOGUE_LEN: usize = 6;
   let blocked = blocked_syscalls();
-  let mut prog = Vec::with_capacity(2 + blocked.len() * 2 + 1);
+  let mut prog = Vec::with_capacity(PROLOGUE_LEN + blocked.len() * 2 + 1);
+  prog.push(ld_abs_arch());
+  prog.push(f(
+    libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+    1,
+    0,
+    AUDIT_ARCH_NATIVE,
+  ));
+  prog.push(ret(SECCOMP_RET_KILL_PROCESS));
   prog.push(ld_abs_nr());
+  prog.push(f(
+    libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K,
+    0,
+    1,
+    X32_NR_BOUND,
+  ));
+  prog.push(ret(SECCOMP_RET_KILL_PROCESS));
   for nr in blocked.iter().copied() {
     prog.extend_from_slice(&jeq_kill(nr));
   }
@@ -261,22 +313,43 @@ mod tests {
   /// The filter must be a default-ALLOW denylist (commitment #8) with a
   /// terminating allow, not an accidental allowlist. A one-line change
   /// here would silently invert the whole threat model.
+  ///
+  /// P13 ninja F3: also pins the arch/x32 prologue — if the gate is
+  /// dropped, a compat tracee bypasses the whole denylist (i386 nrs
+  /// match no JEQ and fall to ALLOW).
   #[test]
   fn filter_ends_in_allow() {
     let prog = seccomp_program();
     let last = prog.last().expect("non-empty program");
     assert_eq!(last.k, SECCOMP_RET_ALLOW, "filter must fall through to ALLOW");
+    // Prologue: LD arch (k=4), JEQ native, RET KILL, LD nr (k=0),
+    // JGT x32-bound, RET KILL — pairs begin at index 6.
     assert_eq!(prog[0].code, (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16);
+    assert_eq!(prog[0].k, 4, "first load must be seccomp_data.arch");
+    assert_eq!(prog[1].k, AUDIT_ARCH_NATIVE, "arch JEQ must compare the native audit arch");
+    assert_eq!(prog[2].k, SECCOMP_RET_KILL_PROCESS, "foreign arch must kill");
+    assert_eq!(prog[3].k, 0, "second load must be seccomp_data.nr");
+    assert_eq!(prog[4].k, X32_NR_BOUND, "x32 gate must bound the nr");
+    assert_eq!(prog[5].k, SECCOMP_RET_KILL_PROCESS, "x32 nr must kill");
+    assert_eq!(
+      prog[6].code,
+      (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+      "first denylist pair must start at index 6"
+    );
   }
 
-  /// Every deny is EPERM, never a kill or a trap: the agent must get a
-  /// clean error it can handle, not a signal it cannot.
+  /// Every syscall the filter blocks must return EPERM, never a kill or
+  /// a trap: the agent must get a clean error it can handle, not a
+  /// signal it cannot. (The arch/x32 prologue kills — different
+  /// contract: an unevaluable ABI must not run at all.)
   #[test]
   fn every_deny_is_eperm() {
     let prog = seccomp_program();
     let n = blocked_syscalls().len();
     for i in 0..n {
-      let ret = &prog[1 + (i * 2) + 1];
+      // Pairs start after the 6-instruction prologue: [JEQ, RET] at
+      // 6+2i, so the RET is at 7+2i.
+      let ret = &prog[7 + (i * 2)];
       assert_eq!(ret.k, SECCOMP_RET_ERRNO | EPERM_U, "deny {i} is not EPERM");
     }
   }

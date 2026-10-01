@@ -157,7 +157,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p castellan-broker loopback_ssh -- --nocapture 2>&1 | tail -5
-      - run: cargo test -p castellan-broker llm_only -- --nocapture 2>&1 | tail -5
-      - run: cargo test -p castellan-broker deputy -- --nocapture 2>&1 | tail -5
-      - run: cargo test -p castellan-broker system_bus -- --nocapture 2>&1 | tail -5
+      # P13 ninja F4: NO pipes and NO filters. A pipe (`| tail`) under
+      # GitHub's default `bash -e` returns tail's exit code — a failing
+      # test would pass CI silently (the same hazard this repo's
+      # supply-chain job documents at its own no-pipes comment). A
+      # zero-match filter exits 0 with "0 tests run", so a renamed test
+      # would also pass vacuously. One unpiped full-crate run has
+      # neither failure mode.
+      - name: broker suite (arch/x32 gates, escape ports, unix resolution)
+        run: cargo test -p castellan-broker

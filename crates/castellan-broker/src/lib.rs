@@ -51,7 +51,9 @@
 use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::ffi::OsStr;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::mpsc::Receiver;
 
 pub const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
@@ -61,6 +63,21 @@ pub const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xC050_2100;
 pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
+/// SECCOMP_RET_KILL_PROCESS (libc lacks the constant).
+pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+/// seccomp_data.arch for the native target. P13 ninja F3: without an
+/// arch gate a compat tracee's syscall NUMBERS mean different syscalls
+/// (i386 nr 11 is not x86_64 nr 11), so every JEQ compares wrong and
+/// the tracee falls through to ALLOW — the whole broker bypassed.
+#[cfg(target_arch = "x86_64")]
+pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+#[cfg(target_arch = "aarch64")]
+pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+/// x32 ABI sets bit 30 on every syscall nr while reporting the x86_64
+/// arch — the arch gate alone passes it and the nr never equals a
+/// plain SYS_* (0x4000002a != 42), so x32 connect() would fall through
+/// to ALLOW too. Any nr above this bound is x32/unsupported.
+pub const X32_NR_BOUND: u32 = 0x3fff_ffff;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -109,18 +126,23 @@ pub struct EgressPolicy {
   /// Used for the systemd-resolved stub (127.0.0.53:53), which is a
   /// relay to the real upstream: allowing it is an unmonitored egress
   /// path and a DNS-tunnel channel. Empty by default (audit posture).
-  /// Also used for loopback SSH (HN ssh-localhost escape, 2026-09-30):
-  /// `ssh localhost <cmd>` splits into an allowed client connect to
-  /// 127.0.0.1:22 plus an UNCONFINED server child forked by sshd — the
-  /// child never inherits seccomp/Landlock/cgroup, so the session's
-  /// three layers are all bypassed at once. Denying the client connect
-  /// closes the LLM-obvious door; cron/at/remote-ssh remain (B, the
-  /// exclusion-census follow-up).
+  /// The ssh/docker escape ports moved to `escape_port_denied` (P13
+  /// ninja F2): exact pairs missed 127.0.0.2, v4-mapped loopback and
+  /// the host's own LAN address — sshd accepts on all of them.
   pub denied_loopback: Vec<(IpAddr, u16)>,
+  /// Local interface addresses (getifaddrs at construction). Used only
+  /// by `escape_port_denied`: ssh to SELF via any local IP (docker0,
+  /// LAN, tailscale) reaches this host's sshd exactly like 127.0.0.1 —
+  /// same sshd-child-outside-every-layer escape (P13 ninja F2).
+  pub local_ips: Vec<IpAddr>,
+  /// Master switch for the escape-port rule (loopback/self ssh +
+  /// docker TCP). Default true — same "escape channels deny by
+  /// default" posture as the systemd sockets. `deny_loopback_ssh`
+  /// keeps its name (call sites + tests) and toggles this flag.
+  pub deny_escape_ports: bool,
   /// Deny the systemd user-manager sockets (T4). Default true.
   pub deny_systemd_sockets: bool,
   /// Deny the session bus (`$XDG_RUNTIME_DIR/bus`). Default true.
-  ///
   /// The private manager socket is NOT the only route to systemd's
   /// manager: `org.freedesktop.systemd1` is also exported on the session
   /// bus, and `StartTransientUnit` over the bus launches an arbitrary
@@ -139,8 +161,9 @@ pub struct EgressPolicy {
   /// single POST /containers/create with a `/:/host` bind is root —
   /// one-shot, zero-cost, outside steelman tolerance. Same shape as the
   /// systemd fix: deny the deputy socket by default, legit use becomes
-  /// an explicit grant. Podman/lxd/libvirt paths included by pattern so
-  /// the next install does not need a code change.
+  /// an explicit grant. Honest limit: `is_deputy_socket` is a FIXED
+  /// suffix list (docker, podman, lxd, incus, libvirt, containerd,
+  /// crio, snapd) — a new install path IS a code change, plus a test.
   pub deny_deputy_sockets: bool,
   /// Deny the SYSTEM bus (`/run/dbus/system_bus_socket`). Default true.
   ///
@@ -178,6 +201,8 @@ impl EgressPolicy {
       extra_ips: Vec::new(),
       resolver_ips: resolver_ips(),
       denied_loopback: Vec::new(),
+      local_ips: local_ips(),
+      deny_escape_ports: true,
       deny_systemd_sockets: true,
       deny_user_bus: true,
       deny_deputy_sockets: true,
@@ -191,6 +216,26 @@ impl EgressPolicy {
     // connected to 127.0.0.1:22 from inside a session (fix-scoped-to-
     // with_llm_only was the bug; the first fix only covered the floor).
     p.deny_loopback_ssh();
+    p
+  }
+
+  /// P13 ninja F12: audit posture — `--no-enforce`'s banner promises
+  /// "observation only, no containment", so EVERY default deny is off
+  /// (escape ports, systemd, buses, deputies, stub pairs). The daemon's
+  /// AuditWatcher is what records WOULD-DENY (daemon-side, no broker
+  /// needed); with an allow-everything policy the broker would record
+  /// nothing anyway and cost a notification round-trip per connect.
+  /// Callers layer an explicitly requested destination policy on top
+  /// (`with_llm_only`) — that is operator-requested containment, not a
+  /// default contradicting the banner.
+  pub fn audit() -> Self {
+    let mut p = Self::new();
+    p.deny_escape_ports = false;
+    p.deny_systemd_sockets = false;
+    p.deny_user_bus = false;
+    p.deny_deputy_sockets = false;
+    p.deny_system_bus = false;
+    p.denied_loopback.clear();
     p
   }
 
@@ -260,31 +305,54 @@ impl EgressPolicy {
   /// this deny the escape is silent: no spine row, no freeze, no trust
   /// hit.
   ///
-  /// Denied ports: 22 (sshd default) plus the common alternates 2222
-  /// and 2200. The canary honeypot (an arbitrary loopback port) is
-  /// unaffected — this denies specific (ip, port) pairs, not loopback.
-  ///
-  /// Applied in `new()` (default posture) as well as `with_llm_only()`:
-  /// P13 E-a probed 2026-09-30 and the first fix — scoped to the floor
-  /// only — left the default --enforce posture connecting to :22 live.
-  /// Escape channels deny by default; the destination policy is a
-  /// separate axis.
+  /// P13 ninja F2 (2026-09-30): the first implementation pinned exact
+  /// (ip, port) pairs — 127.0.0.1/::1 × {22,2222,200} — which missed
+  /// 127.0.0.2, v4-mapped [::ffff:127.0.0.1] and the host's own LAN
+  /// address (sshd binds 0.0.0.0; all of them reach it). The pairs are
+  /// replaced by `escape_port_denied`: ANY loopback or self address on
+  /// an escape port. This fn keeps its name (call sites, tests, spine
+  /// history) and toggles the flag that arms that rule.
   ///
   /// Honest limit: port lists are enumerable, and remote ssh / cron / at
   /// need no loopback TCP at all. This closes the LLM-obvious door, not
   /// the class — the exclusion-census (B) closes the class.
   pub fn deny_loopback_ssh(&mut self) {
-    for port in [22u16, 2222, 2200] {
-      for ip in [
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-        IpAddr::V6(Ipv6Addr::LOCALHOST),
-      ] {
-        let entry = (ip, port);
-        if !self.denied_loopback.contains(&entry) {
-          self.denied_loopback.push(entry);
-        }
-      }
+    self.deny_escape_ports = true;
+  }
+
+  /// Escape-port rule (P13 ninja F2): ssh and docker-TCP are dangerous
+  /// only when the destination is THIS host — the server child (sshd,
+  /// dockerd) then runs locally outside every session layer. Remote
+  /// destinations are ordinary egress (default posture allows them;
+  /// restrict_ip denies them by allowlist). Covers what the old exact
+  /// pairs missed: all of 127.0.0.0/8, ::1, v4-mapped loopback,
+  /// 0.0.0.0/[::] (kernel connect() maps them onto loopback), and every
+  /// local interface address. Returns the spine reason when denied.
+  pub fn escape_port_denied(&self, ip: &IpAddr, port: u16) -> Option<&'static str> {
+    if !self.deny_escape_ports {
+      return None;
     }
+    let ssh = matches!(port, 22 | 2222 | 2200);
+    let docker_tcp = matches!(port, 2375 | 2376);
+    if !ssh && !docker_tcp {
+      return None;
+    }
+    // Normalize v4-mapped ::ffff:a.b.c.d to its v4 form — the kernel
+    // treats it as v4 for loopback/locality purposes.
+    let norm = match ip {
+      IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        Some(v4) => IpAddr::V4(v4),
+        None => *ip,
+      },
+      IpAddr::V4(_) => *ip,
+    };
+    if norm.is_loopback() || norm.is_unspecified() {
+      return Some(if ssh { "loopback-ssh" } else { "docker-tcp" });
+    }
+    if self.local_ips.contains(&norm) {
+      return Some(if ssh { "self-ssh" } else { "docker-tcp" });
+    }
+    None
   }
 
   /// Is this specific (ip, port) pair explicitly denied even though it
@@ -335,6 +403,82 @@ pub fn resolver_ips() -> Vec<IpAddr> {
   out
 }
 
+/// Local interface addresses for `escape_port_denied` (P13 ninja F2).
+///
+/// FILTER-SAFE BY CONSTRUCTION: `EgressPolicy::new()` runs after
+/// `spawn_broker()` installs the notif filter but before `run()` starts
+/// answering, so any trapped syscall here (connect/sendto/sendmsg/...)
+/// would self-deadlock the supervisor — `getifaddrs(3)` speaks netlink
+/// (`sendto`) and is deliberately NOT used. `socket(2)`+`ioctl(2)` are
+/// not in the broker jump table, and `/proc/net/if_inet6` is a plain
+/// file read (open/read are not trapped either).
+///
+/// IPv4 via SIOCGIFCONF; IPv6 via /proc/net/if_inet6 (the ioctl is
+/// v4-only). Loopback is in the result — `escape_port_denied` checks
+/// loopback before consulting this list, duplicates are harmless.
+pub fn local_ips() -> Vec<IpAddr> {
+  let mut out: Vec<IpAddr> = Vec::new();
+  unsafe {
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+    if fd >= 0 {
+      let mut buf = [0u8; 4096];
+      let mut ifc = libc::ifconf {
+        ifc_len: buf.len() as libc::c_int,
+        ifc_ifcu: libc::__c_anonymous_ifc_ifcu {
+          ifcu_buf: buf.as_mut_ptr() as *mut libc::c_char,
+        },
+      };
+      if libc::ioctl(fd, libc::SIOCGIFCONF, &mut ifc) == 0 {
+        let stride = mem::size_of::<libc::ifreq>();
+        let len = ifc.ifc_len as usize;
+        let mut off = 0usize;
+        while off + stride <= len {
+          let req = &*(buf.as_ptr().add(off) as *const libc::ifreq);
+          if req.ifr_ifru.ifru_addr.sa_family as i32 == libc::AF_INET {
+            let sin =
+              &req.ifr_ifru.ifru_addr as *const libc::sockaddr as *const libc::sockaddr_in;
+            // s_addr is network order; from_be → the big-endian value
+            // Ipv4Addr::from expects (first octet = most significant).
+            let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr)));
+            if !out.contains(&ip) {
+              out.push(ip);
+            }
+          }
+          off += stride;
+        }
+      }
+      libc::close(fd);
+    }
+  }
+  // IPv6: 32 hex digits, ifindex, prefixlen, scope, flags, name.
+  if let Ok(text) = std::fs::read_to_string("/proc/net/if_inet6") {
+    for line in text.lines() {
+      let hex: &str = match line.split_whitespace().next() {
+        Some(h) if h.len() == 32 => h,
+        _ => continue,
+      };
+      let mut octets = [0u8; 16];
+      let mut ok = true;
+      for (i, slot) in octets.iter_mut().enumerate() {
+        match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+          Ok(b) => *slot = b,
+          Err(_) => {
+            ok = false;
+            break;
+          }
+        }
+      }
+      if ok {
+        let ip = IpAddr::V6(Ipv6Addr::from(octets));
+        if !out.contains(&ip) {
+          out.push(ip);
+        }
+      }
+    }
+  }
+  out
+}
+
 /// The unix paths that let a process escape the session scope by asking
 /// the user manager to act. C25/T4: `systemd-run` needs no cgroup write
 /// and no unit-file write — it talks to the manager over these sockets.
@@ -364,14 +508,47 @@ pub fn is_user_bus(path: &[u8]) -> bool {
 /// suffix so the common install paths (/run, /var/run) both hit, and the
 /// matched set stays explicit — no wildcard on ".sock" (that would eat
 /// wayland, pipewire and every benign desktop socket).
+///
+/// P13 ninja review (2026-09-30): containerd/crio/incus/snapd added —
+/// same contract, same one-shot class. Matched set is a fixed list
+/// (paths below), not a pattern: anything not named here is allowed.
+///
+/// Seat-input deputy (P13 F10, probed 2026-09-30): /tmp/.X11-unix/X*
+/// answered CONNECTED from an enforced session AND ~/.Xauthority was
+/// readable (read roots are `/`) — with the cookie, any X11 client gets
+/// XTEST keystroke injection into the human's seat and XGetImage screen
+/// readback (X11 has no per-client input isolation; Wayland's
+/// virtual-keyboard protocol IS privileged, X11's equivalent is not).
+/// The plan's pre-registered rule: reachable + readable cookie → deny
+/// by default. Same mechanism as the host-control deputies.
 pub fn is_deputy_socket(path: &[u8]) -> bool {
   let s = String::from_utf8_lossy(path);
   s.ends_with("/docker.sock")
     || s.ends_with("/podman/podman.sock")
     || s.ends_with("/lxd/unix.socket")
     || s.ends_with("/lxd.socket")
+    || s.ends_with("/incus/unix.socket")
     || s.ends_with("/libvirt/libvirt-sock")
     || s.ends_with("/libvirt/libvirt-sock-ro")
+    || s.ends_with("/containerd/containerd.sock")
+    || s.ends_with("/crio/crio.sock")
+    || s.ends_with("/snapd.socket")
+    || s.contains("/.X11-unix/X")
+}
+
+/// Run the unix suffix deny-list against one spelling of a path.
+fn unix_match(path: &[u8], policy: &EgressPolicy) -> Option<(Verdict, &'static str)> {
+  if policy.deny_systemd_sockets && is_manager_socket(path) {
+    Some((Verdict::Deny, "systemd-socket"))
+  } else if policy.deny_user_bus && is_user_bus(path) {
+    Some((Verdict::Deny, "session-bus"))
+  } else if policy.deny_system_bus && is_system_bus(path) {
+    Some((Verdict::Deny, "system-bus"))
+  } else if policy.deny_deputy_sockets && is_deputy_socket(path) {
+    Some((Verdict::Deny, "deputy-socket"))
+  } else {
+    None
+  }
 }
 
 /// The system bus path class (P13 E-c). Suffix match covers /run and
@@ -466,16 +643,23 @@ pub fn parse_sockaddr(buf: &[u8]) -> Option<Sockaddr> {
 pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
   match sa {
     Sockaddr::V4(ip, port) => {
+      // P13 ninja F2: escape ports (ssh/docker-TCP) to ANY self address,
+      // before the exact-pair resolver-stub check below.
+      if let Some(reason) = policy.escape_port_denied(&IpAddr::V4(*ip), *port) {
+        return (Verdict::Deny, reason);
+      }
       if policy.loopback_denied(&IpAddr::V4(*ip), *port) {
-        // Reason names the closed relay: resolver-stub (DNS) vs
-        // loopback-ssh (HN escape). Both ride denied_loopback; the port
-        // tells them apart (53 = stub, 22/2222/2200 = ssh).
+        // Reason names the closed relay: resolver-stub (DNS). The old
+        // 22/2222/2200 pairs moved to escape_port_denied (F2).
         let reason = if *port == 53 { "resolver-stub" } else { "loopback-ssh" };
         return (Verdict::Deny, reason);
       }
       (evaluate_v4(*ip, policy), "ipv4")
     }
     Sockaddr::V6(ip, port) => {
+      if let Some(reason) = policy.escape_port_denied(&IpAddr::V6(*ip), *port) {
+        return (Verdict::Deny, reason);
+      }
       if policy.loopback_denied(&IpAddr::V6(*ip), *port) {
         let reason = if *port == 53 { "resolver-stub" } else { "loopback-ssh" };
         return (Verdict::Deny, reason);
@@ -484,16 +668,41 @@ pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
     }
     Sockaddr::Abstract => (Verdict::Deny, "abstract-socket"),
     Sockaddr::Unix(path) => {
-      if policy.deny_systemd_sockets && is_manager_socket(path) {
-        (Verdict::Deny, "systemd-socket")
-      } else if policy.deny_user_bus && is_user_bus(path) {
-        (Verdict::Deny, "session-bus")
-      } else if policy.deny_system_bus && is_system_bus(path) {
-        (Verdict::Deny, "system-bus")
-      } else if policy.deny_deputy_sockets && is_deputy_socket(path) {
-        (Verdict::Deny, "deputy-socket")
-      } else {
-        (Verdict::Allow, "unix")
+      // P13 ninja F1: a cwd-relative sun_path ("docker.sock" after
+      // chdir("/run")) is resolved by the KERNEL against the tracee's
+      // cwd — the denylist only ever sees the literal bytes, so every
+      // suffix rule misses it. No pid is available here to resolve
+      // /proc/<pid>/cwd, and legit unix paths are absolute by
+      // convention (XDG_*), so relative fails closed.
+      if !path.starts_with(b"/") {
+        return (Verdict::Deny, "unix-relative");
+      }
+      // Literal match first — no I/O, catches direct /run/docker.sock
+      // and the "/var/run/..." spellings without touching the fs.
+      if let Some(v) = unix_match(path, policy) {
+        return v;
+      }
+      // P13 ninja F1: symlink resolution. A static symlink
+      // (`ln -s /run/.../systemd/private /tmp/x`) is closed
+      // deterministically by canonicalize; a FLIPPING symlink is
+      // caught by F4c-style stability (two reads 2ms apart must agree,
+      // else "unix-unstable" deny). Residual — same class as the F4c
+      // TCP one: a flip landing between the second read and the
+      // kernel's own path walk after CONTINUE, microseconds wide and
+      // rate-gated by CONNECT_RATE_PER_SEC. ENOENT twice = path does
+      // not exist: the kernel will fail the connect anyway (and b8's
+      // absent-socket probe plus docker-CLI up-checks must see
+      // FileNotFound, not EPERM — literal match already ran above).
+      let first = std::fs::canonicalize(OsStr::from_bytes(path));
+      std::thread::sleep(std::time::Duration::from_millis(2));
+      let second = std::fs::canonicalize(OsStr::from_bytes(path));
+      match (first, second) {
+        (Ok(a), Ok(b)) if a == b => {
+          let resolved = a.as_os_str().as_bytes();
+          unix_match(resolved, policy).unwrap_or((Verdict::Allow, "unix"))
+        }
+        (Ok(_), Ok(_)) | (Err(_), Ok(_)) | (Ok(_), Err(_)) => (Verdict::Deny, "unix-unstable"),
+        (Err(_), Err(_)) => (Verdict::Allow, "unix"),
       }
     }
     Sockaddr::Other(_) => (Verdict::Allow, "other-family"),
@@ -1034,9 +1243,50 @@ fn respond(listener: RawFd, req: &SeccompNotif, verdict: Verdict) -> io::Result<
 /// no fd handoff is needed. (A handoff via SCM_RIGHTS deadlocks: the
 /// handoff's own sendmsg is intercepted before the supervisor has the
 /// listener. Found live, 2026-09-05.)
-pub fn install_listener() -> io::Result<RawFd> {
-  let prog = vec![
+/// The seccomp program installed by `install_listener`, extracted for
+/// unit tests (P13 ninja F3: the arch/x32 gates need layout assertions
+/// and a mini-interpreter test — those must not require seccomp perms).
+///
+/// Layout (indices are load-bearing; jt/jf in the jump table are
+/// position-relative, so the table's offsets did NOT change when the
+/// gate was prepended — only the gate's own offsets are new):
+///
+/// ```text
+/// 0  LD  [4]                    arch
+/// 1  JEQ AUDIT_ARCH_NATIVE jt=1 jf=0   native → 3, foreign → 2
+/// 2  RET KILL_PROCESS           foreign arch: i386 nrs mean other syscalls
+/// 3  LD  [0]                    nr
+/// 4  JGT X32_NR_BOUND jt=0 jf=1 x32 (bit 30) → 5, native → 6
+/// 5  RET KILL_PROCESS           x32: 0x4000002a never equals SYS_connect
+/// 6.. jump table (jt 10..0 → RET NOTIF; fall → RET ALLOW)
+/// ```
+///
+/// Without the gate a compat tracee falls through every JEQ (its
+/// syscall numbers are the i386 table) and reaches RET ALLOW — the
+/// entire broker bypassed, closing not just egress but also the F1
+/// signal-scope trap. KILL_PROCESS on mismatch is the libseccomp
+/// standard: the process cannot be decided, so it does not run.
+pub fn broker_program() -> Vec<libc::sock_filter> {
+  vec![
+    // P13 ninja F3: arch gate. seccomp_data.arch is at offset 4.
+    bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 4),
+    bpf(
+      libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+      1,
+      0,
+      AUDIT_ARCH_NATIVE,
+    ),
+    bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+    // x32 gate: bit-30-set nrs report the native arch but never match
+    // a plain SYS_* below.
     bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+    bpf(
+      libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K,
+      0,
+      1,
+      X32_NR_BOUND,
+    ),
+    bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
     // Jump table: connect/sendto/sendmsg/sendmmsg/recvmmsg/connect-time + F1 signals -> NOTIF, else -> ALLOW.
     // F4 (2026-09-27, .227 breakout round 4): sendmmsg/recvmmsg bypassed
     // the broker entirely — one sendmmsg carried an allowed loopback AND
@@ -1058,7 +1308,11 @@ pub fn install_listener() -> io::Result<RawFd> {
     bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, libc::SYS_rt_tgsigqueueinfo as u32),
     bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_USER_NOTIF),
     bpf(libc::BPF_RET | libc::BPF_K, 0, 0, SECCOMP_RET_ALLOW),
-  ];
+  ]
+}
+
+pub fn install_listener() -> io::Result<RawFd> {
+  let prog = broker_program();
   unsafe {
     if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
       return Err(io::Error::last_os_error());
@@ -1642,6 +1896,186 @@ mod tests {
   }
 
   #[test]
+  fn escape_ports_cover_all_self_ip_shapes() {
+    // P13 ninja F2: exact (ip,port) pairs missed every self spelling
+    // but 127.0.0.1/::1 — sshd binds 0.0.0.0 and accepts on all of them.
+    let p = EgressPolicy::new();
+    for (ip, port) in [
+      // the rest of 127.0.0.0/8
+      (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 22u16),
+      (IpAddr::V4(Ipv4Addr::new(127, 255, 255, 254)), 2200),
+      // v4-mapped loopback
+      (
+        IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
+        22,
+      ),
+      // unspecified — kernel connect() maps 0.0.0.0/[::] onto loopback
+      (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 22),
+      (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 2222),
+      // docker TCP: same one-shot root contract as docker.sock
+      (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2375),
+      (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2376),
+    ] {
+      let sa = match ip {
+        IpAddr::V4(v4) => Sockaddr::V4(v4, port),
+        IpAddr::V6(v6) => Sockaddr::V6(v6, port),
+      };
+      assert_eq!(decide(&sa, &p).0, Verdict::Deny, "{ip}:{port} must deny");
+    }
+    // Self via a real local interface address (F2's LAN/dockery hole).
+    let self_ip = local_ips().into_iter().find(|ip| !ip.is_loopback());
+    if let Some(ip) = self_ip {
+      let sa = match ip {
+        IpAddr::V4(v4) => Sockaddr::V4(v4, 22),
+        IpAddr::V6(v6) => Sockaddr::V6(v6, 22),
+      };
+      assert_eq!(
+        decide(&sa, &p).0,
+        Verdict::Deny,
+        "ssh to own address {ip} must deny"
+      );
+    }
+    // Remote destinations are ordinary egress (destination policy is a
+    // separate axis; default posture allows, restrict_ip denies).
+    let sa = Sockaddr::V4(Ipv4Addr::new(8, 8, 8, 8), 22);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+    let sa = Sockaddr::V4(Ipv4Addr::new(8, 8, 8, 8), 2375);
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+    // Turning the flag off restores observation posture.
+    let mut audit = EgressPolicy::new();
+    audit.deny_escape_ports = false;
+    let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 1), 22);
+    assert_eq!(decide(&sa, &audit).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn local_ips_is_filter_safe_and_nonempty() {
+    // P13 ninja F2/F3: new() calls this AFTER install_listener but
+    // BEFORE run() — getifaddrs (netlink sendto) would self-deadlock.
+    // The impl must only use socket+ioctl+/proc. Non-empty on any
+    // normal host (loopback at minimum); the call completing at all
+    // inside the test binary is the no-hang evidence at unit level.
+    let ips = local_ips();
+    assert!(!ips.is_empty(), "local_ips() must at least report loopback");
+  }
+
+  #[test]
+  fn relative_unix_paths_denied() {
+    // P13 ninja F1: `chdir("/run"); connect("docker.sock")` hands the
+    // kernel a sun_path with no leading slash — every suffix rule
+    // missed it because the literal bytes are "docker.sock".
+    let p = EgressPolicy::new();
+    for path in [
+      &b"docker.sock"[..],
+      b"run/systemd/private",
+      b"./../run/dbus/system_bus_socket",
+    ] {
+      let sa = Sockaddr::Unix(path.to_vec());
+      let (v, reason) = decide(&sa, &p);
+      assert_eq!(v, Verdict::Deny, "{path:?} must deny");
+      assert_eq!(reason, "unix-relative");
+    }
+  }
+
+  #[test]
+  fn symlinked_unix_paths_resolve_to_their_target() {
+    // P13 ninja F1: static symlink bypass — `ln -s /run/docker.sock
+    // /tmp/evil` then connect("/tmp/evil"): the literal bytes match no
+    // suffix rule. canonicalize resolves the chain; the resolved path
+    // hits the denylist. Target is a real file in a tempdir so the test
+    // is host-independent (no docker required).
+    let dir = std::env::temp_dir().join(format!("castellan-sym-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("docker.sock");
+    std::fs::write(&target, b"").unwrap();
+    let link = dir.join("innocent");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let sa = Sockaddr::Unix(link.to_string_lossy().into_owned().into_bytes());
+    let (v, reason) = decide(&sa, &EgressPolicy::new());
+    assert_eq!(v, Verdict::Deny, "symlink must resolve to docker.sock");
+    assert_eq!(reason, "deputy-socket");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn absent_unix_path_still_falls_through_to_kernel_errno() {
+    // b8's over-block probe and docker-CLI up-checks must see
+    // FileNotFound (kernel ENOENT), never EPERM: an ENOENT-twice
+    // canonicalize means the path does not exist, so the literal
+    // match (already run) is all there is to decide on.
+    let p = EgressPolicy::new();
+    let path = format!("/tmp/castellan-absent-{}.sock", std::process::id());
+    let sa = Sockaddr::Unix(path.into_bytes());
+    assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  /// Minimal BPF interpreter for `broker_program()` (P13 ninja F3).
+  /// seccomp_data: nr at offset 0, arch at offset 4. Supports the three
+  /// opcode classes the program uses: LD|W|ABS, JMP|JEQ|K, JMP|JGT|K,
+  /// RET|K. Returns the RET value.
+  fn eval_bpf(prog: &[libc::sock_filter], nr: u32, arch: u32) -> u32 {
+    let mut a: u32 = 0;
+    let mut pc: usize = 0;
+    loop {
+      let ins = prog[pc];
+      let code = ins.code;
+      if code == (libc::BPF_RET | libc::BPF_K) as u16 {
+        return ins.k;
+      } else if code == (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16 {
+        a = match ins.k {
+          0 => nr,
+          4 => arch,
+          other => panic!("unexpected load offset {other}"),
+        };
+        pc += 1;
+      } else if code == (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16 {
+        pc += if a == ins.k { 1 + ins.jt as usize } else { 1 + ins.jf as usize };
+      } else if code == (libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K) as u16 {
+        pc += if a > ins.k { 1 + ins.jt as usize } else { 1 + ins.jf as usize };
+      } else {
+        panic!("unsupported opcode {code:#x} at pc {pc}");
+      }
+    }
+  }
+
+  #[test]
+  fn broker_program_arch_and_x32_gates() {
+    // P13 ninja F3: without the gates a compat tracee (i386 nr table)
+    // matches no JEQ and falls through to ALLOW — the whole broker
+    // (egress + unix denylist + F1 signal scope) bypassed. x32 reports
+    // the native arch but sets bit 30 on nrs, so it needs the JGT too.
+    let prog = broker_program();
+    let native = AUDIT_ARCH_NATIVE;
+    #[cfg(target_arch = "x86_64")]
+    let compat = 0x4000_0003u32; // AUDIT_ARCH_I386
+    #[cfg(target_arch = "aarch64")]
+    let compat = 0x4000_0001u32; // AUDIT_ARCH_ARM
+    // Native, connect → NOTIF (the broker's whole job).
+    assert_eq!(
+      eval_bpf(&prog, libc::SYS_connect as u32, native),
+      SECCOMP_RET_USER_NOTIF
+    );
+    // Native, a signal the scope gate owns → NOTIF.
+    assert_eq!(
+      eval_bpf(&prog, libc::SYS_tgkill as u32, native),
+      SECCOMP_RET_USER_NOTIF
+    );
+    // Native, an unrelated syscall (write) → ALLOW.
+    assert_eq!(eval_bpf(&prog, libc::SYS_write as u32, native), SECCOMP_RET_ALLOW);
+    // Foreign arch, even with a native-looking nr → KILL, never ALLOW.
+    assert_eq!(eval_bpf(&prog, libc::SYS_connect as u32, compat), SECCOMP_RET_KILL_PROCESS);
+    // x32: native arch, bit-30 nr → KILL (it would otherwise fall to ALLOW).
+    assert_eq!(
+      eval_bpf(&prog, (libc::SYS_connect as u32) | 0x4000_0000, native),
+      SECCOMP_RET_KILL_PROCESS
+    );
+    // Layout sanity: gates precede the table, RET NOTIF before RET ALLOW.
+    assert_eq!(prog[0].k, 4, "first load is seccomp_data.arch");
+    assert_eq!(prog[3].k, 0, "second load is seccomp_data.nr");
+  }
+
+  #[test]
   fn system_bus_denied_by_default() {
     // P13 E-c (probed 2026-09-30): world-rw socket, matched neither
     // prior predicate, pkcheck rc=0 for udisks2 loop-setup + mount.
@@ -1667,12 +2101,17 @@ mod tests {
   fn deputy_sockets_denied_by_default() {
     // P13 E-b (probed live 2026-09-30): docker.sock CONNECTED from an
     // enforced session — one-shot root via container bind-mount.
+    // P13 F10: /tmp/.X11-unix/X0 CONNECTED + cookie readable — seat
+    // input/screen via XTEST/XGetImage (pre-registered deny trigger).
     let p = EgressPolicy::new();
     for path in [
       &b"/run/docker.sock"[..],
       b"/var/run/docker.sock",
       b"/run/podman/podman.sock",
       b"/var/lib/libvirt/libvirt-sock",
+      b"/run/containerd/containerd.sock",
+      b"/tmp/.X11-unix/X0",
+      b"/tmp/.X11-unix/X1",
     ] {
       assert_eq!(
         decide(&Sockaddr::Unix(path.to_vec()), &p).0,
@@ -1855,10 +2294,14 @@ mod tests {
   #[test]
   fn sendmmsg_first_dest_denied_under_restriction() {
     // F4: a batch whose first dest is public is denied outright.
+    // (P13 ninja F13: the comment here used to claim "first element
+    // decides" — stale. F4/R2 widened it: ANY denied dest denies the
+    // WHOLE batch, fail-closed; batch_any_denied_denies pins that rule.
+    // This test keeps the first-element case as the named regression.)
     let p = EgressPolicy { restrict_ip: true, ..EgressPolicy::new() };
     let _ = &p;
-    // decide_dest on a parsed public dest denies; the batch rule is
-    // "first element decides", so this is the operative case.
+    // decide_dest on a parsed public dest denies; the batch rule then
+    // propagates that deny to every element.
     let (v, _, _) = decide_dest(&DestRead::Parsed(Sockaddr::V4(Ipv4Addr::new(8, 8, 8, 8), 53)), &p);
     assert_eq!(v, Verdict::Deny);
   }

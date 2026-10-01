@@ -27,6 +27,34 @@ b8: **19/19** (3 new default-posture ssh assertions). Workspace: 199 tests,
 clippy 0/48 (= baseline), deny x4 ok. p0: 12/3 — **identical 12/3 on the
 stashed pre-change tree** (pre-existing R7-tty local misses, not this change).
 
+## Ninja review round (security-review-ninja, 2026-09-30)
+
+Adversarial review of the fix commit (c316020). 1 Critical + 2 High +
+6 Medium — all fixed in the follow-up commit; FULL record in
+`docs/THREAT_MODEL.md` §C37n. Summary of what changed:
+
+| # | Severity | Finding | Fix |
+|---|----------|---------|-----|
+| N1 | Critical | unix denies were literal-suffix only: cwd-relative (`chdir /run; connect docker.sock`) and symlinked paths bypassed ALL four unix deny classes | `decide()`: non-absolute sun_path → `unix-relative` deny; absolute paths literal-match first, then `fs::canonicalize` ×2 (2ms stability, F4c shape) with the deny list on the RESOLVED path; ENOENT-twice falls through (FileNotFound preserved) |
+| N2 | High | ssh deny pinned exact (127.0.0.1,::1) pairs — 127.0.0.2, v4-mapped, 0.0.0.0 and every self interface IP reached sshd | `escape_port_denied()`: {22,2222,2200} × (all loopback shapes + `local_ips()`), plus {2375,2376} Docker-TCP; `local_ips()` via socket+ioctl+/proc (getifaddrs would self-deadlock post-install) |
+| N3 | High | neither seccomp filter checked `seccomp_data.arch` — a compat tracee fell through every JEQ to ALLOW, bypassing the whole broker AND the envelope denylist; x32 was a second hole | arch+x32 gates in BOTH filters → KILL_PROCESS; mini-BPF-interpreter test + layout-asserting `filter_ends_in_allow` |
+| N4 | Medium | escape-regression CI job could never fail (pipe exit + zero-match filters) | one unpiped full-crate run |
+| N5 | Medium | b8 accepted ECONNREFUSED as "denied" — the connect had EXECUTED | only PermissionError passes |
+| N6 | Medium | probe: E-a CONNECTED was a NOTE; E-i passed on any errno (EISDIR proves nothing) | strict verdicts; E-i non-destructive (open-without-write, O_EXCL siblings) |
+| N7 | Medium | deputy list missed containerd/crio/incus/snapd + Docker TCP | added; "no code change" doc claim corrected to "fixed list" |
+| N8 | Medium | E-h advisory unreachable in default layout; daemon HOME compare non-canonical | daemon canonicalizes home/state/cfg, `home.starts_with(&canon)` |
+| N9 | Medium | `sudo -n` advisory: no timeout, inherited stdin, per-launch journal | severed stdio, 1s timeout, 24h result cache |
+| N10 | Medium | `--no-enforce` applied every default deny while banner said "no containment" | plain audit skips `spawn_broker()` entirely (live-verified); audit+net-restrict on `EgressPolicy::audit()` |
+| N11 | Low | probe pre-killed the live daemon; grep poisoned SID extraction; unquoted script paths | `XDG_RUNTIME_DIR` isolation, `grep -oh`, `%q` quoting |
+| N12 | Low | stale sendmmsg test comment ("first element decides" post-F4) | corrected |
+
+Post-ninja verification: probe battery **17 PASS / 0 FAIL / 1 NOTE**
+(X11 now DENIED — the F10 pre-registered trigger fired: CONNECTED +
+cookie READABLE, so `/tmp/.X11-unix/X*` joined the deputy deny list;
+this box measured as an X11 session). b8 **19/19** strict. Workspace
+**205 tests**. F12 live-verified: plain-audit launch prints no
+watchdog/broker lines.
+
 ## Classification (frozen pre-probe, as executed)
 
 ### OUTSIDE tolerance — one-shot, zero-cost, must fix

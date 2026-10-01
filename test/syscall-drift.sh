@@ -153,6 +153,25 @@ while IFS=$'\t' read -r kind name decision capability rationale members; do
 done < <(grep '^class' "$TABLE")
 [ "$DRIFT" = "0" ] && ok "every class member is a real syscall on this kernel"
 
+# 2a. P14 F-D: every MEMBER of a Hard class must be in the filter.
+# This is the check whose absence let 21 declared-Hard members
+# (fsopen/pidfd_getfd/…) run unblocked while the gate stayed green. The
+# old "Hard class -> is blocked" branch (below, via check_kw) computed
+# hits = comm -23 <kernel-matching> <known>, which excludes every name
+# the table already lists — so a listed-but-unblocked member was
+# invisible. This branch works on the member set directly, and the
+# selftest seeds a removal to prove it can go red.
+hard_mem=$(awk -F'\t' '$1=="class" && $3=="Hard"{n=split($6,a,","); for(i=1;i<=n;i++) if(a[i]!="") print a[i]}' "$TABLE" | sort -u)
+printf '%s\n' "$hard_mem" | grep -v '^$' | sort -u > /tmp/.drift_hardmem.$$
+printf '%s\n' "$filtered" | grep -v '^$' | sort -u > /tmp/.drift_filt2.$$
+gap=$(comm -23 /tmp/.drift_hardmem.$$ /tmp/.drift_filt2.$$)
+if [ -z "$gap" ]; then
+  ok "every Hard-class member is in the filter"
+else
+  bad "Hard-class members NOT blocked (declared closed, actually open): $(tr '\n' ' ' <<<"$gap")"
+fi
+rm -f /tmp/.drift_hardmem.$$ /tmp/.drift_filt2.$$
+
 # 2b. the direction that actually matters: this kernel has syscalls in a
 # watched CAPABILITY that the table never names. The table cannot know
 # them in advance — that is the point — so the gate flags every

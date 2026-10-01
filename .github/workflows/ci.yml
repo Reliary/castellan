@@ -104,6 +104,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p castellan-envelope --example syscall-classes
       - run: bash test/syscall-drift.sh
+      # P14: the gate's own Koch criterion. This was silently broken —
+      # the injections referenced mutation files that are not in the
+      # repo, so it reported "mutation did not apply" and never ran while
+      # the docs cited it as 5/5. It is now self-contained; run it so a
+      # future regression in the gate itself is a red build.
+      - run: bash test/syscall-drift-selftest.sh
 
   # Workload-syscall probe.
   #
@@ -166,3 +172,11 @@ jobs:
       # neither failure mode.
       - name: broker suite (arch/x32 gates, escape ports, unix resolution)
         run: cargo test -p castellan-broker
+
+      # P14: the envelope denylist must block every Hard-class MEMBER, not
+      # just the class's own consts (this is the check whose absence let
+      # fsopen/pidfd_getfd run free). The drift gate (syscall-drift job)
+      # now covers this against the running kernel; this unpiped crate run
+      # keeps the Rust invariant in the escape-regression job too.
+      - name: envelope suite (Hard-member closure, arch/x32, drift table)
+        run: cargo test -p castellan-envelope

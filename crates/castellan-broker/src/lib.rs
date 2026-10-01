@@ -190,6 +190,18 @@ pub struct EgressPolicy {
   /// a destination argument the broker cannot read from tracee memory is
   /// DENIED (fail-closed: no proof of destination, no packet).
   pub restrict_ip: bool,
+  /// Deny socket address families other than AF_INET/AF_INET6/AF_UNIX.
+  /// Default true. P14 F-E (probed live 2026-10-01): the parser maps any
+  /// other family to `Sockaddr::Other(fam)` and `decide()` returned
+  /// ALLOW — measured AF_VSOCK and AF_SMC sockets opening inside a
+  /// session (a connect on either is then waved through). No host-side
+  /// VSOCK peer existed in the test, so this is not a confirmed escape,
+  /// but the default was open where every other arm is fail-closed.
+  /// AF_NETLINK (name resolution / kernel queries) and AF_ALG (local
+  /// kernel crypto) are explicitly allowed; they are kernel-local, not
+  /// egress. Everything else denies, and a family that a real workload
+  /// needs becomes an explicit allow with a dated rationale.
+  pub deny_unknown_family: bool,
 }
 
 impl EgressPolicy {
@@ -208,6 +220,7 @@ impl EgressPolicy {
       deny_deputy_sockets: true,
       deny_system_bus: true,
       restrict_ip: false,
+      deny_unknown_family: true,
     };
     // Escape channels deny by default (systemd-socket precedent): ssh
     // localhost runs its command in an sshd child outside every layer —
@@ -235,6 +248,7 @@ impl EgressPolicy {
     p.deny_user_bus = false;
     p.deny_deputy_sockets = false;
     p.deny_system_bus = false;
+    p.deny_unknown_family = false;
     p.denied_loopback.clear();
     p
   }
@@ -705,7 +719,21 @@ pub fn decide(sa: &Sockaddr, policy: &EgressPolicy) -> (Verdict, &'static str) {
         (Err(_), Err(_)) => (Verdict::Allow, "unix"),
       }
     }
-    Sockaddr::Other(_) => (Verdict::Allow, "other-family"),
+    Sockaddr::Other(fam) => {
+      // P14 F-E: fail closed on families we do not model. AF_NETLINK
+      // (name resolution / kernel queries) and AF_ALG (local kernel
+      // crypto) are kernel-local — they reach no peer — so they stay
+      // allowed; every other family denies by default rather than
+      // falling through the way the parser's `Other` arm used to.
+      if !policy.deny_unknown_family {
+        return (Verdict::Allow, "other-family");
+      }
+      if *fam == libc::AF_NETLINK || *fam == libc::AF_ALG {
+        (Verdict::Allow, "kernel-local-family")
+      } else {
+        (Verdict::Deny, "unknown-family")
+      }
+    }
   }
 }
 
@@ -2140,6 +2168,30 @@ mod tests {
     let p = EgressPolicy::new();
     let sa = Sockaddr::V4(Ipv4Addr::new(127, 0, 0, 53), 53);
     assert_eq!(decide(&sa, &p).0, Verdict::Allow);
+  }
+
+  #[test]
+  fn unknown_socket_family_denied_by_default() {
+    // P14 F-E (probed live 2026-10-01): AF_VSOCK/AF_SMC sockets opened
+    // inside a session and decide()'s Other arm returned Allow — the one
+    // fail-open arm in the policy. Now unknown families deny; the two
+    // kernel-local families stay allowed (a connect on them reaches no
+    // peer, and AF_NETLINK is used by name resolution).
+    let p = EgressPolicy::new();
+    // Linux AF_* numbers (libc does not export AF_VSOCK/AF_SMC on gnu).
+    const AF_VSOCK: i32 = 40;
+    const AF_SMC: i32 = 43;
+    const AF_PACKET: i32 = 17;
+    const AF_NETLINK: i32 = 16;
+    const AF_ALG: i32 = 38;
+    assert_eq!(decide(&Sockaddr::Other(AF_VSOCK), &p).0, Verdict::Deny);
+    assert_eq!(decide(&Sockaddr::Other(AF_SMC), &p).0, Verdict::Deny);
+    assert_eq!(decide(&Sockaddr::Other(AF_PACKET), &p).0, Verdict::Deny);
+    assert_eq!(decide(&Sockaddr::Other(AF_NETLINK), &p).0, Verdict::Allow);
+    assert_eq!(decide(&Sockaddr::Other(AF_ALG), &p).0, Verdict::Allow);
+    // Audit posture restores the old blanket-allow (banner honesty).
+    let a = EgressPolicy::audit();
+    assert_eq!(decide(&Sockaddr::Other(AF_VSOCK), &a).0, Verdict::Allow);
   }
 
   #[test]

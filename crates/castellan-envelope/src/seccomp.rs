@@ -22,13 +22,33 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
     libc::SYS_process_vm_writev,
+    // P14 F-B/F-C (probed live 2026-10-01): pidfd_getfd is the modern
+    // process-memory / fd-theft primitive — it duplicates a file
+    // descriptor out of another process with only
+    // PTRACE_MODE_ATTACH_REALCREDS. Measured: pidfd_getfd on a child in
+    // the SAME session returned a working fd and the read succeeded
+    // (FD-THEFT-CONFIRMED); it was in no class and not blocked.
+    // process_madvise/process_mrelease were declared Hard but not
+    // blocked. Adding the filter entries makes the filter match the
+    // table; pidfd_open stays unblocked (a handle is powerless without a
+    // trapped action — pidfd_send_signal is already trapped).
+    libc::SYS_pidfd_getfd,
+    libc::SYS_process_madvise,
+    libc::SYS_process_mrelease,
     libc::SYS_io_uring_setup,
     libc::SYS_io_uring_enter,
     libc::SYS_io_uring_register,
     libc::SYS_open_by_handle_at,
+    // P14 F-C: name_to_handle_at was declared Hard (file-handle-bypass
+    // pairs with open_by_handle_at) but not blocked. It only produces the
+    // handle the open consumes; blocking both closes the class rather
+    // than halving it.
+    libc::SYS_name_to_handle_at,
     libc::SYS_bpf,
     libc::SYS_perf_event_open,
     libc::SYS_userfaultfd,
+    // P14 F-C: syslog was in the kernel-observer Hard class and unblocked.
+    libc::SYS_syslog,
     libc::SYS_kcmp,
     libc::SYS_add_key,
     libc::SYS_request_key,
@@ -42,9 +62,38 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     libc::SYS_chroot,
     libc::SYS_mount,
     libc::SYS_umount2,
+    // P14 F-A (probed live 2026-10-01): the class table declared the new
+    // mount API as Hard but the filter never blocked it — a mismatch the
+    // drift gate could not see (F-D). Measured inside an enforced
+    // session: legacy mount() EPERM, but fsopen/fsconfig(CREATE)/fsmount/
+    // open_tree("/") all SUCCEEDED (open_tree gave a traversable fd).
+    // A mount obtained through the new API is a write surface outside
+    // every Landlock rule, exactly the capability the class names.
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
     libc::SYS_reboot,
     libc::SYS_swapon,
     libc::SYS_swapoff,
+    // P14 F-C (probed live 2026-10-01): the machine-admin Hard class
+    // named these as capability-closing members but the filter blocked
+    // only reboot/swapon/swapoff. Machine-wide state (disk quota, clock,
+    // hostname, raw I/O port access, process accounting) has blast
+    // radius beyond the session, which is the class's stated rationale.
+    libc::SYS_quotactl,
+    libc::SYS_quotactl_fd,
+    libc::SYS_settimeofday,
+    libc::SYS_clock_settime,
+    libc::SYS_clock_adjtime,
+    libc::SYS_adjtimex,
+    libc::SYS_sethostname,
+    libc::SYS_setdomainname,
+    libc::SYS_iopl,
+    libc::SYS_ioperm,
+    libc::SYS_acct,
     libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_fsetxattr,
     libc::SYS_removexattr, libc::SYS_lremovexattr, libc::SYS_fremovexattr,
     // B6 phase 1: chown/utime families. chmod is deliberately NOT
@@ -141,48 +190,77 @@ pub fn seccomp_program() -> Vec<libc::sock_filter> {
 /// table the tests use, and a number with no name is reported as
 /// `nr:<n>` rather than dropped, so an unrecognised entry cannot
 /// disappear from the report.
+/// Name -> number for every syscall the filter may reference. Single
+/// source of truth: `blocked_names()` (for the drift gate) and the
+/// tests' `syscall_nr` both read this. P14 F-D: this table used to be
+/// copied in two places, which is how a member could be added to the
+/// class table and never blocked while every check stayed green.
+#[rustfmt::skip]
+const FILTER_NAMES: &[(&str, libc::c_long)] = &[
+  ("ptrace", libc::SYS_ptrace),
+  ("process_vm_readv", libc::SYS_process_vm_readv),
+  ("process_vm_writev", libc::SYS_process_vm_writev),
+  ("pidfd_getfd", libc::SYS_pidfd_getfd),
+  ("process_madvise", libc::SYS_process_madvise),
+  ("process_mrelease", libc::SYS_process_mrelease),
+  ("io_uring_setup", libc::SYS_io_uring_setup),
+  ("io_uring_enter", libc::SYS_io_uring_enter),
+  ("io_uring_register", libc::SYS_io_uring_register),
+  ("open_by_handle_at", libc::SYS_open_by_handle_at),
+  ("name_to_handle_at", libc::SYS_name_to_handle_at),
+  ("bpf", libc::SYS_bpf),
+  ("perf_event_open", libc::SYS_perf_event_open),
+  ("userfaultfd", libc::SYS_userfaultfd),
+  ("syslog", libc::SYS_syslog),
+  ("kcmp", libc::SYS_kcmp),
+  ("add_key", libc::SYS_add_key),
+  ("request_key", libc::SYS_request_key),
+  ("keyctl", libc::SYS_keyctl),
+  ("init_module", libc::SYS_init_module),
+  ("finit_module", libc::SYS_finit_module),
+  ("delete_module", libc::SYS_delete_module),
+  ("kexec_load", libc::SYS_kexec_load),
+  ("kexec_file_load", libc::SYS_kexec_file_load),
+  ("pivot_root", libc::SYS_pivot_root),
+  ("chroot", libc::SYS_chroot),
+  ("mount", libc::SYS_mount),
+  ("umount2", libc::SYS_umount2),
+  ("fsopen", libc::SYS_fsopen),
+  ("fsconfig", libc::SYS_fsconfig),
+  ("fsmount", libc::SYS_fsmount),
+  ("move_mount", libc::SYS_move_mount),
+  ("open_tree", libc::SYS_open_tree),
+  ("mount_setattr", libc::SYS_mount_setattr),
+  ("reboot", libc::SYS_reboot),
+  ("swapon", libc::SYS_swapon),
+  ("swapoff", libc::SYS_swapoff),
+  ("quotactl", libc::SYS_quotactl),
+  ("quotactl_fd", libc::SYS_quotactl_fd),
+  ("settimeofday", libc::SYS_settimeofday),
+  ("clock_settime", libc::SYS_clock_settime),
+  ("clock_adjtime", libc::SYS_clock_adjtime),
+  ("adjtimex", libc::SYS_adjtimex),
+  ("sethostname", libc::SYS_sethostname),
+  ("setdomainname", libc::SYS_setdomainname),
+  ("iopl", libc::SYS_iopl),
+  ("ioperm", libc::SYS_ioperm),
+  ("acct", libc::SYS_acct),
+  ("setxattr", libc::SYS_setxattr),
+  ("lsetxattr", libc::SYS_lsetxattr),
+  ("fsetxattr", libc::SYS_fsetxattr),
+  ("removexattr", libc::SYS_removexattr),
+  ("lremovexattr", libc::SYS_lremovexattr),
+  ("fremovexattr", libc::SYS_fremovexattr),
+  ("chown", libc::SYS_chown),
+  ("fchown", libc::SYS_fchown),
+  ("lchown", libc::SYS_lchown),
+  ("fchownat", libc::SYS_fchownat),
+];
+
 pub fn blocked_names() -> Vec<String> {
-  const TABLE: &[(&str, libc::c_long)] = &[
-    ("ptrace", libc::SYS_ptrace),
-    ("process_vm_readv", libc::SYS_process_vm_readv),
-    ("process_vm_writev", libc::SYS_process_vm_writev),
-    ("io_uring_setup", libc::SYS_io_uring_setup),
-    ("io_uring_enter", libc::SYS_io_uring_enter),
-    ("io_uring_register", libc::SYS_io_uring_register),
-    ("open_by_handle_at", libc::SYS_open_by_handle_at),
-    ("bpf", libc::SYS_bpf),
-    ("perf_event_open", libc::SYS_perf_event_open),
-    ("userfaultfd", libc::SYS_userfaultfd),
-    ("kcmp", libc::SYS_kcmp),
-    ("add_key", libc::SYS_add_key),
-    ("request_key", libc::SYS_request_key),
-    ("keyctl", libc::SYS_keyctl),
-    ("init_module", libc::SYS_init_module),
-    ("finit_module", libc::SYS_finit_module),
-    ("delete_module", libc::SYS_delete_module),
-    ("kexec_load", libc::SYS_kexec_load),
-    ("kexec_file_load", libc::SYS_kexec_file_load),
-    ("pivot_root", libc::SYS_pivot_root),
-    ("chroot", libc::SYS_chroot),
-    ("mount", libc::SYS_mount),
-    ("umount2", libc::SYS_umount2),
-    ("reboot", libc::SYS_reboot),
-    ("swapon", libc::SYS_swapon),
-    ("swapoff", libc::SYS_swapoff),
-    ("setxattr", libc::SYS_setxattr),
-    ("lsetxattr", libc::SYS_lsetxattr),
-    ("fsetxattr", libc::SYS_fsetxattr),
-    ("removexattr", libc::SYS_removexattr),
-    ("lremovexattr", libc::SYS_lremovexattr),
-    ("fremovexattr", libc::SYS_fremovexattr),
-    ("chown", libc::SYS_chown),
-    ("fchown", libc::SYS_fchown),
-    ("lchown", libc::SYS_lchown),
-    ("fchownat", libc::SYS_fchownat),
-  ];
   blocked_syscalls()
     .iter()
-    .map(|nr| match TABLE.iter().find(|(_, v)| v == nr) {
+    .map(|nr| match FILTER_NAMES.iter().find(|(_, v)| v == nr) {
       Some((n, _)) => (*n).to_string(),
       None => format!("nr:{}", *nr),
     })
@@ -233,6 +311,34 @@ mod tests {
     }
   }
 
+  /// P14 F-D: every MEMBER of a Hard class must resolve to a blocked
+  /// syscall, not just the class's own `libc_consts`. The prior test only
+  /// checked that a Hard class named *some* const; a member the filter
+  /// omitted (fsopen, pidfd_getfd before P14) passed every check while
+  /// running free. This is the invariant the drift gate tried to state
+  /// but computed on the wrong set.
+  #[test]
+  fn every_hard_class_member_is_blocked() {
+    let blocked = blocked_syscalls();
+    for c in by_decision(Decision::Hard) {
+      for m in c.members {
+        let nr = syscall_nr(m).unwrap_or_else(|| {
+          panic!(
+            "Hard class {} lists member '{m}' but it has no FILTER_NAMES entry — \
+             add the constant (and block it), or reclassify the member",
+            c.name
+          )
+        });
+        assert!(
+          blocked.contains(&nr),
+          "Hard class {} lists member '{m}' but blocked_syscalls() omits it — \
+           the class claims a closure the filter does not have",
+          c.name
+        );
+      }
+    }
+  }
+
   /// Every `Hard` class const must actually be blocked, or the class's
   /// capability is not actually closed.
   #[test]
@@ -267,47 +373,10 @@ mod tests {
   }
 
   fn syscall_nr(name: &str) -> Option<libc::c_long> {
-    // The set of constants the table may reference, resolved at compile
-    // time by matching the names we actually use.
-    const TABLE: &[(&str, libc::c_long)] = &[
-      ("ptrace", libc::SYS_ptrace),
-      ("process_vm_readv", libc::SYS_process_vm_readv),
-      ("process_vm_writev", libc::SYS_process_vm_writev),
-      ("io_uring_setup", libc::SYS_io_uring_setup),
-      ("io_uring_enter", libc::SYS_io_uring_enter),
-      ("io_uring_register", libc::SYS_io_uring_register),
-      ("open_by_handle_at", libc::SYS_open_by_handle_at),
-      ("bpf", libc::SYS_bpf),
-      ("perf_event_open", libc::SYS_perf_event_open),
-      ("userfaultfd", libc::SYS_userfaultfd),
-      ("kcmp", libc::SYS_kcmp),
-      ("add_key", libc::SYS_add_key),
-      ("request_key", libc::SYS_request_key),
-      ("keyctl", libc::SYS_keyctl),
-      ("init_module", libc::SYS_init_module),
-      ("finit_module", libc::SYS_finit_module),
-      ("delete_module", libc::SYS_delete_module),
-      ("kexec_load", libc::SYS_kexec_load),
-      ("kexec_file_load", libc::SYS_kexec_file_load),
-      ("pivot_root", libc::SYS_pivot_root),
-      ("chroot", libc::SYS_chroot),
-      ("mount", libc::SYS_mount),
-      ("umount2", libc::SYS_umount2),
-      ("reboot", libc::SYS_reboot),
-      ("swapon", libc::SYS_swapon),
-      ("swapoff", libc::SYS_swapoff),
-      ("setxattr", libc::SYS_setxattr),
-      ("lsetxattr", libc::SYS_lsetxattr),
-      ("fsetxattr", libc::SYS_fsetxattr),
-      ("removexattr", libc::SYS_removexattr),
-      ("lremovexattr", libc::SYS_lremovexattr),
-      ("fremovexattr", libc::SYS_fremovexattr),
-      ("chown", libc::SYS_chown),
-      ("fchown", libc::SYS_fchown),
-      ("lchown", libc::SYS_lchown),
-      ("fchownat", libc::SYS_fchownat),
-    ];
-    TABLE.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+    // P14 F-D: single source of truth (FILTER_NAMES). This used to be a
+    // second copy of the same list, which is how the table and the
+    // filter could drift with every check still green.
+    FILTER_NAMES.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
   }
 
   /// The filter must be a default-ALLOW denylist (commitment #8) with a

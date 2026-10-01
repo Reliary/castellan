@@ -64,15 +64,15 @@ start_daemon() {
 start_daemon
 
 mkdir -p /tmp/cast-p9-witness
-witness_keep() { # witness_keep <sid> — keep via a daemon-witnessed tty (B7)
+witness_keep() { # witness_keep <sid> — keep from the session's launcher tty.
+  # R7 made every session tty-launched (headless JoinSession is gated),
+  # and human_tty_ok for session-scoped ops is now an EXACT match on
+  # the recorded launcher tty. A nested `script` mints a fresh inner
+  # pty that can never equal the launcher's — so the keep must come
+  # from THIS suite's own tty (run the suite under a terminal or
+  # `script -qec`, same requirement as drill-gate-prod).
   local sid="$1"
-  script -qec '
-    BIN=/home/john/src/castellan/target/release/castellan
-    OUT=$($BIN launch --project /tmp/cast-p9-witness -- true 2>&1)
-    WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
-    $BIN keep '"$sid"' 2>&1
-    $BIN kill $WSID >/dev/null 2>&1
-  ' /dev/null 2>&1
+  "$BIN/castellan" keep "$sid" 2>&1
 }
 
 

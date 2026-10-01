@@ -2120,7 +2120,7 @@ impl Daemon {
     // B6 P3 (R19): the secrets are NOT returned in the response — the
     // response is visible to the agent, so returning them is a canary
     // oracle teaching the exact bytes to strip. They persist in the
-    // canary ledger (canary.jsonl, reloaded at startup).
+    // registry ledger (registry.jsonl, reloaded at startup).
     Response::ok()
       .with_message("canaries planted")
       .with_extra(
@@ -2878,6 +2878,13 @@ impl Daemon {
         restrict: net_restrict,
         keyring: self.keyring.clone(),
         client_tls: self.proxy_tls.clone(),
+        // P15 H1/F2: a tunnel to the honeypot port would originate the
+        // connection from the daemon pid and defeat sender attribution.
+        deny_ports: if self.honeypot.port > 0 {
+          vec![self.honeypot.port]
+        } else {
+          vec![]
+        },
       };
       match castellan_proxy::start(pcfg) {
         Ok(h) => {

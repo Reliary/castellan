@@ -197,6 +197,7 @@ hosts = ["127.0.0.1"]
     restrict: true,
     keyring: Arc::new(Keyring::parse(keyring.as_bytes()).unwrap()),
     client_tls: STUB_CLIENT_TLS.clone(),
+    deny_ports: vec![],
   };
   let h = start(cfg).unwrap();
   let ca_pem = std::fs::read_to_string(&h.ca_path).unwrap();
@@ -235,6 +236,7 @@ fn k6_unbound_host_gets_no_injection() {
     restrict: true,
     keyring: Arc::new(Keyring::empty()),
     client_tls: STUB_CLIENT_TLS.clone(),
+    deny_ports: vec![],
   };
   let h = start(cfg).unwrap();
   let ca_pem = std::fs::read_to_string(&h.ca_path).unwrap();
@@ -259,6 +261,7 @@ fn k3c_non_allowlisted_host_is_denied() {
     restrict: true,
     keyring: Arc::new(Keyring::empty()),
     client_tls: native_tls_config(),
+    deny_ports: vec![],
   };
   let h = start(cfg).unwrap();
 
@@ -287,6 +290,7 @@ fn k5_workspace_poisoned_keyring_never_reaches_load_path() {
     restrict: true,
     keyring: Arc::new(Keyring::load(&w.join("nonexistent/keyring.toml"))),
     client_tls: native_tls_config(),
+    deny_ports: vec![],
   };
   assert!(cfg.keyring.is_empty());
   let h = start(cfg).unwrap();

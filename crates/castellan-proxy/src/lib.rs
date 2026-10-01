@@ -14,6 +14,13 @@ pub struct ProxyConfig {
   pub restrict: bool,
   pub keyring: Arc<Keyring>,
   pub client_tls: Arc<rustls::ClientConfig>,
+  /// P15 H1/F2: loopback destinations the tunnel must never reach —
+  /// today that is the session honeypot port. A CONNECT tunnel to it
+  /// makes the honeypot-side connection originate from the DAEMON pid
+  /// (proxy threads live in the daemon), which would defeat sender
+  /// attribution and re-frame the secret's owner. Checked before
+  /// `allowed()`, so it holds in both proxy postures.
+  pub deny_ports: Vec<u16>,
 }
 
 pub struct ProxyHandle {
@@ -203,6 +210,23 @@ fn handle_conn(
     raw_respond(&mut sock, "501 Not Implemented");
     return Ok(());
   };
+
+  // P15 H1/F2: never tunnel to a deny-listed loopback port (the
+  // honeypot). Before allowed(), so both proxy postures enforce it.
+  if cfg.deny_ports.contains(&port) {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+      if ip.is_loopback() {
+        emit(spine, "egress_deny", &host, "honeypot-tunnel");
+        raw_respond(&mut sock, "403 Forbidden");
+        return Ok(());
+      }
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+      emit(spine, "egress_deny", &host, "honeypot-tunnel");
+      raw_respond(&mut sock, "403 Forbidden");
+      return Ok(());
+    }
+  }
 
   if !allowed(cfg, &host) {
     emit(spine, "egress_deny", &host, "allowlist");
@@ -601,6 +625,7 @@ mod tests {
       restrict,
       keyring: Arc::new(Keyring::empty()),
       client_tls: native_tls_config(),
+      deny_ports: vec![],
     }
   }
 
@@ -644,6 +669,7 @@ mod tests {
       restrict: true,
       keyring: Arc::new(k),
       client_tls: native_tls_config(),
+      deny_ports: vec![],
     };
     let raw = b"POST /v1/chat HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer canary\r\nX-API-Key: canary2\r\nContent-Length: 2\r\n\r\n{}";
     let req = rewrite_request(raw, "api.github.com", &c).unwrap();

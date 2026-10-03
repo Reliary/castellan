@@ -121,7 +121,7 @@ unsafe fn recv_fd(sock: RawFd) -> io::Result<RawFd> {
   }
   let cmsg = libc::CMSG_FIRSTHDR(&msg);
   if cmsg.is_null() || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-    return Err(io::Error::new(io::ErrorKind::Other, "no SCM_RIGHTS"));
+    return Err(io::Error::other("no SCM_RIGHTS"));
   }
   let mut fd: RawFd = -1;
   std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg), &mut fd as *mut RawFd as *mut u8, 4);
@@ -209,7 +209,7 @@ fn baseline() -> io::Result<u128> {
       }
       let r = connect_v4(fd, [127, 0, 0, 1], ALLOW_PORT);
       if r != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::ECONNREFUSED) {
-        return Err(io::Error::new(io::ErrorKind::Other, "baseline connect not refused"));
+        return Err(io::Error::other("baseline connect not refused"));
       }
       libc::close(fd);
     }

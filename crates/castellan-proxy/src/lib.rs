@@ -624,7 +624,7 @@ fn is_clean_eof(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::io::Cursor;
+  
 
   fn cfg_with(hosts: &[&str], restrict: bool) -> ProxyConfig {
     ProxyConfig {

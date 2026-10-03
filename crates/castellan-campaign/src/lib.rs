@@ -77,10 +77,10 @@ fn signal_rank(signal: Signal) -> u8 {
 /// is in the run, "medium" if only reverts, "low" otherwise.
 pub fn detect_campaigns(project: &Path, state_home: &Path) -> std::io::Result<CampaignReport> {
   let db = TrustDb::open(state_home).map_err(|e| {
-    std::io::Error::new(std::io::ErrorKind::Other, format!("trust db open: {e}"))
+    std::io::Error::other(format!("trust db open: {e}"))
   })?;
   let events = db.events(project).map_err(|e| {
-    std::io::Error::new(std::io::ErrorKind::Other, format!("trust events: {e}"))
+    std::io::Error::other(format!("trust events: {e}"))
   })?;
   // events come back newest-first; reverse to chronological
   let mut events = events;

@@ -110,7 +110,7 @@ pub fn ebgm(n: u64, expected: f64, alpha: f64, beta: f64) -> f64 {
   if expected <= 0.0 {
     return 0.0;
   }
-  let posterior_mean = (n as f64 + alpha) / (expected + beta);
+  let _posterior_mean = (n as f64 + alpha) / (expected + beta);
   // EBGM is the geometric mean of the posterior; for the
   // gamma-Poisson conjugate this is exp(digamma(alpha + n) -
   // ln(E + beta)). The digamma approximation for large alpha+n:

@@ -63,14 +63,13 @@ impl ResponseVerb {
     }
   }
 
-  pub fn from_str(s: &str) -> Option<Self> {
-    match s {
-      "freeze" => Some(ResponseVerb::Freeze),
-      "freeze_all" => Some(ResponseVerb::FreezeAll),
-      "quarantine_files" => Some(ResponseVerb::QuarantineFiles),
-      "alarm_human" => Some(ResponseVerb::AlarmHuman),
-      "log_only" => Some(ResponseVerb::LogOnly),
-      _ => None,
+  fn from_index(i: usize) -> Self {
+    match i {
+      0 => ResponseVerb::Freeze,
+      1 => ResponseVerb::FreezeAll,
+      2 => ResponseVerb::QuarantineFiles,
+      3 => ResponseVerb::AlarmHuman,
+      _ => ResponseVerb::LogOnly,
     }
   }
 }
@@ -185,7 +184,7 @@ impl ImmuneMemory {
     if overlap < CONFIDENCE_GATE {
       return None;
     }
-    let (response, margin) = read_margin(&self.incident, &addr);
+    let (response, _margin) = read_margin(&self.incident, &addr);
     let confidence = overlap;
     Some(Recall { response, confidence, activations: written, self_match: false })
   }
@@ -228,7 +227,6 @@ fn bind_role(shape: &[u8; 64], role: &[u8; 64]) -> sdm::Address {
 }
 
 const ROLE_INCIDENT: &[u8; 64] = &[0x5a; 64];
-const ROLE_SELF: &[u8; 64] = &[0xa5; 64];
 
 /// Encode a response verb as a 512-bit pattern: one-hot over the verb
 /// vocabulary, spread deterministically.
@@ -240,35 +238,6 @@ fn encode_response(verb: ResponseVerb) -> sdm::Address {
     bytes[bit / 8] |= 1 << (bit % 8);
   }
   sdm::Address::from_bytes(bytes)
-}
-
-/// Decode a recalled pattern back to a response verb: majority vote
-/// over the 8-bit slots. A cold read (all zeros) decodes to LogOnly —
-/// the safest default (never auto-freeze on nothing).
-fn decode_response(pattern: &sdm::Address) -> ResponseVerb {
-  let bytes = pattern.as_bytes();
-  let mut best = 0usize;
-  let mut best_score = i32::MIN;
-  for verb in 0..5 {
-    let mut score = 0i32;
-    for i in 0..8 {
-      let bit = verb * 8 + i;
-      let set = (bytes[bit / 8] >> (bit % 8)) & 1;
-      score += if set == 1 { 1 } else { -1 };
-    }
-    if score > best_score {
-      best = verb;
-      best_score = score;
-    }
-  }
-  ResponseVerb::from_str(match best {
-    0 => "freeze",
-    1 => "freeze_all",
-    2 => "quarantine_files",
-    3 => "alarm_human",
-    _ => "log_only",
-  })
-  .unwrap_or(ResponseVerb::LogOnly)
 }
 
 /// Read margin: the winning verb's counter sum vs the runner-up,
@@ -283,14 +252,14 @@ fn read_margin(matrix: &LocationMatrix, addr: &sdm::Address) -> (ResponseVerb, f
       continue;
     }
     written += 1;
-    for verb in 0..5 {
+    for (verb, sum) in sums.iter_mut().enumerate() {
       let mut score = 0i32;
       for i in 0..8 {
         let bit = verb * 8 + i;
         let set = (loc.counters[bit] > 0) as i32;
         score += if set == 1 { 1 } else { -1 };
       }
-      sums[verb] += score;
+      *sum += score;
     }
   }
   if written == 0 {
@@ -308,15 +277,7 @@ fn read_margin(matrix: &LocationMatrix, addr: &sdm::Address) -> (ResponseVerb, f
   }
   let max_possible = (written * 8) as f64;
   let margin = (sums[best] - sums[second]) as f64 / max_possible;
-  let verb = ResponseVerb::from_str(match best {
-    0 => "freeze",
-    1 => "freeze_all",
-    2 => "quarantine_files",
-    3 => "alarm_human",
-    _ => "log_only",
-  })
-  .unwrap_or(ResponseVerb::LogOnly);
-  (verb, margin.clamp(0.0, 1.0))
+  (ResponseVerb::from_index(best), margin.clamp(0.0, 1.0))
 }
 
 /// Encode a telemetry window into a 512-bit shape by HDC bundling:
@@ -328,12 +289,12 @@ pub fn encode_shape(events: &[impl AsRef<str>]) -> [u8; 64] {
   let mut votes = [0i32; 512];
   for ev in events {
     let h = blake3::hash(ev.as_ref().as_bytes());
-    for bit in 0..512 {
+    for (bit, v) in votes.iter_mut().enumerate() {
       let byte = h.as_bytes()[bit / 8 % 32];
       if (byte >> (bit % 8)) & 1 == 1 {
-        votes[bit] += 1;
+        *v += 1;
       } else {
-        votes[bit] -= 1;
+        *v -= 1;
       }
     }
   }

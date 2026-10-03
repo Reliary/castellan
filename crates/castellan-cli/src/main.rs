@@ -274,7 +274,7 @@ fn drill_req(args: &[String]) -> serde_json::Value {
   match args.first().map(|s| s.as_str()) {
     Some("run") => serde_json::json!({"op": "drill_run"}),
     Some("status") | None => serde_json::json!({"op": "drill_status"}),
-    Some(other) => {
+    Some(_other) => {
       eprintln!("usage: castellan drill [run|status]");
       std::process::exit(2);
     }
@@ -344,7 +344,7 @@ fn memory_req(args: &[String]) -> serde_json::Value {
       serde_json::json!({"op": "memory_recall", "session": session})
     }
     Some("status") | None => serde_json::json!({"op": "memory_status"}),
-    Some(other) => {
+    Some(_other) => {
       eprintln!("usage: castellan memory [recall <session>|status]");
       std::process::exit(2);
     }
@@ -550,7 +550,7 @@ fn allow_hosts_from_config(restrict: bool, explicit: &[String]) -> Vec<String> {
       Ok(cfgv) => {
         for h in cfgv.llm.unwrap_or(LlmHosts { hosts: Vec::new() }).hosts {
           let h = h.trim().to_string();
-          if !h.is_empty() && !hosts.iter().any(|e| *e == h) {
+          if !h.is_empty() && !hosts.contains(&h) {
             hosts.push(h);
           }
         }
@@ -1491,7 +1491,8 @@ fn render(line: &str) -> String {
               out.push_str(&format!("  pending {want} for {sess} (hint {hint}) — nonce in daemon journal\n"));
             }
           }
-        }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
+        }
+        if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
         let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
         let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
         let oob = cert.get("bounds").and_then(|b| b.get("out_of_bounds_attempts")).and_then(|x| x.as_u64()).unwrap_or(0);

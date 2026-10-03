@@ -2258,7 +2258,7 @@ mod tests {
   fn abstract_socket_denied() {
     // R4: abstract (leading NUL) and empty unix paths deny.
     let p = EgressPolicy::new();
-    let mut buf = vec![1u8, 0, 0, b'x'];
+    let buf = vec![1u8, 0, 0, b'x'];
     match parse_sockaddr(&buf).unwrap() {
       Sockaddr::Abstract => {}
       other => panic!("expected Abstract, got {other:?}"),

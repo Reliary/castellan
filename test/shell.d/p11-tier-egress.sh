@@ -29,6 +29,11 @@ export XDG_STATE_HOME="$W/state"
 mkdir -p "$XDG_STATE_HOME"
 SOCK="/run/user/$(id -u)/castellan.sock"
 unset CASTELLAN_EGRESS_ALLOW_HOSTS
+
+# R7: spawn is rate-limited to 10/min per project (fixed window, resets
+# 60s from window start; refused attempts do not extend it). This suite
+# fires 11+ launches on P0 inside one window — retry inside the pty.
+RL='rl(){ local e="$1"; shift; local n=0 o; while :; do o=$(env "$e" "$@" 2>&1); case "$o" in *"spawn rate limited"*) n=$((n+1)); [ $n -ge 15 ] && break; sleep 6.2;; *) printf "%s\n" "$o"; return 0;; esac; done; printf "%s\n" "$o"; return 1; };'
 export XDG_CONFIG_HOME="$W/config"
 mkdir -p "$XDG_CONFIG_HOME"
 
@@ -96,7 +101,7 @@ drive_low() {
   local proj="$1"
   for _ in 1 2 3 4 5; do
     mkproj "$proj"
-    SID=$(script -qec "XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' -- bash -c 'true' >/dev/null 2>&1; ls -t '$XDG_STATE_HOME/castellan/sessions'/*.json 2>/dev/null | head -1 | xargs basename | sed 's/\.json//'" /dev/null 2>/dev/null | tail -1 | tr -d '\r')
+    SID=$(script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' -- bash -c 'true' >/dev/null 2>&1; ls -t '$XDG_STATE_HOME/castellan/sessions'/*.json 2>/dev/null | head -1 | xargs basename | sed 's/\.json//'" /dev/null 2>/dev/null | tail -1 | tr -d '\r')
     [ -n "$SID" ] || return 1
     script -qec "XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' undo '$SID'" /dev/null >/dev/null 2>&1
   done
@@ -116,8 +121,8 @@ echo "== K1: declared LLM host stays reachable, agent is not bricked =="
 # use the machine's hostname to prove the allowlist path works end to end.
 ALLOWED=$(python3 -c "import socket;print(socket.gethostbyname(socket.gethostname()))" 2>/dev/null)
 mkproj "$P0"
-script -qec "
-  XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --allow-host '$ALLOWED' -- bash -c 'echo WORKED > out.txt'
+script -qec "$RL
+  rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --allow-host '$ALLOWED' -- bash -c 'echo WORKED > out.txt'
 " /dev/null >"$W/k1.out" 2>&1
 SID1=$(tr -d '\r' < "$W/k1.out" | grep -o 's[0-9a-f]\{12,\}' | head -1)
 # the floor forces undo, so the write lands in the session upper layer,
@@ -133,8 +138,8 @@ grep -q "egress restricted" "$W/k1.out" && ok "K1b: the launcher announced the e
 echo
 echo "== K2: with no declared host, public egress is denied =="
 mkproj "$P0"
-script -qec "
-  XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- python3 '$W/probe.py'
+script -qec "$RL
+  rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- python3 '$W/probe.py'
 " /dev/null >"$W/k2.out" 2>/dev/null
 K2=$(tr -d '\r' < "$W/k2.out" | grep -o 'tcp_public=E[0-9]*' | head -1)
 echo "  $K2"
@@ -143,8 +148,8 @@ echo "  $K2"
 echo
 echo "== K3: a warm project is untouched by the floor =="
 PW="$W/warm"; mkproj "$PW"
-SIDW=$(script -qec "
-  XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$PW' -- bash -c 'echo hi > $PW/w.txt'
+SIDW=$(script -qec "$RL
+  rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$PW' -- bash -c 'echo hi > $PW/w.txt'
 " /dev/null 2>"$W/k3.err" | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
 if grep -q "trust tier <= 1" "$W/k3.err"; then bad "K3: the floor fired on a cold/warm project"; else ok "K3: the floor did not fire on a non-low project"; fi
 if grep -q "egress restricted" "$W/k3.err"; then bad "K3b: egress was restricted on a non-low project"; else ok "K3b: egress unrestricted on a non-low project"; fi
@@ -162,8 +167,8 @@ echo "$AUD" | grep -q "udp *OPEN" && echo "$RES" | grep -q "udp *DENIED" \
 echo
 echo "== K4: a human egress grant lifts the floor for one launch =="
 mkproj "$P0"
-SIDG=$(script -qec "
-  XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'echo G > out.txt'
+SIDG=$(script -qec "$RL
+  rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'echo G > out.txt'
 " /dev/null 2>/dev/null | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
 # request (the agent may ask), then the human approves from the SAME terminal
 rpc "{\"op\":\"bless_request\",\"session\":\"${SIDG}\",\"want\":\"egress\",\"reason\":\"p11 test\"}" >/dev/null
@@ -181,12 +186,12 @@ if [ -n "$NONCE" ]; then
     || bad "K4a: approval failed: $(tail -2 "$W/k4b.out" | tr '\n' ' ')"
   # the next launch asks for and consumes the one-shot grant
   mkproj "$P0"
-  script -qec "XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --grant egress -- bash -c 'echo H > out.txt'" /dev/null >"$W/k4c.out" 2>&1
+  script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --grant egress -- bash -c 'echo H > out.txt'" /dev/null >"$W/k4c.out" 2>&1
   grep -q "consumed expansion grant" "$W/k4c.out" && ok "K4b: the launcher consumed the egress grant" \
     || bad "K4b: the grant was not consumed: $(grep -i 'grant\|tier' "$W/k4c.out" | tr '\n' ' ')"
   # and the one after it is floored again — the grant is one-shot
   mkproj "$P0"
-  script -qec "XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'true'" /dev/null >"$W/k4d.out" 2>&1
+  script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'true'" /dev/null >"$W/k4d.out" 2>&1
   grep -q "trust tier <= 1" "$W/k4d.out" && ok "K4c: the floor returns after the one-shot grant is spent" \
     || bad "K4c: the grant did not expire (floor still lifted): $(grep -i 'tier\|grant' "$W/k4d.out" | tr '\n' ' ')"
 else
@@ -195,8 +200,8 @@ fi
 
 echo
 echo "== K5b: broker denies reach the session spine =="
-SIDB=$(script -qec "
-  XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- python3 '$W/probe.py'
+SIDB=$(script -qec "$RL
+  rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- python3 '$W/probe.py'
 " /dev/null 2>/dev/null | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
 SPINE="$XDG_STATE_HOME/castellan/events/${SIDB}.jsonl"
 if [ -f "$SPINE" ] && grep -q "broker_deny" "$SPINE"; then

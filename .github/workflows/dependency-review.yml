@@ -1,0 +1,33 @@
+name: Dependency review
+
+on:
+  pull_request:
+
+# Posts the PR summary comment → needs pull-requests: write (hence the
+# SHA-pinned action under the privilege-bearing pinning rule).
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      # Precondition verified 2026-10-02: /dependency-graph/sbom returns
+      # 125 packages from this repo's Cargo.lock, so the dependency graph
+      # is active and cargo PR diffs are visible to this action (the
+      # cargo-blind failure mode the ci-audit plan flagged).
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          # Mirrors deny.toml's allow list plus NCSA. NCSA came from the
+          # first run's real finding: libfuzzer-sys (fuzz/Cargo.lock) is
+          # (MIT OR Apache-2.0) AND NCSA — OSI-approved, fuzz-only dev
+          # dependency, never in a release binary (cargo-deny does not
+          # see the fuzz workspace; this action scans every lockfile).
+          # deny.toml stays authoritative for shipped crates.
+          allow-licenses: >-
+            MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause,
+            BSD-3-Clause, ISC, Unicode-DFS-2016, Unicode-3.0, Zlib, CC0-1.0,
+            MPL-2.0, NCSA
+          comment-summary-in-pr: always

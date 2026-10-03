@@ -534,7 +534,7 @@ fn user_manager_pid() -> Option<u32> {
     };
     let Some(rest) = stat.rsplit_once(')') else { continue };
     let fields: Vec<&str> = rest.1.split_whitespace().collect();
-    let (Some(ppid), Some(state)) = (fields.get(1).and_then(|f| f.parse::<i32>().ok()), fields.get(0)) else {
+    let (Some(ppid), Some(state)) = (fields.get(1).and_then(|f| f.parse::<i32>().ok()), fields.first()) else {
       continue;
     };
     if ppid != 1 || *state != "S" {

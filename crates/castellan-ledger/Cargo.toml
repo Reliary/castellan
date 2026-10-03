@@ -2,6 +2,7 @@
 name = "castellan-ledger"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 castellan-core = { path = "../castellan-core" }

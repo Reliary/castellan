@@ -1,7 +1,7 @@
 use castellan_core::EventSink;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -40,7 +40,7 @@ fn getrandom_fill(buf: &mut [u8]) {
 /// NEVER overwrites an existing file (defensive: if this ever points at
 /// real user state, we must not destroy it).
 pub fn plant(session: &str, session_scratch: &Path) -> io::Result<Planted> {
-  let dir = session_scratch.join("canary");
+  let dir = session_scratch.join("dotfiles");
   std::fs::create_dir_all(&dir)?;
 
   let aws_key = format!("AKIA{}", rand_hex(10).to_uppercase());
@@ -52,7 +52,7 @@ pub fn plant(session: &str, session_scratch: &Path) -> io::Result<Planted> {
     "[default]\naws_access_key_id = {aws_key}\naws_secret_access_key = {aws_secret}\n"
   );
   let hosts_yml = format!(
-    "github.com:\n    oauth_token: {gh_token}\n    user: castellan-canary\n"
+    "github.com:\n    oauth_token: {gh_token}\n    user: dev-user\n"
   );
   let npmrc = format!("//registry.npmjs.org/:_authToken={npm_token}\n");
 
@@ -95,8 +95,11 @@ impl Honeypot {
   /// Bind on a kernel-assigned port and start the accept thread.
   /// Returns immediately; the thread runs for the daemon's lifetime.
   /// Previously-registered secrets are reloaded from
-  /// `<state_home>/castellan/canary.jsonl` — a daemon restart must not
-  /// silently disarm planted canaries (S0 audit fix).
+  /// `<state_home>/castellan/registry.jsonl` — a daemon restart must not
+  /// silently disarm planted canaries (S0 audit fix). The file was
+  /// renamed from `canary.jsonl` (P15 H2: the old name told any reader
+  /// which bytes were traps); a legacy file is migrated in place so
+  /// existing registrations survive the upgrade.
   pub fn start(state_home: &Path) -> io::Result<Self> {
     Self::start_with_callback(state_home, Arc::new(|_| {}))
   }
@@ -112,7 +115,11 @@ impl Honeypot {
     let secrets: Registry = Arc::new(Mutex::new(HashMap::new()));
     let sink_dir = state_home.to_path_buf();
     std::fs::create_dir_all(sink_dir.join("castellan"))?;
-    let ledger = sink_dir.join("castellan/canary.jsonl");
+    let ledger = sink_dir.join("castellan/registry.jsonl");
+    let legacy = sink_dir.join("castellan/canary.jsonl");
+    if !ledger.exists() && legacy.exists() {
+      let _ = std::fs::rename(&legacy, &ledger);
+    }
 
     for (secret, session) in load_canary_ledger(&ledger) {
       secrets.lock().unwrap().insert(secret, session);
@@ -192,6 +199,105 @@ impl Honeypot {
 /// connection this bounds both thread count and trickle-DoS hold time.
 const MAX_CONNS: usize = 16;
 
+/// Who opened the connection that carried a canary secret (P15 H1).
+/// Resolved from the LIVE client socket at accept time — by read-loop
+/// end the client has usually closed and the fd is gone.
+enum Sender {
+  /// A process inside a session scope: attribute the trip to it.
+  Session(String),
+  /// A pid with no session scope (daemon drill, proxy threads, human
+  /// shell): fall back to secret ownership — preserves the D2 contract.
+  NonSession,
+  /// Socket or pid unresolvable (fast-close race): freeze nobody.
+  Unknown,
+}
+
+fn parse_hex_port(addr_field: &str) -> Option<u16> {
+  addr_field.rsplit_once(':').and_then(|(_, p)| u16::from_str_radix(p, 16).ok())
+}
+
+fn find_pid_with_fd(target: &str) -> Option<u32> {
+  let entries = std::fs::read_dir("/proc").ok()?;
+  for e in entries.flatten() {
+    let name = e.file_name();
+    let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+      continue;
+    };
+    let Ok(fds) = std::fs::read_dir(e.path().join("fd")) else {
+      continue; // other-uid or vanished: not our candidate
+    };
+    for fd in fds.flatten() {
+      if let Ok(link) = std::fs::read_link(fd.path()) {
+        if link.to_string_lossy() == target {
+          return Some(pid);
+        }
+      }
+    }
+  }
+  None
+}
+
+/// Pure cgroup-string parse behind `session_scope_of` (P15 unit pin).
+///
+/// Requires a `.scope` component directly after `castellan.slice/`:
+/// a non-scope subdirectory must NOT fabricate a session id (the
+/// pre-P15-extract code split on `.scope` with no match and returned
+/// the whole remainder as a "sid").
+fn parse_session_scope(cgroup: &str) -> Option<String> {
+  let line = cgroup.lines().find(|l| l.contains("castellan.slice/"))?;
+  let after = line.split("castellan.slice/").nth(1)?;
+  let (sid, _) = after.split_once(".scope")?;
+  if sid.is_empty() || sid.contains('/') {
+    None
+  } else {
+    Some(sid.to_string())
+  }
+}
+
+fn session_scope_of(pid: u32) -> Option<String> {
+  let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+  parse_session_scope(&cg)
+}
+
+fn resolve_sender(stream: &TcpStream) -> Sender {
+  let (Ok(local), Ok(peer)) = (stream.local_addr(), stream.peer_addr()) else {
+    return Sender::Unknown;
+  };
+  let (SocketAddr::V4(local4), SocketAddr::V4(peer4)) = (local, peer) else {
+    return Sender::Unknown;
+  };
+  // The CLIENT's socket row: its local port is the ephemeral peer port,
+  // its remote port is ours. The server-side accepted row has the ports
+  // swapped and belongs to this honeypot thread, not the sender.
+  let (client_port, honeypot_port) = (peer4.port(), local4.port());
+  let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else {
+    return Sender::Unknown;
+  };
+  let mut inode: Option<u64> = None;
+  for line in tcp.lines().skip(1) {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() < 10 {
+      continue;
+    }
+    if let (Some(lp), Some(rp)) = (parse_hex_port(f[1]), parse_hex_port(f[2])) {
+      if lp == client_port && rp == honeypot_port {
+        inode = f[9].parse().ok();
+        break;
+      }
+    }
+  }
+  let Some(inode) = inode else {
+    return Sender::Unknown;
+  };
+  let Some(pid) = find_pid_with_fd(&format!("socket:[{inode}]")) else {
+    return Sender::Unknown;
+  };
+  match session_scope_of(pid) {
+    Some(sid) => Sender::Session(sid),
+    None => Sender::NonSession,
+  }
+}
+
 fn load_canary_ledger(ledger: &Path) -> Vec<(String, String)> {
   let Ok(content) = std::fs::read_to_string(ledger) else {
     return Vec::new();
@@ -211,6 +317,15 @@ fn load_canary_ledger(ledger: &Path) -> Vec<(String, String)> {
 }
 
 fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path, on_trip: &TripCallback) {
+  // P15 H1: attribute the SENDER before reading anything — the client
+  // fd is only guaranteed live at accept time (a fast-close may drop it
+  // before the read loop ends). Rules (frozen plan p15):
+  //   Session(s)  → trip/freeze/score s (kind canary_framing if s sent
+  //                 someone else's secret — sender pays, owner stays clean)
+  //   NonSession  → secret-owner attribution (daemon drill, human shell;
+  //                 proxy tunnels to this port are blocked at the proxy)
+  //   Unknown     → freeze nobody, owner spine records canary_unattributed
+  let sender = resolve_sender(&stream);
   let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
   // hard total deadline: a trickle-feeding client cannot hold this
   // connection (and its thread) beyond 5s regardless of read timing
@@ -225,36 +340,124 @@ fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path, on
       Ok(0) | Err(_) => break,
       Ok(n) => {
         total.extend_from_slice(&buf[..n]);
+        // respond fast so the client doesn't stall
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        // Evaluate on EVERY chunk, not after loop end: the hit used to
+        // wait for the read timeout (~2s), which made the D2 drill's
+        // 300ms spine check miss a trip that did fire (pre-existing
+        // timing bug, negative-controlled against pre-P15). "Using IS
+        // the trigger" now freezes at first sight.
+        let haystack = String::from_utf8_lossy(&total);
+        let hit: Option<(String, String)> = {
+          let reg = registry.lock().unwrap();
+          reg
+            .iter()
+            .find(|(secret, _)| haystack.contains(secret.as_str()))
+            .map(|(s, sess)| (s.clone(), sess.clone()))
+        };
+        if let Some((secret, owner)) = hit {
+          dispatch_trip(&sender, &owner, &secret, state_home, on_trip);
+          let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+          return;
+        }
         if total.len() > 1 << 20 {
           break;
         }
-        // respond fast so the client doesn't stall
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
       }
     }
   }
-  let haystack = String::from_utf8_lossy(&total);
-  let hit: Option<(String, String)> = {
-    let reg = registry.lock().unwrap();
-    reg
-      .iter()
-      .find(|(secret, _)| haystack.contains(secret.as_str()))
-      .map(|(s, sess)| (s.clone(), sess.clone()))
-  };
-  if let Some((secret, session)) = hit {
-    eprintln!(
-      "castellan-canary: TRIP — canary credential used by session {session}"
-    );
-    log_trip(state_home, &session, &secret);
-    freeze_session(&session);
-    on_trip(&session);
-    let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+}
+
+/// Why the plan came out the way it did — wording only, the decision
+/// lives in `trip_plan`.
+#[derive(Debug, PartialEq, Eq)]
+enum TripReason {
+  /// The sender IS a session and the fd mapped.
+  SessionSender,
+  /// Sender resolved but holds no session scope (drill, human shell).
+  NonSessionSender,
+  /// Fast-close race: socket or pid unresolvable.
+  Unattributable,
+}
+
+/// The pure attribution decision for a honeypot hit (P15 C40a),
+/// split out of `dispatch_trip` so the four-row table is unit-pinnable
+/// without touching cgroups, the spine, or trust.
+#[derive(Debug, PartialEq, Eq)]
+struct TripPlan {
+  /// Session whose spine records the event (sender for Act-on-session,
+  /// owner for non-session/unattributed).
+  session: String,
+  /// Spine/trust event kind — `canary_trip`, `canary_framing`,
+  /// `canary_unattributed`.
+  kind: &'static str,
+  /// Freeze + trust signal. False only for the unattributable case:
+  /// freezing the owner there would re-enable framing via send+close.
+  freeze: bool,
+  reason: TripReason,
+}
+
+fn trip_plan(sender: &Sender, owner: &str) -> TripPlan {
+  match *sender {
+    // Sender-session attribution: the SENDER pays. A session sending
+    // another session's secret is canary_framing — owner stays clean.
+    Sender::Session(ref s) => {
+      let framing = s != owner;
+      TripPlan {
+        session: s.clone(),
+        kind: if framing { "canary_framing" } else { "canary_trip" },
+        freeze: true,
+        reason: TripReason::SessionSender,
+      }
+    }
+    // Non-session sender (daemon drill / human shell): fall back to
+    // secret ownership — preserves the D2 drill contract.
+    Sender::NonSession => TripPlan {
+      session: owner.to_string(),
+      kind: "canary_trip",
+      freeze: true,
+      reason: TripReason::NonSessionSender,
+    },
+    // Evidence without accusation: record on the owner spine, freeze
+    // nobody.
+    Sender::Unknown => TripPlan {
+      session: owner.to_string(),
+      kind: "canary_unattributed",
+      freeze: false,
+      reason: TripReason::Unattributable,
+    },
   }
 }
 
-fn log_trip(state_home: &Path, session: &str, secret: &str) {
+fn dispatch_trip(sender: &Sender, owner: &str, secret: &str, state_home: &Path, on_trip: &TripCallback) {
+  let plan = trip_plan(sender, owner);
+  let note = match plan.reason {
+    TripReason::SessionSender => format!(
+      "session {} sent a canary registered to {owner}",
+      plan.session
+    ),
+    TripReason::NonSessionSender => format!(
+      "canary credential used by session {} (non-session sender)",
+      plan.session
+    ),
+    TripReason::Unattributable => format!(
+      "canary used by unresolvable sender (fast-close) — owner {} recorded, no freeze",
+      plan.session
+    ),
+  };
+  log_trip(state_home, &plan.session, secret, plan.kind);
+  if plan.freeze {
+    eprintln!("castellan-canary: TRIP — {}: {note}", plan.kind);
+    freeze_session(&plan.session);
+    on_trip(&plan.session);
+  } else {
+    eprintln!("castellan-canary: {note}");
+  }
+}
+
+fn log_trip(state_home: &Path, session: &str, secret: &str, kind: &str) {
   if let Ok(sink) = EventSink::for_session(state_home, session) {
-    let _ = sink.emit("canary_trip", &format!("secret_prefix={}", &secret[..secret.len().min(8)]), "frozen");
+    let _ = sink.emit(kind, &format!("secret_prefix={}", &secret[..secret.len().min(8)]), "frozen");
   }
 }
 
@@ -296,7 +499,7 @@ mod tests {
   fn ledger_reload_skips_malformed_lines() {
     let state = temp_state("malformed");
     std::fs::create_dir_all(state.join("castellan")).unwrap();
-    let ledger = state.join("castellan/canary.jsonl");
+    let ledger = state.join("castellan/registry.jsonl");
     std::fs::write(
       &ledger,
       "{\"secret\":\"ghp_good\",\"session\":\"s1\"}\nnot json at all\n{\"secret\":\"npm_also_good\",\"session\":\"s2\"}\n",
@@ -308,9 +511,94 @@ mod tests {
   }
 
   #[test]
+  fn legacy_canary_ledger_is_migrated() {
+    // P15 H2: the ledger was renamed canary.jsonl → registry.jsonl; a
+    // daemon restart on an old state dir must still arm the old
+    // registrations (S0), not silently disarm them.
+    let state = temp_state("legacy");
+    std::fs::create_dir_all(state.join("castellan")).unwrap();
+    std::fs::write(
+      state.join("castellan/canary.jsonl"),
+      "{\"secret\":\"ghp_legacy\",\"session\":\"old\"}\n",
+    )
+    .unwrap();
+    let hp = Honeypot::start(&state).unwrap();
+    assert_eq!(hp.secret_count(), 1, "legacy registrations must be migrated");
+    assert!(
+      state.join("castellan/registry.jsonl").exists(),
+      "legacy file must be renamed in place"
+    );
+    assert!(
+      !state.join("castellan/canary.jsonl").exists(),
+      "old self-labeling filename must not remain"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+  }
+
+  #[test]
   fn detached_registers_without_ledger() {
     let hp = Honeypot::detached();
     hp.register(&CanarySecret { value: "x".into(), session: "s".into() });
     assert_eq!(hp.secret_count(), 1);
+  }
+
+  // P15 unit pin: cgroup-line → session id. The No-scope/no-sid rows
+  // are the harden (the pre-extract split(".scope").next() returned the
+  // whole remainder as a "sid" when ".scope" was absent).
+  #[test]
+  fn session_scope_parse_fixtures() {
+    let ok = |cg: &str| parse_session_scope(cg);
+    assert_eq!(
+      ok("0::/user.slice/user-1000.slice/user@1000.service/castellan.slice/s18abcdef.scope\n").as_deref(),
+      Some("s18abcdef")
+    );
+    assert_eq!(
+      ok("0::/user.slice/user-1000.slice/user@1000.service/castellan.slice/s18abcdef.scope/child.scope\n").as_deref(),
+      Some("s18abcdef")
+    );
+    assert_eq!(ok("0::/user.slice/user-1000.slice/user@1000.service\n"), None);
+    assert_eq!(ok("0::/user.slice/castellan.slice/"), None);
+    assert_eq!(ok("0::/user.slice/castellan.slice/not-a-scope-dir\n"), None);
+    assert_eq!(ok("0::/user.slice/castellan.slice/a/b.scope\n"), None);
+    assert_eq!(ok(""), None);
+  }
+
+  // P15 unit pin: the four-row attribution table. A regression that
+  // freezes the owner when a sender-session resolved is the cross-
+  // session framing bug C40a — row 2 is the regression lock.
+  #[test]
+  fn trip_dispatch_attribution_table() {
+    let owner = "sOWNER";
+
+    let p = trip_plan(&Sender::Session(owner.to_string()), owner);
+    assert_eq!(p.session, owner);
+    assert_eq!(p.kind, "canary_trip");
+    assert!(p.freeze);
+
+    let p = trip_plan(&Sender::Session("sATTACKER".into()), owner);
+    assert_eq!(p.session, "sATTACKER");
+    assert_eq!(p.kind, "canary_framing");
+    assert!(p.freeze, "the SENDER must be frozen, not the owner");
+
+    let p = trip_plan(&Sender::NonSession, owner);
+    assert_eq!(p.session, owner);
+    assert_eq!(p.kind, "canary_trip");
+    assert!(p.freeze, "D2 drill contract: non-session falls back to owner");
+
+    let p = trip_plan(&Sender::Unknown, owner);
+    assert_eq!(p.session, owner);
+    assert_eq!(p.kind, "canary_unattributed");
+    assert!(!p.freeze, "owner-freeze would re-enable send+close framing");
+  }
+}
+
+#[cfg(feature = "fuzz")]
+pub mod fuzz_api {
+  pub fn load_ledger_bytes(bytes: &[u8]) {
+    let path = std::env::temp_dir().join(format!("castellan-fuzz-ledger-{}", std::process::id()));
+    if std::fs::write(&path, bytes).is_ok() {
+      let _ = super::load_canary_ledger(&path);
+      let _ = std::fs::remove_file(&path);
+    }
   }
 }

@@ -24,7 +24,6 @@
 
 use castellan_core::EventSink;
 use castellan_policy::{Op, Policy, Verdict};
-use castellan_replay::ReplayOutcome;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -106,11 +105,10 @@ pub fn kept_sessions(trust: &castellan_trust::TrustDb, project: &Path) -> Vec<St
   let mut out: Vec<String> = Vec::new();
   for ev in events {
     match ev.signal {
-      castellan_trust::Signal::CleanSession | castellan_trust::Signal::ProofPassed => {
-        if !out.contains(&ev.session) {
+      castellan_trust::Signal::CleanSession | castellan_trust::Signal::ProofPassed
+        if !out.contains(&ev.session) => {
           out.push(ev.session);
         }
-      }
       _ => {}
     }
   }

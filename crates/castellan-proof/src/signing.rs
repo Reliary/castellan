@@ -20,7 +20,7 @@
 //! non-repudiation against a same-uid adversary with kernel-level
 //! access. Residual risks are in THREAT_MODEL.md (C9/C32).
 
-use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey as DalekKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// A detached signature over a certificate's canonical bytes.
@@ -43,7 +43,7 @@ pub const SIGN_SCOPE: &str =
 
 /// An ed25519 signing key held only in process memory.
 pub struct SigningKey {
-  keypair: Keypair,
+  key: DalekKey,
 }
 
 impl SigningKey {
@@ -56,9 +56,7 @@ impl SigningKey {
         .map_err(|e| format!("open /dev/urandom: {e}"))?;
       f.read_exact(&mut seed).map_err(|e| format!("read entropy: {e}"))?;
     }
-    let secret = SecretKey::from_bytes(&seed).map_err(|e| format!("secret key: {e}"))?;
-    let public: PublicKey = (&secret).into();
-    Ok(Self { keypair: Keypair { secret, public } })
+    Ok(Self { key: DalekKey::from_bytes(&seed) })
   }
 
   /// Make this process and its children non-dumpable and disable core
@@ -81,12 +79,12 @@ impl SigningKey {
   }
 
   pub fn public_hex(&self) -> String {
-    self.keypair.public.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    self.key.verifying_key().as_bytes().iter().map(|b| format!("{b:02x}")).collect()
   }
 
   /// Sign canonical bytes, returning the detached signature artifact.
   pub fn sign(&self, msg: &[u8]) -> CertSignature {
-    let sig: Signature = self.keypair.sign(msg);
+    let sig: Signature = self.key.sign(msg);
     CertSignature {
       public_key: self.public_hex(),
       signature: sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect(),
@@ -111,15 +109,16 @@ pub fn verify(
   }
   let pk_bytes = hex_decode(&sig.public_key).ok_or("malformed public key hex")?;
   let pk_arr: [u8; 32] = pk_bytes.try_into().map_err(|_| "public key must be 32 bytes")?;
-  let public = PublicKey::from_bytes(&pk_arr).map_err(|e| format!("public key: {e}"))?;
+  let public = VerifyingKey::from_bytes(&pk_arr).map_err(|e| format!("public key: {e}"))?;
   let sg_bytes = hex_decode(&sig.signature).ok_or("malformed signature hex")?;
   let sg_arr: [u8; 64] = sg_bytes.try_into().map_err(|_| "signature must be 64 bytes")?;
-  let signature = Signature::from_bytes(&sg_arr).map_err(|e| format!("signature: {e}"))?;
+  let signature =
+    Signature::try_from(&sg_arr[..]).map_err(|e| format!("signature: {e}"))?;
   public.verify(msg, &signature).map_err(|_| "signature verification failed".to_string())
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-  if s.len() % 2 != 0 {
+  if !s.len().is_multiple_of(2) {
     return None;
   }
   (0..s.len())

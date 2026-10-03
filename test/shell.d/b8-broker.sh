@@ -83,7 +83,7 @@ except OSError:
 else:
     print("UNIX_OK")
 
-# No over-block: loopback TCP.
+# No over-block: loopback TCP (non-ssh ports).
 t = socket.socket(); t.settimeout(2)
 try:
     t.connect(("127.0.0.1", 9))
@@ -91,6 +91,29 @@ except PermissionError:
     print("LOOP_DENIED")
 except OSError:
     print("LOOP_OK")
+
+# P13 E-a: loopback ssh under the DEFAULT posture (no --net flags). The
+# first fix scoped the deny to with_llm_only, so this launch connected
+# to 127.0.0.1:22 live (probed 2026-09-30). Escape channels now deny in
+# EgressPolicy::new(); assert the flip here, not just under --net-restrict.
+#
+# P13 ninja F5: ONLY PermissionError (seccomp EPERM) proves the broker
+# denied. ECONNREFUSED (SSH22_OTHER) means the connect EXECUTED and the
+# kernel found nothing listening — i.e. the broker allowed it; accepting
+# it made the assertion vacuous on hosts without sshd. CONNECTED is the
+# same failure with sshd present.
+for port in (22, 2222, 2200):
+    s = socket.socket(); s.settimeout(2)
+    try:
+        s.connect(("127.0.0.1", port))
+    except PermissionError:
+        print("SSH22_DENIED_%d" % port)
+    except OSError:
+        print("SSH22_OTHER_%d" % port)
+    else:
+        print("SSH22_CONNECTED_%d" % port)
+    finally:
+        s.close()
 
 # No over-block: git must still work.
 import shutil
@@ -115,6 +138,19 @@ grep -q ROUTE2_BLOCKED "$WORK/t4.out" && ok "route 2 (session bus StartTransient
 grep -q UNIX_OK "$WORK/t4.out" && ok "ordinary unix socket still allowed" || bad "ordinary unix socket wrongly denied"
 grep -q LOOP_OK "$WORK/t4.out" && ok "loopback TCP still allowed" || bad "loopback TCP wrongly denied"
 grep -q GIT_OK "$WORK/t4.out" && ok "git workflow survives" || bad "git broken"
+# P13 E-a: default posture must deny loopback ssh (escape channels deny
+# by default). P13 ninja F5: ONLY SSH22_DENIED (PermissionError =
+# seccomp EPERM) counts. SSH22_OTHER is ECONNREFUSED — the connect
+# EXECUTED (broker allowed it) and only then found no listener; on a
+# host WITH sshd it would be CONNECTED. Accepting OTHER made this
+# vacuous exactly where sshd is absent.
+for port in 22 2222 2200; do
+  if grep -q "SSH22_DENIED_$port" "$WORK/t4.out"; then
+    ok "default posture denies loopback ssh 127.0.0.1:$port"
+  else
+    bad "default posture left loopback ssh 127.0.0.1:$port open — sshd-child escape works ($(grep "SSH22_" "$WORK/t4.out" | tr '\n' ' '))"
+  fi
+done
 # A launched unit would leave a job on the manager; assert none.
 if systemctl --user is-active castellan-esc-accept.service >/dev/null 2>&1; then
   bad "escaped transient unit is active"
@@ -124,7 +160,13 @@ else
 fi
 [[ -n "$SID" ]] && "$BIN/castellan" kill "$SID" >/dev/null 2>&1
 
-# ---- --net: destination-scoped egress -----------------------------
+# ---- --net: destination-scoped egress restriction -----------------------------
+# NOTE on mechanisms: `--net` is Landlock port-scoped (Loopback ports =
+# [honeypot, proxy]), so 127.0.0.1:22 dies at LANDLOCK here, not at the
+# broker. The broker ssh deny (loopback-ssh) applies under --net-restrict
+# (with_llm_only). Both layers must deny; the suite asserts each under
+# its own flag so a regression in either layer goes red with the layer
+# named in the failure.
 echo "== --net: destination-scoped egress restriction =="
 cat > "$WORK/net.py" <<'PY'
 import socket
@@ -135,12 +177,64 @@ except PermissionError:
     print("PUB_DENIED")
 except OSError as e:
     print("PUB_OTHER:%s" % e.errno)
+# HN ssh-localhost escape under --net (Landlock layer): port 22 is not
+# in [honeypot, proxy], so Landlock denies with EPERM.
+for port in (22, 2222, 2200):
+    t = socket.socket(); t.settimeout(2)
+    try:
+        t.connect(("127.0.0.1", port))
+    except PermissionError:
+        print("SSH_DENIED_%d" % port)
+    except OSError:
+        print("SSH_OTHER_%d" % port)
+    else:
+        print("SSH_CONNECTED_%d" % port)
+    finally:
+        t.close()
 PY
 "$BIN/castellan" launch --harness claude --project "$WORK/proj" --enforce --net \
   -- python3 "$WORK/net.py" > "$WORK/net.out" 2>"$WORK/net.err"
 SID2=$(grep -o 's[0-9a-f]\{10,\}' "$WORK/net.err" | head -1)
 grep -q PUB_DENIED "$WORK/net.out" && ok "--net denies public TCP by destination" || { bad "--net did not deny public TCP"; grep PUB "$WORK/net.out"; }
+for port in 22 2222 2200; do
+  grep -q "SSH_DENIED_$port" "$WORK/net.out" && ok "--net (Landlock) denies loopback ssh 127.0.0.1:$port" || { bad "--net left loopback ssh 127.0.0.1:$port open"; grep SSH "$WORK/net.out"; }
+done
 [[ -n "$SID2" ]] && "$BIN/castellan" kill "$SID2" >/dev/null 2>&1
+
+echo "== --net-restrict: broker loopback-ssh deny =="
+cat > "$WORK/nr.py" <<'PY'
+import socket
+# Same ssh probes, now under the broker destination policy (with_llm_only).
+# Landlock is Open here, so a deny is PROOF the broker's loopback-ssh rule fired.
+for port in (22, 2222, 2200):
+    t = socket.socket(); t.settimeout(2)
+    try:
+        t.connect(("127.0.0.1", port))
+    except PermissionError:
+        print("NR_SSH_DENIED_%d" % port)
+    except OSError:
+        print("NR_SSH_OTHER_%d" % port)
+    else:
+        print("NR_SSH_CONNECTED_%d" % port)
+    finally:
+        t.close()
+# Honeypot-adjacent loopback must survive (no over-block).
+t = socket.socket(); t.settimeout(2)
+try:
+    t.connect(("127.0.0.1", 9))
+except PermissionError:
+    print("NR_LOOP_DENIED")
+except OSError:
+    print("NR_LOOP_OK")
+PY
+"$BIN/castellan" launch --harness claude --project "$WORK/proj" --enforce --net-restrict \
+  -- python3 "$WORK/nr.py" > "$WORK/nr.out" 2>"$WORK/nr.err"
+SID3=$(grep -o 's[0-9a-f]\{10,\}' "$WORK/nr.err" | head -1)
+for port in 22 2222 2200; do
+  grep -q "NR_SSH_DENIED_$port" "$WORK/nr.out" && ok "--net-restrict (broker) denies loopback ssh 127.0.0.1:$port" || { bad "--net-restrict left loopback ssh 127.0.0.1:$port open — sshd-child escape works"; grep NR_SSH "$WORK/nr.out"; }
+done
+grep -q NR_LOOP_OK "$WORK/nr.out" && ok "--net-restrict leaves non-ssh loopback alone" || { bad "--net-restrict over-blocked loopback"; grep NR_LOOP "$WORK/nr.out"; }
+[[ -n "$SID3" ]] && "$BIN/castellan" kill "$SID3" >/dev/null 2>&1
 
 echo "== SUMMARY =="
 echo "  PASS=$PASS FAIL=$FAIL"

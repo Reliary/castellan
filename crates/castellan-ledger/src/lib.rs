@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -105,7 +105,7 @@ fn spawn_map_helper(
       std::process::exit(0);
     }
     Ok(ForkResult::Parent { child }) => Ok(u32::try_from(child.as_raw()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?),
-    Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+    Err(e) => Err(io::Error::other(e)),
   }
 }
 
@@ -220,7 +220,7 @@ pub fn discard(upper: &Path, work: &Path) -> io::Result<()> {
     if d.exists() {
       // overlayfs drops a mode-000 work/work/ subdir while the mount is
       // live; after session exit it blocks remove_dir_all with EACCES
-      // (owner john, no +x on the dir — found via the V3 corpus: every
+      // (owner test-user, no +x on the dir — found via the V3 corpus: every
       // undo (discard) failed). Restore traversal perms first.
       let _ = std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o755));
       let mut stack = vec![d.to_path_buf()];

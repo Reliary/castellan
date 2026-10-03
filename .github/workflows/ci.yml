@@ -2,11 +2,19 @@ name: ci
 
 on:
   push:
-    branches: [main, quattro]
+    branches: [main, quattro, diff-trust]
   pull_request:
+
+# Rapid push series shouldn't burn runner minutes on superseded runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 # test/shell.d/*.sh acceptance suites require a real user cgroup slice
 # (user@UID.service under systemd) and run on dev machines only, not CI.
@@ -15,22 +23,78 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
+      - run: cargo build --workspace --all-targets
+      # No `cargo fmt` gate: the repo style is 2-space (AGENTS.md) with no
+      # rustfmt.toml, so rustfmt default (4-space) would rewrite 46 files.
+      # clippy -D warnings is the style gate.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: no openssl-sys (cross-compile sanity)
+        run: |
+          if cargo tree -e normal 2>/dev/null | grep -q "openssl-sys"; then
+            echo "openssl-sys blocks ARM/static builds"; exit 1; fi
+      - name: no sqlite runtime DBs or image binaries committed
+        run: |
+          if git ls-files | grep -qE '\.sqlite(-journal|-shm|-wal)?$'; then echo "SQLite runtime DBs committed"; exit 1; fi
+          if git ls-files | grep -qE '\.(jpe?g|png|gif|bmp|ico)$'; then echo "Binary images committed"; exit 1; fi
+          echo "artifact check ok"
 
   release-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
+
+  # Cross-architecture compile sanity. Castellan is Linux-only
+  # (Landlock/seccomp/cgroup), so the matrix is Linux targets only:
+  # x86_64 check + aarch64 cross-compile via gcc-aarch64. No macOS/
+  # Windows (kernel primitives do not exist there — honestly scoped).
+  cross-arch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross linker
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - run: cargo check --workspace --target x86_64-unknown-linux-gnu
+      # aarch64 uses the bundled-sqlite path (no system linker sqlite);
+      # the build-script needs the cross CC, installed above. If the
+      # cross toolchain drifts, this job goes red — that IS the signal.
+      - run: cargo check --workspace --target aarch64-unknown-linux-gnu
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tools
+        # No `|| true`: a failed install must be visible here rather than
+        # surfacing later as a confusing "command not found".
+        run: cargo install cargo-audit cargo-deny --locked
+      # No pipes without pipefail: `cmd 2>&1 | tail` masks the exit code
+      # and a compromised dependency would pass CI silently. Each check
+      # tees to a log AND fails the step on advisories/bans/violations.
+      # No --ignore flags as of 2026-10-03: the ed25519-dalek v2 upgrade
+      # (2.2.0 / curve25519-dalek 4.1.3 / rand gone) retired the last
+      # three RUSTSEC ids. Mirroring rule stands: any deny.toml ignore
+      # must appear here too (cargo-audit does not read deny.toml).
+      - name: cargo audit (blocking)
+        run: cargo audit --deny warnings
+      - name: cargo deny advisories (blocking)
+        run: cargo deny check advisories
+      - name: cargo deny bans+licenses+sources (blocking)
+        run: cargo deny check bans licenses sources
 
   # Kernel-drift gate for the seccomp denylist.
   #
@@ -46,11 +110,17 @@ jobs:
   syscall-drift:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p castellan-envelope --example syscall-classes
       - run: bash test/syscall-drift.sh
+      # P14: the gate's own Koch criterion. This was silently broken —
+      # the injections referenced mutation files that are not in the
+      # repo, so it reported "mutation did not apply" and never ran while
+      # the docs cited it as 5/5. It is now self-contained; run it so a
+      # future regression in the gate itself is a red build.
+      - run: bash test/syscall-drift-selftest.sh
 
   # Workload-syscall probe.
   #
@@ -63,8 +133,127 @@ jobs:
   workload-syscalls:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p castellan-envelope --example syscall-probe
       - run: python3 test/workload-syscalls.py
+
+  # diff-trust gate (A+B): structural blast + scope-creep.
+  #
+  # A is only safe to ship if sig_name precision on real touched files
+  # stays >= 0.80 and caller-count agrees with rg ground truth within
+  # 20%; B is only safe if clean-session false-positive stays at zero
+  # on the fixture corpus. This re-derives both on every run from the
+  # repo's own sources (no fixture files to rot — the corpus IS the
+  # repo). Cert latency is bounded so the keep path cannot regress
+  # into a slow gate.
+  diff-trust-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # No pipe (F4 rule): `| tail` would mask a structural-test failure —
+      # this step's own exit code is the signal the python gates cannot
+      # replace (they re-derive behavior, not test-suite health).
+      - run: cargo test -p castellan-proof structural
+      - name: sig_name precision on repo sources
+        run: python3 test/diff-trust-gate.py --check precision --min 0.80
+      - name: caller-count agreement vs rg ground truth
+        run: python3 test/diff-trust-gate.py --check callers --max-disagree 0.20
+      - name: cert assembly latency bound
+        run: python3 test/diff-trust-gate.py --check latency --max-ms 2000
+
+  # ssh/deputy/system-bus escape regressions (P13 C37): the b8 shell
+  # suite asserts all three live (needs a cgroup slice, dev-box only), so
+  # CI pins the same rules at unit level — if `new()` ever stops denying
+  # loopback ssh, docker.sock, or the system bus, CI goes red even
+  # though b8 never runs there. E-d (TCP control plane) was refuted by
+  # code: the daemon binds only a unix socket.
+  escape-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # P13 ninja F4: NO pipes and NO filters. A pipe (`| tail`) under
+      # GitHub's default `bash -e` returns tail's exit code — a failing
+      # test would pass CI silently (the same hazard this repo's
+      # supply-chain job documents at its own no-pipes comment). A
+      # zero-match filter exits 0 with "0 tests run", so a renamed test
+      # would also pass vacuously. One unpiped full-crate run has
+      # neither failure mode.
+      - name: broker suite (arch/x32 gates, escape ports, unix resolution)
+        run: cargo test -p castellan-broker
+
+      # P14: the envelope denylist must block every Hard-class MEMBER, not
+      # just the class's own consts (this is the check whose absence let
+      # fsopen/pidfd_getfd run free). The drift gate (syscall-drift job)
+      # now covers this against the running kernel; this unpiped crate run
+      # keeps the Rust invariant in the escape-regression job too.
+      - name: envelope suite (Hard-member closure, arch/x32, drift table)
+        run: cargo test -p castellan-envelope
+
+  # Workflow-structure lint (borrowed from reliary-agent). Local v1.7.7
+  # run: clean, so it gates per the ci-audit kill criterion (blocking only
+  # if clean at first run). -shellcheck=/-pyflakes= pin the integrations
+  # OFF so this job's result depends only on workflow YAML, not on which
+  # extras the runner happens to ship; shellcheck itself is report-only
+  # below.
+  lint-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install actionlint (pinned)
+        run: |
+          curl -sL "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz" \
+            | tar -xz -C /tmp actionlint
+          /tmp/actionlint --version
+      - name: actionlint
+        run: /tmp/actionlint -shellcheck= -pyflakes= -oneline
+
+  # Report-only: 239 findings at default severity against pre-existing
+  # suite style — gating on that floods PRs with debt. The error class is
+  # kept at zero manually (the one historical error, SC2145 in
+  # p12-proxy.sh launch_env, was a real bug and got fixed); this step's
+  # job is to keep the report visible without gating.
+  shellcheck-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install shellcheck (pinned)
+        run: |
+          curl -sL "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz" \
+            | tar -xJ -C /tmp
+      - name: shellcheck (all severities, not gating)
+        if: always()
+        continue-on-error: true
+        run: |
+          /tmp/shellcheck-v0.10.0/shellcheck -f gcc test/shell.d/*.sh test/*.sh || true
+      - name: error-severity must stay at zero
+        run: |
+          n=$(/tmp/shellcheck-v0.10.0/shellcheck -S error -f gcc test/shell.d/*.sh test/*.sh | wc -l)
+          echo "error-severity findings: $n"
+          [ "$n" -eq 0 ]
+
+  # Test-count ratchet (reliary8 pattern). 214 measured 2026-10-03
+  # (+3 P17 family pins; floor was 211 on 2026-10-02).
+  # A drop means suites/tests disappeared — bump the floor deliberately
+  # in the same PR that removes a test, never silently.
+  test-ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests (fail the job on failure, unpiped)
+        run: |
+          cargo test --workspace > test.log 2>&1 || { cat test.log; exit 1; }
+          grep -E 'test result:' test.log || true
+      - name: Assert count >= floor
+        run: |
+          FLOOR=214
+          total=$(awk '/test result:/{for(i=1;i<=NF;i++) if($i ~ /^passed/) s+=$(i-1)} END{print s+0}' test.log)
+          echo "workspace tests: $total (floor $FLOOR)"
+          [ "$total" -ge "$FLOOR" ]

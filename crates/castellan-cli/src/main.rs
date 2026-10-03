@@ -274,7 +274,7 @@ fn drill_req(args: &[String]) -> serde_json::Value {
   match args.first().map(|s| s.as_str()) {
     Some("run") => serde_json::json!({"op": "drill_run"}),
     Some("status") | None => serde_json::json!({"op": "drill_status"}),
-    Some(other) => {
+    Some(_other) => {
       eprintln!("usage: castellan drill [run|status]");
       std::process::exit(2);
     }
@@ -344,7 +344,7 @@ fn memory_req(args: &[String]) -> serde_json::Value {
       serde_json::json!({"op": "memory_recall", "session": session})
     }
     Some("status") | None => serde_json::json!({"op": "memory_status"}),
-    Some(other) => {
+    Some(_other) => {
       eprintln!("usage: castellan memory [recall <session>|status]");
       std::process::exit(2);
     }
@@ -550,7 +550,7 @@ fn allow_hosts_from_config(restrict: bool, explicit: &[String]) -> Vec<String> {
       Ok(cfgv) => {
         for h in cfgv.llm.unwrap_or(LlmHosts { hosts: Vec::new() }).hosts {
           let h = h.trim().to_string();
-          if !h.is_empty() && !hosts.iter().any(|e| *e == h) {
+          if !h.is_empty() && !hosts.contains(&h) {
             hosts.push(h);
           }
         }
@@ -708,6 +708,36 @@ fn launch(args: &[String], sock: &str) -> ! {
   };
   if !consumed.is_empty() {
     eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
+  }
+  // P13 E-h/E-e advisories: the envelope cannot fix either (host-config
+  // facts, not kernel gaps), so they surface where the other forced-
+  // posture warnings already print. Both are within steelman tolerance —
+  // advisory only, never a launch block.
+  if enforce {
+    let proj = std::fs::canonicalize(&project).unwrap_or_else(|_| project.clone());
+    if let Ok(home) = std::env::var("HOME") {
+      let home = std::fs::canonicalize(&home).unwrap_or_else(|_| std::path::PathBuf::from(home));
+      // An ancestor project (project==HOME, or project=/) puts shell rc,
+      // .ssh/authorized_keys and .git/hooks inside the write roots —
+      // deferred execution outside the session when the human's own
+      // tooling runs them next.
+      if home.starts_with(&proj) {
+        eprintln!(
+          "castellan: WARNING: project {} contains $HOME — agent writes reach shell rc/.ssh/.git-hooks (P13 E-h)",
+          proj.display()
+        );
+      }
+    }
+    // E-e: NOPASSWD sudo makes the uid boundary decorative — one exec
+    // from the session is root. P13 ninja F9 hardening: stdin severed
+    // (never inherit the launch tty), 1s hard timeout (sudo can block
+    // in PAM/NSS), and the RESULT is cached for 24h so a password-
+    // required host logs one sudo line per day, not per launch.
+    if sudo_nopasswd_cached() {
+      eprintln!(
+        "castellan: WARNING: `sudo -n` succeeds (NOPASSWD) — session uid boundary does not imply unprivileged (P13 E-e)"
+      );
+    }
   }
   // P12: point the session at its egress proxy. The CA bundle the
   // session trusts is daemon-minted per session (system roots +
@@ -938,6 +968,22 @@ fn launch(args: &[String], sock: &str) -> ! {
   // the agent; the agent inherits the notif filter and then applies the
   // envelope. On spawn failure we fall through to a plain exec (honest
   // degradation — the envelope still applies).
+  //
+  // P13 ninja F12: PLAIN audit mode (--no-enforce without an explicit
+  // destination policy) must not install the filter at all — the banner
+  // above promises "observation only, no containment", and every broker
+  // deny (escape ports, systemd, buses, deputies) is containment.
+  // WOULD-DENY writes are recorded daemon-side by the AuditWatcher,
+  // which never needed the broker; with a permissive policy the broker
+  // would record nothing anyway and cost a notification round-trip per
+  // connect. An explicit --net-restrict still spawns it (operator-
+  // requested destination policy) on an EgressPolicy::audit() base so
+  // the default unix/escape denies stay off under the audit banner.
+  if !enforce && !net_restrict {
+    let err = execvp(&cmd);
+    eprintln!("exec failed: {err}");
+    std::process::exit(127);
+  }
   let broker = castellan_broker::spawn_broker();
   match broker {
     Ok(castellan_broker::Spawn::Supervisor(mut sup)) => {
@@ -946,7 +992,15 @@ fn launch(args: &[String], sock: &str) -> ! {
       // restrict_ip; the operator's allowlist is the LLM provider plus
       // anything else declared. An empty allowlist under restrict_ip is
       // deny-all-by-exception, and that is the honest fail-closed state.
-      let mut bpolicy = castellan_broker::EgressPolicy::new();
+      //
+      // P13 ninja F12: under --no-enforce the base is EgressPolicy::audit()
+      // (all default denies off — the banner); an explicit net_restrict
+      // then layers the operator-requested destination policy on top.
+      let mut bpolicy = if enforce {
+        castellan_broker::EgressPolicy::new()
+      } else {
+        castellan_broker::EgressPolicy::audit()
+      };
       if net_restrict {
         bpolicy = bpolicy.with_llm_only(&allow_hosts);
         if !allow_hosts.is_empty() {
@@ -1110,6 +1164,66 @@ fn launch(args: &[String], sock: &str) -> ! {
   }
 }
 
+/// P13 E-e advisory probe with F9 hardening: cached 24h, bounded 1s,
+/// stdin/stdout/stderr severed. Returns the last observed answer.
+fn sudo_nopasswd_cached() -> bool {
+  let stamp = {
+    let base = std::env::var("XDG_STATE_HOME")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+      });
+    base.join("castellan/sudo-probe")
+  };
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_secs())
+    .unwrap_or(0);
+  if let Ok(text) = std::fs::read_to_string(&stamp) {
+    let mut lines = text.lines();
+    let cached = lines.next().map(|l| l == "1").unwrap_or(false);
+    let ts = lines.next().and_then(|l| l.parse::<u64>().ok()).unwrap_or(0);
+    if now.saturating_sub(ts) < 24 * 3600 {
+      return cached;
+    }
+  }
+  // `-n` never prompts; the timeout guards PAM/NSS stalls (LDAP etc).
+  let mut child = std::process::Command::new("sudo")
+    .args(["-n", "true"])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .ok();
+  let mut result = false;
+  if let Some(c) = child.as_mut() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+      match c.try_wait() {
+        Ok(Some(status)) => {
+          result = status.success();
+          break;
+        }
+        Ok(None) => {
+          if std::time::Instant::now() >= deadline {
+            let _ = c.kill();
+            let _ = c.wait();
+            eprintln!("castellan: sudo probe timed out after 1s — NOPASSWD check skipped");
+            break;
+          }
+          std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Err(_) => break,
+      }
+    }
+  }
+  if let Some(parent) = stamp.parent() {
+    let _ = std::fs::create_dir_all(parent);
+  }
+  let _ = std::fs::write(&stamp, format!("{}\n{now}\n", if result { 1 } else { 0 }));
+  result
+}
+
 /// B6 phase 4: the launcher's kernel tty_nr, read from /proc/self/stat
 /// (field index 4 after comm). 0 = headless (no tty requirement on
 /// human-only ops for sessions launched from here).
@@ -1142,11 +1256,27 @@ fn hop_into_user_service() -> ! {
     .map(|p| p.to_string_lossy().into_owned())
     .unwrap_or_else(|_| "castellan".to_string());
   eprintln!("castellan: launcher outside user@.service — hopping into a transient scope for cgroup migration");
-  match std::process::Command::new("systemd-run")
-    .arg("--user")
-    .arg("--scope")
-    .arg("--unit")
-    .arg(&unit)
+  // systemd-run --user resolves the user bus at $XDG_RUNTIME_DIR/bus and
+  // IGNORES DBUS_SESSION_BUS_ADDRESS (measured .227 + dev box
+  // 2026-10-03: fake XDG + real bus var → "Failed to connect to user
+  // scope bus" → the hop dies fail-closed and no session starts). Any
+  // XDG_RUNTIME_DIR other than the real /run/user/<uid> — test
+  // isolation (p13 F11) or a custom runtime dir — hits this. So:
+  // systemd-run itself gets the REAL runtime dir (its bus lookup), and
+  // the spawned child gets OUR XDG back via --setenv so socket
+  // resolution keeps the isolated path (verified: child sees the
+  // restored value).
+  let child_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+  let real_xdg = format!("/run/user/{}", nix::unistd::getuid());
+  let mut cmd = std::process::Command::new("systemd-run");
+  cmd.arg("--user").arg("--scope").arg("--unit").arg(&unit);
+  if let Some(child) = child_xdg.as_deref() {
+    if child != real_xdg {
+      cmd.env("XDG_RUNTIME_DIR", &real_xdg);
+      cmd.arg(format!("--setenv=XDG_RUNTIME_DIR={child}"));
+    }
+  }
+  match cmd
     .arg(&exe)
     .args(argv)
     .status()
@@ -1377,7 +1507,8 @@ fn render(line: &str) -> String {
               out.push_str(&format!("  pending {want} for {sess} (hint {hint}) — nonce in daemon journal\n"));
             }
           }
-        }      if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
+        }
+        if let Some(cert) = v.get("extra").and_then(|e| e.get("cert")) {
         let label = cert.get("quality_label").and_then(|l| l.as_str()).unwrap_or("?");
         let bounds = cert.get("bounds").and_then(|b| b.get("verdict")).and_then(|x| x.as_str()).unwrap_or("?");
         let oob = cert.get("bounds").and_then(|b| b.get("out_of_bounds_attempts")).and_then(|x| x.as_u64()).unwrap_or(0);

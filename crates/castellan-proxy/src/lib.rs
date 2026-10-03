@@ -14,6 +14,13 @@ pub struct ProxyConfig {
   pub restrict: bool,
   pub keyring: Arc<Keyring>,
   pub client_tls: Arc<rustls::ClientConfig>,
+  /// P15 H1/F2: loopback destinations the tunnel must never reach —
+  /// today that is the session honeypot port. A CONNECT tunnel to it
+  /// makes the honeypot-side connection originate from the DAEMON pid
+  /// (proxy threads live in the daemon), which would defeat sender
+  /// attribution and re-frame the secret's owner. Checked before
+  /// `allowed()`, so it holds in both proxy postures.
+  pub deny_ports: Vec<u16>,
 }
 
 pub struct ProxyHandle {
@@ -121,6 +128,24 @@ fn emit(spine: &Mutex<castellan_core::EventSink>, kind: &str, path: &str, verdic
   }
 }
 
+/// P15 F2 pure predicate: refuse to tunnel when the destination port is
+/// deny-listed AND the host is loopback (the honeypot binds loopback
+/// only). A public host on the same port is not the honeypot — that is
+/// the broker's decision, not this one. Split out of `handle_conn` so
+/// the table is unit-pinnable without sockets.
+fn honeypot_tunnel_denied(deny_ports: &[u16], host: &str, port: u16) -> bool {
+  if !deny_ports.contains(&port) {
+    return false;
+  }
+  // parse_connect already strips brackets today; tolerate them here so a
+  // future caller cannot fail open on "[::1]".
+  let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+  if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    return ip.is_loopback();
+  }
+  host.eq_ignore_ascii_case("localhost")
+}
+
 fn allowed(cfg: &ProxyConfig, host: &str) -> bool {
   if !cfg.restrict {
     return true;
@@ -203,6 +228,14 @@ fn handle_conn(
     raw_respond(&mut sock, "501 Not Implemented");
     return Ok(());
   };
+
+  // P15 H1/F2: never tunnel to a deny-listed loopback port (the
+  // honeypot). Before allowed(), so both proxy postures enforce it.
+  if honeypot_tunnel_denied(&cfg.deny_ports, &host, port) {
+    emit(spine, "egress_deny", &host, "honeypot-tunnel");
+    raw_respond(&mut sock, "403 Forbidden");
+    return Ok(());
+  }
 
   if !allowed(cfg, &host) {
     emit(spine, "egress_deny", &host, "allowlist");
@@ -591,7 +624,7 @@ fn is_clean_eof(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::io::Cursor;
+  
 
   fn cfg_with(hosts: &[&str], restrict: bool) -> ProxyConfig {
     ProxyConfig {
@@ -601,6 +634,7 @@ mod tests {
       restrict,
       keyring: Arc::new(Keyring::empty()),
       client_tls: native_tls_config(),
+      deny_ports: vec![],
     }
   }
 
@@ -644,6 +678,7 @@ mod tests {
       restrict: true,
       keyring: Arc::new(k),
       client_tls: native_tls_config(),
+      deny_ports: vec![],
     };
     let raw = b"POST /v1/chat HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer canary\r\nX-API-Key: canary2\r\nContent-Length: 2\r\n\r\n{}";
     let req = rewrite_request(raw, "api.github.com", &c).unwrap();
@@ -697,5 +732,54 @@ mod tests {
     forward_body(&mut client, &mut up, &req, &[]).unwrap();
     assert!(!up.windows(13).any(|w| w == b"Authorization"));
     assert!(up.ends_with(b"a"));
+  }
+
+  // P15 F2 unit pin: the deny table that keeps a tunnel from
+  // laundering honeypot attribution through the daemon pid.
+  #[test]
+  fn honeypot_tunnel_denied_table() {
+    let d = &[9077u16];
+    assert!(honeypot_tunnel_denied(d, "127.0.0.1", 9077));
+    assert!(honeypot_tunnel_denied(d, "127.0.0.2", 9077));
+    assert!(honeypot_tunnel_denied(d, "::1", 9077));
+    assert!(honeypot_tunnel_denied(d, "[::1]", 9077));
+    assert!(honeypot_tunnel_denied(d, "localhost", 9077));
+    assert!(honeypot_tunnel_denied(d, "LOCALHOST", 9077));
+    assert!(!honeypot_tunnel_denied(d, "127.0.0.1", 443));
+    assert!(!honeypot_tunnel_denied(d, "example.com", 9077));
+    assert!(!honeypot_tunnel_denied(d, "192.168.1.5", 9077));
+    assert!(!honeypot_tunnel_denied(&[], "127.0.0.1", 9077));
+  }
+}
+
+#[cfg(feature = "fuzz")]
+pub mod fuzz_api {
+  use super::{native_tls_config, Keyring, ProxyConfig};
+  use std::sync::OnceLock;
+
+  pub fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
+    super::parse_connect(head)
+  }
+
+  fn fuzz_cfg() -> &'static ProxyConfig {
+    static CFG: OnceLock<ProxyConfig> = OnceLock::new();
+    CFG.get_or_init(|| ProxyConfig {
+      session: "fuzz".into(),
+      state_dir: std::env::temp_dir(),
+      allow_hosts: vec![],
+      restrict: false,
+      keyring: std::sync::Arc::new(
+        Keyring::parse(
+          b"[[credential]]\nname=\"gh\"\nscheme=\"bearer\"\ntoken=\"REAL\"\nhosts=[\"api.github.com\"]\n",
+        )
+        .expect("fixed keyring blob is valid (covered by unit test)"),
+      ),
+      client_tls: native_tls_config(),
+      deny_ports: vec![],
+    })
+  }
+
+  pub fn rewrite_request(raw: &[u8], host: &str) {
+    let _ = super::rewrite_request(raw, host, fuzz_cfg());
   }
 }

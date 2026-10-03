@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const HV_BITS: usize = 10_000;
-pub const HV_WORDS: usize = (HV_BITS + 63) / 64;
+pub const HV_WORDS: usize = HV_BITS.div_ceil(64);
 pub const HV_BYTES: usize = HV_WORDS * 8;
 
 /// Serialization header for persisted prototypes (S2 audit fix).
@@ -345,7 +345,7 @@ mod tests {
     for i in 0..20 {
       bad.push(ev("exec", &format!("/tmp/payload{i}.sh"), "deny"));
     }
-    for i in 0..10 {
+    for _i in 0..10 {
       bad.push(ev("net", "connect", "deny"));
     }
     let bad_hv = encode_session(&bad);

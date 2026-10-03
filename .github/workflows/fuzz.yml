@@ -1,0 +1,31 @@
+name: Fuzz (weekly)
+
+# Shape borrowed from reliary-agent's fuzz.yml with both of its defects
+# fixed: (1) no `| tail` on run steps — a fuzz crash must fail the job,
+# (2) installs are checked, not `|| true`-swallowed — a missing
+# cargo-fuzz must be a red build, not a silently skipped run.
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Monday 6 AM
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz (pinned via --locked against fuzz/Cargo.lock)
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: Run proxy_fuzz (60s) — CONNECT/head rewriter, agent-controlled bytes
+        run: cargo +nightly fuzz run proxy_fuzz -- -max_total_time=60 -timeout=30
+      - name: Run rpc_fuzz (60s) — control-plane Request decode
+        run: cargo +nightly fuzz run rpc_fuzz -- -max_total_time=60 -timeout=30
+      - name: Run ledger_fuzz (60s) — canary ledger restart path
+        run: cargo +nightly fuzz run ledger_fuzz -- -max_total_time=60 -timeout=30

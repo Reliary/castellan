@@ -2,6 +2,7 @@
 name = "castellan-canary"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 castellan-core = { path = "../castellan-core" }
@@ -12,3 +13,6 @@ serde_json = { workspace = true }
 [features]
 # Forwards the P8 drill fault-injection hook (see castellan-core).
 drills = ["castellan-core/drills"]
+# Fuzz-harness shims only (fuzz/ crate). Off everywhere else; no
+# production behavior change.
+fuzz = []

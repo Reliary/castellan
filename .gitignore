@@ -20,3 +20,5 @@ ideation-data/
 .DS_Store
 .idea/
 .vscode/
+__pycache__/
+*.pyc

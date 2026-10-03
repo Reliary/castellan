@@ -46,7 +46,7 @@ castellan/
 - **zbus** (pure Rust, no libdbus) for systemd user manager `StartTransientUnit` and dbus nonce-gated bless broker.
 - **nix** crate for Landlock, seccomp, cgroup, inotify, overlayfs, user-namespace syscalls — well-maintained, idiomatic.
 - **blake3** for content-addressed before-images (matches stria/relay).
-- **ed25519-dalek** for per-machine HV signing — **not currently a dependency**; listed only because commitment #9 (DESIGN-ONLY) would need it. Do not add until the signing feature is actually built.
+- **ed25519-dalek 2.x** for per-boot certificate signing (S2, built: `castellan-proof::signing` generates the key in-process at daemon start; never written to disk). Was listed here as DESIGN-ONLY when this file was written — stale status, corrected 2026-10-03.
 - **mimalloc** global allocator.
 - **rustc-hash FxHash** maps in hot paths (matches reliary-agent).
 - **ahash** where insertion-heavy and not security-sensitive (matches reliary-compress).

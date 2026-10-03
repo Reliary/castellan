@@ -28,6 +28,9 @@ use std::sync::{Arc, Mutex};
 enum Caller {
   Human,
   Agent,
+  // Designed for an unresolvable caller; classification is binary today
+  // (in castellan.slice -> Agent, else Human) and never yields it.
+  #[allow(dead_code)]
   Rejected,
 }
 
@@ -158,6 +161,9 @@ struct SessionNotes {
 }
 
 /// The persisted launch profile for a session (respawn material).
+/// Designed, not wired: durable_launch_profile reads it for
+/// bless-broker respawn, which has no caller yet.
+#[allow(dead_code)]
 #[derive(Default)]
 struct LaunchProfileFields {
   command: Option<Vec<String>>,
@@ -198,7 +204,7 @@ fn resolve_allow_hosts(explicit: &[String]) -> Vec<String> {
       if let Some(list) = llm.get("hosts").and_then(|h| h.as_array()) {
         for h in list.iter().filter_map(|v| v.as_str()) {
           let h = h.trim().to_string();
-          if !h.is_empty() && !hosts.iter().any(|e| *e == h) {
+          if !h.is_empty() && !hosts.contains(&h) {
             hosts.push(h);
           }
         }
@@ -244,8 +250,12 @@ enum BlessKind {
 /// the agent could forge it). Consumed exactly once by grant_check.
 #[derive(Debug, Clone)]
 struct Grant {
+  // Audit fields: written at grant time, not yet read (grant_check
+  // consumes `want` only).
+  #[allow(dead_code)]
   session: SessionId,
   want: String,
+  #[allow(dead_code)]
   granted_ts: u64,
 }
 
@@ -512,6 +522,8 @@ impl Daemon {
   /// The launch profile persisted at spawn: the exact command plus the
   /// confinement flags, so a bless-broker respawn reproduces the
   /// session's confinement minus the expansion.
+  /// Designed, not wired (no caller yet).
+  #[allow(dead_code)]
   fn durable_launch_profile(session: &str) -> Option<LaunchProfileFields> {
     let meta = Self::durable_session_meta(session)?;
     let command = meta.get("command").and_then(|c| {
@@ -708,7 +720,7 @@ impl Daemon {
       .registry
       .lock()
       .unwrap()
-      .get(&session)
+      .get(session)
       .map(|s| s.launcher_tty)
       .unwrap_or(0);
     // B7: headless sessions (launcher tty 0) previously accepted ANY
@@ -785,7 +797,7 @@ impl Daemon {
         let project = session
           .as_ref()
           .and_then(|s| self.registry.lock().unwrap().get(s).map(|r| r.project.clone()))
-          .or_else(|| {
+          .or({
             // session-less ops (Thaw{None}, Kill{None}) carry no
             // session: no project to floor. Record unattributable
             // rejections in the spine so the human can see them
@@ -1129,7 +1141,7 @@ impl Daemon {
     let proto_path = state
       .join("castellan/radar")
       .join(format!("{}.bin", castellan_radar::project_hash(project)));
-    let mut prototype = match std::fs::read(&proto_path) {
+    let prototype = match std::fs::read(&proto_path) {
       Ok(bytes) => castellan_radar::Prototype::from_bytes(&bytes),
       Err(_) => castellan_radar::Prototype::empty(),
     };
@@ -1286,13 +1298,14 @@ impl Daemon {
   /// `drill status` and emitted to the spine as `drill_*` events.
   /// A failing drill is a loud alarm: the defense is broken.
   fn run_drills(&self) -> Vec<castellan_drill::DrillResult> {
-    let mut results = Vec::new();
-    results.push(self.drill_census());
-    results.push(self.drill_honeypot());
-    results.push(self.drill_bless());
-    results.push(self.drill_envelope());
-    results.push(self.drill_freeze());
-    results.push(self.drill_channels());
+    let results = vec![
+      self.drill_census(),
+      self.drill_honeypot(),
+      self.drill_bless(),
+      self.drill_envelope(),
+      self.drill_freeze(),
+      self.drill_channels(),
+    ];
     let any_fail = results.iter().any(|r| !r.pass);
     let sink = EventSink::for_session(&Self::state_dir(), "drill");
     if let Ok(sink) = sink {
@@ -1445,7 +1458,7 @@ impl Daemon {
       .lock()
       .unwrap()
       .iter()
-      .any(|e| e.kind == BlessKind::Forged && e.nonce_hint == forged[..forged.len().min(8)].to_string());
+      .any(|e| e.kind == BlessKind::Forged && e.nonce_hint == forged[..forged.len().min(8)]);
     let pass = !resp.ok && recorded;
     castellan_drill::DrillResult::new(
       "bless",
@@ -2031,10 +2044,7 @@ impl Daemon {
   fn bless_reject(&self, nonce: &str) -> Response {
     let removed = {
       let mut b = self.bless.lock().unwrap();
-      match b.remove(nonce) {
-        Some(r) => Some(r),
-        None => None,
-      }
+      b.remove(nonce)
     };
     match removed {
       Some(r) => {
@@ -2080,7 +2090,7 @@ impl Daemon {
     let pending: Vec<serde_json::Value> = {
       let b = self.bless.lock().unwrap();
       let mut items: Vec<(&String, &BlessRequest)> = b.iter().collect();
-      items.sort_by_key(|(n, _)| n.clone());
+      items.sort_by(|a, b| a.0.cmp(b.0));
       items
         .into_iter()
         .map(|(nonce, req)| {
@@ -2120,7 +2130,7 @@ impl Daemon {
     // B6 P3 (R19): the secrets are NOT returned in the response — the
     // response is visible to the agent, so returning them is a canary
     // oracle teaching the exact bytes to strip. They persist in the
-    // canary ledger (canary.jsonl, reloaded at startup).
+    // registry ledger (registry.jsonl, reloaded at startup).
     Response::ok()
       .with_message("canaries planted")
       .with_extra(
@@ -2235,6 +2245,26 @@ impl Daemon {
       proofs.iter().filter(|p| p.passed).collect();
     match castellan_ledger::commit(&project, &upper) {
       Ok(applied) => {
+        // A/B (diff-trust): structural blast + scope-creep, computed
+        // from the session's upper layer BEFORE commit materializes it
+        // (same pre-commit window as the placebo proofs). Owned
+        // grammar-free code in castellan-proof::structural — no index
+        // daemon, no new deps. Emits one `structural_blast` spine event
+        // (the cert's A factor reads it) and, when scope_creep, one
+        // ScopeCreep trust signal (-8, advisory at high tiers).
+        let blast = castellan_proof::structural::blast_for_session(&project, &upper);
+        if let Ok(sink) = EventSink::for_session(&Self::state_dir(), session) {
+          if !blast.touched_fns.is_empty() || !blast.files.is_empty() {
+            let body = serde_json::json!({
+              "files": blast.files,
+              "touched_fns": blast.touched_fns,
+              "callees": blast.callees,
+              "caller_hits": blast.caller_hits,
+              "scope_creep": blast.scope_creep,
+            });
+            let _ = sink.emit("structural_blast", &body.to_string(), "measured");
+          }
+        }
         let _ = castellan_ledger::discard(&upper, &work);
         // P9.4: blast-radius weight for this session's touches. The
         // stria index may not exist (async build, never blocks) —
@@ -2251,7 +2281,7 @@ impl Daemon {
         // drifted pin -> weight 1.0 (neutral). The pin is read from
         // the DURABLE session record (the registry entry was removed
         // by kill above — the durable record survives).
-        let pinned_index_sha = Self::durable_session_meta(&session.to_string())
+        let pinned_index_sha = Self::durable_session_meta(session)
           .and_then(|m| m.get("hub_index_sha").and_then(|v| v.as_str()).map(String::from));
         let weight = if let Some(pinned) = pinned_index_sha {
           if castellan_hub::index_sha(&project).as_deref() == Some(pinned.as_str()) {
@@ -2270,6 +2300,23 @@ impl Daemon {
         };
         // user kept the session: positive trust signal
         let mut db = self.trust.lock().unwrap();
+        if blast.scope_creep {
+          let _ = db.apply(
+            &project,
+            &TrustEvent {
+              ts: castellan_core::now_unix(),
+              session: session.to_string(),
+              signal: Signal::ScopeCreep,
+              evidence: format!(
+                "broad code delta: {} fn(s) across {} file(s); callers {}; callees {}",
+                blast.touched_fns.len(),
+                blast.files.len(),
+                blast.caller_hits,
+                blast.callees.len(),
+              ),
+            },
+          );
+        }
         let _ = db.apply_weighted(
           &project,
           &TrustEvent {
@@ -2388,7 +2435,7 @@ impl Daemon {
         std::thread::Builder::new()
           .name("scan".into())
           .spawn(move || {
-            let _ = scan_daemon.run_artifact_scan(&scan_ctx);
+            scan_daemon.run_artifact_scan(&scan_ctx);
           })
           .expect("scan thread");
         let lines: Vec<serde_json::Value> =
@@ -2651,6 +2698,9 @@ impl Daemon {
     }
   }
 
+  // Argument grouping would mask the spawn contract; the list is the
+  // contract (each flag maps 1:1 to a confinement decision).
+  #[allow(clippy::too_many_arguments)]
   fn spawn(
     &self,
     harness: String,
@@ -2670,20 +2720,28 @@ impl Daemon {
     // trust.db, keyring.toml, spines and canary ledgers would land
     // inside the agent's write roots (full trust + credential forgery).
     // Canonicalize (follows symlinks); normalize() only strips `.`.
+    // P13 ninja F8: home/state/cfg are canonicalized too — a symlinked
+    // HOME made `canon == home` compare canonical-project against raw
+    // $HOME and miss, which was the hole the launcher-side advisory
+    // existed to catch. The refusal is the primary control; the
+    // advisory stays as second net for layouts this still misses.
     {
       let canon = project.canonicalize().unwrap_or_else(|_| project.clone());
       let state = Self::state_dir();
+      let state = state.canonicalize().unwrap_or(state);
       let cfgdir = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
           std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
         });
+      let cfgdir = cfgdir.canonicalize().unwrap_or(cfgdir);
       let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+      let home = home.canonicalize().unwrap_or(home);
       let bad = state
         .starts_with(&canon)
         || cfgdir.starts_with(&canon)
-        || canon == home
-        || canon == std::path::PathBuf::from("/");
+        || home.starts_with(&canon)
+        || canon == *"/";
       if bad {
         return Response::err(
           "project contains daemon state/config (refusing: trust.db and keyring would be agent-writable)",
@@ -2833,6 +2891,13 @@ impl Daemon {
         restrict: net_restrict,
         keyring: self.keyring.clone(),
         client_tls: self.proxy_tls.clone(),
+        // P15 H1/F2: a tunnel to the honeypot port would originate the
+        // connection from the daemon pid and defeat sender attribution.
+        deny_ports: if self.honeypot.port > 0 {
+          vec![self.honeypot.port]
+        } else {
+          vec![]
+        },
       };
       match castellan_proxy::start(pcfg) {
         Ok(h) => {
@@ -2935,6 +3000,8 @@ impl Daemon {
       )
   }
 
+  // Same contract-as-signature rationale as spawn.
+  #[allow(clippy::too_many_arguments)]
   fn persist_session(
     &self,
     id: &str,
@@ -3219,16 +3286,16 @@ fn rand_hex(n: usize) -> String {
 /// Channels probed:
 /// - tcp_allowed: TCP connect to the honeypot port (must be ALLOWED)
 /// - tcp_denied:  TCP connect to a non-honeypot port (must be DENIED)
-/// - udp:         UDP send to a PUBLIC address (expected OPEN without
-///                the broker; DENIED under a destination policy)
-/// - unix:        unix socket connect outside the session (expected
-///                OPEN — unix sockets are not covered by Landlock)
-/// - dns:         DNS-crafted UDP query to the resolver (expected OPEN
-///                without the broker; DENIED under a destination policy)
-/// - fs_drop:     write to a world-readable path outside the workspace
-///                (expected DENIED by Landlock write roots)
-/// - fd_inherit:  write through an inherited fd (expected OPEN — the
-///                envelope cannot revoke an already-open fd)
+/// - udp: UDP send to a PUBLIC address (expected OPEN without
+///   the broker; DENIED under a destination policy)
+/// - unix: unix socket connect outside the session (expected
+///   OPEN — unix sockets are not covered by Landlock)
+/// - dns: DNS-crafted UDP query to the resolver (expected OPEN
+///   without the broker; DENIED under a destination policy)
+/// - fs_drop: write to a world-readable path outside the workspace
+///   (expected DENIED by Landlock write roots)
+/// - fd_inherit: write through an inherited fd (expected OPEN — the
+///   envelope cannot revoke an already-open fd)
 ///
 /// P11: the UDP and DNS probes target a PUBLIC address, not loopback.
 /// They previously sent to 127.0.0.1, which the broker always allows

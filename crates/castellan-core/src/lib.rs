@@ -89,7 +89,11 @@ pub enum ResponseTier {
 /// detection, fail-closed on enforcement).
 pub fn response_tier(signal: &str) -> ResponseTier {
   match signal {
-    "canary_trip" | "hard_deny" | "membership_drift" => ResponseTier::Freeze,
+    // canary_framing: the SENDER used a canary that belonged to
+    // someone else (P15 H1) — sender pays exactly like a self-trip.
+    // canary_unattributed: sender vanished before fd mapping; the
+    // frozen plan freezes nobody, so it routes to Silent by default.
+    "canary_trip" | "canary_framing" | "hard_deny" | "membership_drift" => ResponseTier::Freeze,
     _ => ResponseTier::Silent,
   }
 }
@@ -695,6 +699,7 @@ mod tests {
   #[test]
   fn high_confidence_signals_freeze() {
     assert_eq!(response_tier("canary_trip"), ResponseTier::Freeze);
+    assert_eq!(response_tier("canary_framing"), ResponseTier::Freeze);
     assert_eq!(response_tier("hard_deny"), ResponseTier::Freeze);
     assert_eq!(response_tier("membership_drift"), ResponseTier::Freeze);
   }
@@ -704,6 +709,8 @@ mod tests {
     assert_eq!(response_tier("radar_anomaly"), ResponseTier::Silent);
     assert_eq!(response_tier("would_deny"), ResponseTier::Silent);
     assert_eq!(response_tier("harness_drift"), ResponseTier::Silent);
+    // P15: sender-unresolvable trips record evidence but freeze nobody.
+    assert_eq!(response_tier("canary_unattributed"), ResponseTier::Silent);
   }
 
   #[test]

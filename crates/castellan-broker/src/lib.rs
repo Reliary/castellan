@@ -1887,6 +1887,37 @@ mod tests {
   }
 
   #[test]
+  fn unknown_family_denied_by_default() {
+    // P17 battery (live .227 2026-10-03): vsock_create OK, vsock_connect
+    // EPERM — the arm below is what carried that verdict; this pin keeps
+    // a regression from reopening the P14 F-E hole (pre-81c1a87 any
+    // Other(fam) waved through).
+    let p = EgressPolicy::new();
+    assert_eq!(decide(&Sockaddr::Other(40), &p).0, Verdict::Deny); // AF_VSOCK
+    assert_eq!(decide(&Sockaddr::Other(31), &p).0, Verdict::Deny); // AF_BLUETOOTH
+    assert_eq!(decide(&Sockaddr::Other(2), &p).0, Verdict::Deny); // AF_AX25 junk
+  }
+
+  #[test]
+  fn kernel_local_families_allowed() {
+    // AF_NETLINK carries getifaddrs/getaddrinfo route queries; AF_ALG is
+    // local crypto. Both reach no peer — denying them breaks name
+    // resolution (measured OK in the same battery: netlink_getifaddrs).
+    let p = EgressPolicy::new();
+    let (v, r) = decide(&Sockaddr::Other(libc::AF_NETLINK), &p);
+    assert_eq!((v, r), (Verdict::Allow, "kernel-local-family"));
+    let (v, r) = decide(&Sockaddr::Other(libc::AF_ALG), &p);
+    assert_eq!((v, r), (Verdict::Allow, "kernel-local-family"));
+  }
+
+  #[test]
+  fn audit_policy_waves_unknown_families() {
+    // Audit posture observes without gating (the banner's contract).
+    let p = EgressPolicy::audit();
+    assert_eq!(decide(&Sockaddr::Other(40), &p).0, Verdict::Allow);
+  }
+
+  #[test]
   fn llm_only_denies_loopback_ssh() {
     // HN ssh-localhost escape (2026-09-30): `ssh localhost <cmd>` runs
     // the command in an sshd child outside all three layers. The client

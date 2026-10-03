@@ -1256,11 +1256,27 @@ fn hop_into_user_service() -> ! {
     .map(|p| p.to_string_lossy().into_owned())
     .unwrap_or_else(|_| "castellan".to_string());
   eprintln!("castellan: launcher outside user@.service — hopping into a transient scope for cgroup migration");
-  match std::process::Command::new("systemd-run")
-    .arg("--user")
-    .arg("--scope")
-    .arg("--unit")
-    .arg(&unit)
+  // systemd-run --user resolves the user bus at $XDG_RUNTIME_DIR/bus and
+  // IGNORES DBUS_SESSION_BUS_ADDRESS (measured .227 + dev box
+  // 2026-10-03: fake XDG + real bus var → "Failed to connect to user
+  // scope bus" → the hop dies fail-closed and no session starts). Any
+  // XDG_RUNTIME_DIR other than the real /run/user/<uid> — test
+  // isolation (p13 F11) or a custom runtime dir — hits this. So:
+  // systemd-run itself gets the REAL runtime dir (its bus lookup), and
+  // the spawned child gets OUR XDG back via --setenv so socket
+  // resolution keeps the isolated path (verified: child sees the
+  // restored value).
+  let child_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+  let real_xdg = format!("/run/user/{}", nix::unistd::getuid());
+  let mut cmd = std::process::Command::new("systemd-run");
+  cmd.arg("--user").arg("--scope").arg("--unit").arg(&unit);
+  if let Some(child) = child_xdg.as_deref() {
+    if child != real_xdg {
+      cmd.env("XDG_RUNTIME_DIR", &real_xdg);
+      cmd.arg(format!("--setenv=XDG_RUNTIME_DIR={child}"));
+    }
+  }
+  match cmd
     .arg(&exe)
     .args(argv)
     .status()

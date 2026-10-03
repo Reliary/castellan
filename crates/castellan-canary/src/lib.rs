@@ -237,16 +237,26 @@ fn find_pid_with_fd(target: &str) -> Option<u32> {
   None
 }
 
-fn session_scope_of(pid: u32) -> Option<String> {
-  let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-  let line = cg.lines().find(|l| l.contains("castellan.slice/"))?;
+/// Pure cgroup-string parse behind `session_scope_of` (P15 unit pin).
+///
+/// Requires a `.scope` component directly after `castellan.slice/`:
+/// a non-scope subdirectory must NOT fabricate a session id (the
+/// pre-P15-extract code split on `.scope` with no match and returned
+/// the whole remainder as a "sid").
+fn parse_session_scope(cgroup: &str) -> Option<String> {
+  let line = cgroup.lines().find(|l| l.contains("castellan.slice/"))?;
   let after = line.split("castellan.slice/").nth(1)?;
-  let sid = after.split(".scope").next()?;
-  if sid.is_empty() {
+  let (sid, _) = after.split_once(".scope")?;
+  if sid.is_empty() || sid.contains('/') {
     None
   } else {
     Some(sid.to_string())
   }
+}
+
+fn session_scope_of(pid: u32) -> Option<String> {
+  let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+  parse_session_scope(&cg)
 }
 
 fn resolve_sender(stream: &TcpStream) -> Sender {
@@ -358,35 +368,90 @@ fn handle_conn(mut stream: TcpStream, registry: &Registry, state_home: &Path, on
   }
 }
 
-fn dispatch_trip(sender: &Sender, owner: &str, secret: &str, state_home: &Path, on_trip: &TripCallback) {
+/// Why the plan came out the way it did — wording only, the decision
+/// lives in `trip_plan`.
+#[derive(Debug, PartialEq, Eq)]
+enum TripReason {
+  /// The sender IS a session and the fd mapped.
+  SessionSender,
+  /// Sender resolved but holds no session scope (drill, human shell).
+  NonSessionSender,
+  /// Fast-close race: socket or pid unresolvable.
+  Unattributable,
+}
+
+/// The pure attribution decision for a honeypot hit (P15 C40a),
+/// split out of `dispatch_trip` so the four-row table is unit-pinnable
+/// without touching cgroups, the spine, or trust.
+#[derive(Debug, PartialEq, Eq)]
+struct TripPlan {
+  /// Session whose spine records the event (sender for Act-on-session,
+  /// owner for non-session/unattributed).
+  session: String,
+  /// Spine/trust event kind — `canary_trip`, `canary_framing`,
+  /// `canary_unattributed`.
+  kind: &'static str,
+  /// Freeze + trust signal. False only for the unattributable case:
+  /// freezing the owner there would re-enable framing via send+close.
+  freeze: bool,
+  reason: TripReason,
+}
+
+fn trip_plan(sender: &Sender, owner: &str) -> TripPlan {
   match *sender {
+    // Sender-session attribution: the SENDER pays. A session sending
+    // another session's secret is canary_framing — owner stays clean.
     Sender::Session(ref s) => {
       let framing = s != owner;
-      let kind = if framing { "canary_framing" } else { "canary_trip" };
-      eprintln!(
-        "castellan-canary: TRIP — {kind}: session {s} sent a canary registered to {owner}"
-      );
-      log_trip(state_home, s, secret, kind);
-      freeze_session(s);
-      on_trip(s);
+      TripPlan {
+        session: s.clone(),
+        kind: if framing { "canary_framing" } else { "canary_trip" },
+        freeze: true,
+        reason: TripReason::SessionSender,
+      }
     }
-    Sender::NonSession => {
-      eprintln!(
-        "castellan-canary: TRIP — canary credential used by session {owner} (non-session sender)"
-      );
-      log_trip(state_home, owner, secret, "canary_trip");
-      freeze_session(owner);
-      on_trip(owner);
-    }
-    Sender::Unknown => {
-      // Fast-close race: sender vanished before the fd could be
-      // mapped. Freezing the owner here would re-enable framing via
-      // send+close — evidence without accusation instead.
-      eprintln!(
-        "castellan-canary: canary used by unresolvable sender (fast-close) — owner {owner} recorded, no freeze"
-      );
-      log_trip(state_home, owner, secret, "canary_unattributed");
-    }
+    // Non-session sender (daemon drill / human shell): fall back to
+    // secret ownership — preserves the D2 drill contract.
+    Sender::NonSession => TripPlan {
+      session: owner.to_string(),
+      kind: "canary_trip",
+      freeze: true,
+      reason: TripReason::NonSessionSender,
+    },
+    // Evidence without accusation: record on the owner spine, freeze
+    // nobody.
+    Sender::Unknown => TripPlan {
+      session: owner.to_string(),
+      kind: "canary_unattributed",
+      freeze: false,
+      reason: TripReason::Unattributable,
+    },
+  }
+}
+
+fn dispatch_trip(sender: &Sender, owner: &str, secret: &str, state_home: &Path, on_trip: &TripCallback) {
+  let plan = trip_plan(sender, owner);
+  let note = match plan.reason {
+    TripReason::SessionSender => format!(
+      "session {} sent a canary registered to {owner}",
+      plan.session
+    ),
+    TripReason::NonSessionSender => format!(
+      "canary credential used by session {} (non-session sender)",
+      plan.session
+    ),
+    TripReason::Unattributable => format!(
+      "canary used by unresolvable sender (fast-close) — owner {} recorded, no freeze",
+      plan.session
+    ),
+  };
+  log_trip(state_home, &plan.session, secret, plan.kind);
+  if plan.freeze {
+    eprintln!("castellan-canary: TRIP — {}: {note}", plan.kind);
+    freeze_session(&plan.session);
+    on_trip(&plan.session);
+  } else {
+    eprintln!("castellan-canary: {note}");
   }
 }
 
@@ -475,5 +540,65 @@ mod tests {
     let hp = Honeypot::detached();
     hp.register(&CanarySecret { value: "x".into(), session: "s".into() });
     assert_eq!(hp.secret_count(), 1);
+  }
+
+  // P15 unit pin: cgroup-line → session id. The No-scope/no-sid rows
+  // are the harden (the pre-extract split(".scope").next() returned the
+  // whole remainder as a "sid" when ".scope" was absent).
+  #[test]
+  fn session_scope_parse_fixtures() {
+    let ok = |cg: &str| parse_session_scope(cg);
+    assert_eq!(
+      ok("0::/user.slice/user-1000.slice/user@1000.service/castellan.slice/s18abcdef.scope\n").as_deref(),
+      Some("s18abcdef")
+    );
+    assert_eq!(
+      ok("0::/user.slice/user-1000.slice/user@1000.service/castellan.slice/s18abcdef.scope/child.scope\n").as_deref(),
+      Some("s18abcdef")
+    );
+    assert_eq!(ok("0::/user.slice/user-1000.slice/user@1000.service\n"), None);
+    assert_eq!(ok("0::/user.slice/castellan.slice/"), None);
+    assert_eq!(ok("0::/user.slice/castellan.slice/not-a-scope-dir\n"), None);
+    assert_eq!(ok("0::/user.slice/castellan.slice/a/b.scope\n"), None);
+    assert_eq!(ok(""), None);
+  }
+
+  // P15 unit pin: the four-row attribution table. A regression that
+  // freezes the owner when a sender-session resolved is the cross-
+  // session framing bug C40a — row 2 is the regression lock.
+  #[test]
+  fn trip_dispatch_attribution_table() {
+    let owner = "sOWNER";
+
+    let p = trip_plan(&Sender::Session(owner.to_string()), owner);
+    assert_eq!(p.session, owner);
+    assert_eq!(p.kind, "canary_trip");
+    assert!(p.freeze);
+
+    let p = trip_plan(&Sender::Session("sATTACKER".into()), owner);
+    assert_eq!(p.session, "sATTACKER");
+    assert_eq!(p.kind, "canary_framing");
+    assert!(p.freeze, "the SENDER must be frozen, not the owner");
+
+    let p = trip_plan(&Sender::NonSession, owner);
+    assert_eq!(p.session, owner);
+    assert_eq!(p.kind, "canary_trip");
+    assert!(p.freeze, "D2 drill contract: non-session falls back to owner");
+
+    let p = trip_plan(&Sender::Unknown, owner);
+    assert_eq!(p.session, owner);
+    assert_eq!(p.kind, "canary_unattributed");
+    assert!(!p.freeze, "owner-freeze would re-enable send+close framing");
+  }
+}
+
+#[cfg(feature = "fuzz")]
+pub mod fuzz_api {
+  pub fn load_ledger_bytes(bytes: &[u8]) {
+    let path = std::env::temp_dir().join(format!("castellan-fuzz-ledger-{}", std::process::id()));
+    if std::fs::write(&path, bytes).is_ok() {
+      let _ = super::load_canary_ledger(&path);
+      let _ = std::fs::remove_file(&path);
+    }
   }
 }

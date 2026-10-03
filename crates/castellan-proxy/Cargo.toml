@@ -16,3 +16,8 @@ rustls-pki-types = { workspace = true }
 rustls-native-certs = { workspace = true }
 rcgen = { workspace = true }
 httparse = { workspace = true }
+
+[features]
+# Fuzz-harness shims only (fuzz/ crate). Off everywhere else; no
+# production behavior change.
+fuzz = []

@@ -298,8 +298,13 @@ fn leaf_server_config(host: &str, ca: &Ca) -> std::io::Result<Arc<rustls::Server
     rcgen::KeyUsagePurpose::DigitalSignature,
     rcgen::KeyUsagePurpose::KeyEncipherment,
   ];
+  // rcgen 0.14: signed_by takes an Issuer bundling the CA's DN/key
+  // usages/signing key; from_ca_cert_der rebuilds it from the CA DER
+  // (ground truth) and &KeyPair satisfies SigningKey by reference.
+  let issuer = rcgen::Issuer::from_ca_cert_der(ca.cert.der(), &ca.key)
+    .map_err(|e| std::io::Error::other(format!("issuer: {e}")))?;
   let leaf = params
-    .signed_by(&leaf_key, &ca.cert, &ca.key)
+    .signed_by(&leaf_key, &issuer)
     .map_err(|e| std::io::Error::other(format!("leaf sign: {e}")))?;
   let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der());
   let mut scfg = rustls::ServerConfig::builder()

@@ -36,9 +36,12 @@ jobs:
             echo "== $b =="
             readelf -hW "$b" | grep -q 'Type:.*DYN' \
               && echo "  PIE   ok" || { echo "  PIE   MISSING"; rc=1; }
-            # GNU_STACK without E bit = NX (non-executable stack)
-            readelf -lW "$b" | grep 'GNU_STACK' | grep -qE 'RW\s+0x' \
-              && echo "  NX    ok" || { echo "  NX    MISSING"; rc=1; }
+            # NX: GNU_STACK flags (2nd-to-last field) must be RW — RWE
+            # means an executable stack. Field-parses: a regex on the
+            # whole line false-RED on the first run (align prints as 0,
+            # not 0x...), which is how this gate earned its keep.
+            stack=$(readelf -lW "$b" | awk '/GNU_STACK/{print $(NF-1)}')
+            if [ "$stack" = "RW" ]; then echo "  NX    ok"; else echo "  NX    MISSING (flags=$stack)"; rc=1; fi
             readelf -lW "$b" | grep -q 'GNU_RELRO' \
               && echo "  RELRO ok" || { echo "  RELRO MISSING"; rc=1; }
             # BIND_NOW = full RELRO (no lazy binding window)

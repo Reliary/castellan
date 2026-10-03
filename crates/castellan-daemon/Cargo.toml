@@ -37,7 +37,7 @@ castellan-broker = { path = "../castellan-broker" }
 castellan-keyring = { path = "../castellan-keyring" }
 castellan-proxy = { path = "../castellan-proxy" }
 rustls = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 toml = "1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }

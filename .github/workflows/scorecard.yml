@@ -9,6 +9,12 @@ on:
 permissions:
   security-events: write
   contents: read
+  # publish_results: true signs the results with Sigstore/Fulcio. Without
+  # this the action falls back to the interactive device flow — a browser
+  # code no runner completes — and fails with expired_token after ~15 min
+  # of retries (12 consecutive failures before this line). OIDC lets
+  # Fulcio issue the cert non-interactively.
+  id-token: write
 
 jobs:
   analysis:

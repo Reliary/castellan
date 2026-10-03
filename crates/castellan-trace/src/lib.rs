@@ -56,11 +56,23 @@ pub fn open_index(state_dir: &Path) -> rusqlite::Result<Connection> {
   Ok(conn)
 }
 
+/// rusqlite 0.40 dropped the u64 impls; 0.31's were range-checked —
+/// a poisoned negative/overflow now errors loudly instead of wrapping
+/// (review C-1; matches pre-0.40 behavior exactly).
+fn u64_from_i64(idx: usize, v: i64) -> rusqlite::Result<u64> {
+  u64::try_from(v)
+    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Integer, Box::new(e)))
+}
+
+fn u64_to_i64(v: u64) -> rusqlite::Result<i64> {
+  i64::try_from(v).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
 /// The per-session high-water mark: the largest ts already indexed.
 pub fn watermark(conn: &Connection, session: &str) -> rusqlite::Result<u64> {
   conn
     .query_row("SELECT max_ts FROM watermark WHERE session = ?1", [session], |r| {
-      r.get::<_, i64>(0).map(|v| v as u64)
+      r.get::<_, i64>(0).and_then(|v| u64_from_i64(0, v))
     })
     .or_else(|e| match e {
       rusqlite::Error::QueryReturnedNoRows => Ok(0),
@@ -76,14 +88,14 @@ pub fn index_session(conn: &Connection, events: &[WriteEvent]) -> rusqlite::Resu
   for e in events {
     conn.execute(
       "INSERT OR IGNORE INTO writes (session, path, ts) VALUES (?1, ?2, ?3)",
-      params![e.session, e.path, e.ts as i64],
+      params![e.session, e.path, u64_to_i64(e.ts)?],
     )?;
   }
   if let Some(max) = events.iter().map(|e| e.ts).max() {
     conn.execute(
       "INSERT INTO watermark (session, max_ts) VALUES (?1, ?2)
        ON CONFLICT(session) DO UPDATE SET max_ts = MAX(max_ts, excluded.max_ts)",
-      params![events[0].session, max as i64],
+      params![events[0].session, u64_to_i64(max)?],
     )?;
   }
   Ok(())
@@ -119,7 +131,7 @@ pub fn exposure(
   let rows = stmt.query_map(params![compromised, candidate], |r| {
     Ok((
       r.get::<_, String>(0)?,
-      r.get::<_, i64>(1)? as u64,
+      u64_from_i64(1, r.get::<_, i64>(1)?)?,
     ))
   })?;
   for row in rows.flatten() {
@@ -136,7 +148,10 @@ pub fn exposure(
   for (path, cand_ts) in &exposed {
     let comp_ts: Option<u64> = stmt
       .query_row(params![compromised, path], |r| {
-        r.get::<_, Option<i64>>(0).map(|v| v.map(|n| n as u64))
+        r.get::<_, Option<i64>>(0).and_then(|v| match v {
+          Some(n) => u64_from_i64(0, n).map(Some),
+          None => Ok(None),
+        })
       })
       .ok()
       .flatten();
@@ -230,5 +245,29 @@ mod tests {
     let (score, exposed, _) = exposure(&conn, "A", "B").unwrap();
     assert!((score - 0.1).abs() < 1e-9, "hub touch must score low, got {score}");
     assert_eq!(exposed, vec!["Cargo.lock"]);
+  }
+
+  #[test]
+  fn negative_watermark_is_a_loud_error() {
+    let conn = tmp_db();
+    conn
+      .execute("INSERT INTO watermark (session, max_ts) VALUES ('s1', -1)", [])
+      .unwrap();
+    let err = watermark(&conn, "s1").unwrap_err();
+    assert!(
+      matches!(err, rusqlite::Error::FromSqlConversionFailure(..)),
+      "negative watermark must error loudly, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn overflow_ts_write_is_a_loud_error() {
+    let conn = tmp_db();
+    let ev = WriteEvent { session: "s1".into(), path: "/x".into(), ts: u64::MAX };
+    let err = index_session(&conn, &[ev]).unwrap_err();
+    assert!(
+      matches!(err, rusqlite::Error::ToSqlConversionFailure(..)),
+      "u64::MAX must error loudly at the SQL boundary, got {err:?}"
+    );
   }
 }

@@ -59,35 +59,61 @@ def v(name, fn):
     except Exception as e:
         print(f"{name}: EXC {type(e).__name__}: {e}")
 
+# G-1: the ioctl probe opens FIRST and reports NOT-REACHED when the
+# open fails — a DAC-denied open must never print the same errno line
+# the ioctl gate greps for. P17_SEED_OPEN_FAIL forces open failure so
+# the suite can prove its own assertions discriminate (seeded control).
+_SEED = os.environ.get("P17_SEED_OPEN_FAIL") == "1"
+
+def gate_open(path, flags):
+    if _SEED:
+        raise OSError(13, "Permission denied (seeded)")
+    return os.open(path, flags)
+
 v("kvm_open_rdonly", lambda: os.open("/dev/kvm", os.O_RDONLY))
 v("kvm_open_rdwr", lambda: os.open("/dev/kvm", os.O_RDWR))
 try:
-    fd = os.open("/dev/kvm", os.O_RDONLY)
-    fcntl.ioctl(fd, 0xAE00)
-    print("kvm_ioctl_getapi: OK (IOCTL NOT GATED)")
-    os.close(fd)
+    fd = gate_open("/dev/kvm", os.O_RDONLY)
 except OSError as e:
-    print(f"kvm_ioctl_getapi: errno={e.errno} ({errno.errorcode.get(e.errno,'?')})")
+    print(f"kvm_ioctl_getapi: NOT-REACHED (open errno={e.errno})")
+else:
+    try:
+        fcntl.ioctl(fd, 0xAE00)
+        print("kvm_ioctl_getapi: OK (IOCTL NOT GATED)")
+    except OSError as e:
+        print(f"kvm_ioctl_getapi: errno={e.errno} ({errno.errorcode.get(e.errno,'?')})")
+    finally:
+        os.close(fd)
 
 v("ptmx_open_rdonly", lambda: os.open("/dev/ptmx", os.O_RDONLY | os.O_NOCTTY))
 v("ptmx_open_rdwr", lambda: os.open("/dev/ptmx", os.O_RDWR | os.O_NOCTTY))
 try:
-    fd = os.open("/dev/ptmx", os.O_RDONLY | os.O_NOCTTY)
-    n = fcntl.ioctl(fd, 0x80045430, b"\x00\x00\x00\x00")
-    print(f"ptmx_ioctl_TIOCGPTN: OK pty#={struct.unpack('I', n)[0]} (alloc chain ALIVE)")
-    os.close(fd)
+    fd = gate_open("/dev/ptmx", os.O_RDONLY | os.O_NOCTTY)
 except OSError as e:
-    print(f"ptmx_ioctl_TIOCGPTN: errno={e.errno} ({errno.errorcode.get(e.errno,'?')})")
+    print(f"ptmx_ioctl_TIOCGPTN: NOT-REACHED (open errno={e.errno})")
+else:
+    try:
+        n = fcntl.ioctl(fd, 0x80045430, b"\x00\x00\x00\x00")
+        print(f"ptmx_ioctl_TIOCGPTN: OK pty#={struct.unpack('I', n)[0]} (alloc chain ALIVE)")
+    except OSError as e:
+        print(f"ptmx_ioctl_TIOCGPTN: errno={e.errno} ({errno.errorcode.get(e.errno,'?')})")
+    finally:
+        os.close(fd)
 
 v("dri_open_rdonly", lambda: os.open("/dev/dri/card0", os.O_RDONLY))
 v("dri_open_rdwr", lambda: os.open("/dev/dri/card0", os.O_RDWR))
 try:
-    fd = os.open("/dev/dri/card0", os.O_RDONLY)
-    fcntl.ioctl(fd, 0xc0586400, bytearray(80))
-    print("dri_ioctl_version: OK (IOCTL NOT GATED)")
-    os.close(fd)
+    fd = gate_open("/dev/dri/card0", os.O_RDONLY)
 except OSError as e:
-    print(f"dri_ioctl_version: errno={e.errno} ({errno.errorcode.get(e.errno,'?')})")
+    print(f"dri_ioctl_version: NOT-REACHED (open errno={e.errno})")
+else:
+    try:
+        fcntl.ioctl(fd, 0xc0586400, bytearray(80))
+        print("dri_ioctl_version: OK (IOCTL NOT GATED)")
+    except OSError as e:
+        print(f"dri_ioctl_version: errno={e.errno} ({errno.errorcode.get(e.errno,'?')})")
+    finally:
+        os.close(fd)
 
 v("pty_chain_openpty", lambda: (lambda m, s: (os.close(m), os.close(s), "alloc worked")[2])(*os.openpty()))
 
@@ -151,23 +177,33 @@ ok "probe completed in session ${SID:-unknown}"
 
 has() { grep -qF "$1" "$WORK/out"; }
 
-# --- harm gate: ioctls on in-domain device fds denied ---
+# --- harm gate: ioctls on in-domain device fds denied (G-1: three-way)
+# denial = PASS; probe never reached the ioctl = NOTE (never PASS);
+# ioctl worked = FAIL. A DAC-denied open prints NOT-REACHED, not EACCES,
+# so it cannot satisfy the gate.
+ioctl_gate() {
+  if has "$1: errno=13 (EACCES)"; then ok "$2 denied (IOCTL_DEV gate)"
+  elif has "$1: NOT-REACHED"; then note "$2 not exercised — read-open unavailable"
+  elif has "$1: OK"; then bad "$2 NOT denied"
+  else bad "$2 probe line missing"
+  fi
+}
 if [ -e /dev/kvm ]; then
-  has "kvm_ioctl_getapi: errno=13 (EACCES)" && ok "kvm ioctl denied (IOCTL_DEV gate)" || bad "kvm ioctl NOT denied"
+  ioctl_gate "kvm_ioctl_getapi" "kvm ioctl"
   has "kvm_open_rdonly: OK" && ok "kvm read-open survives (documented residual)" || note "kvm read-open: $(grep kvm_open_rdonly "$WORK/out")"
   has "kvm_open_rdwr: errno=13 (EACCES)" && ok "kvm write-open denied" || bad "kvm write-open NOT denied"
 else
   note "/dev/kvm absent — kvm group skipped"
 fi
 if [ -e /dev/dri/card0 ]; then
-  has "dri_ioctl_version: errno=13 (EACCES)" && ok "drm ioctl denied" || bad "drm ioctl NOT denied"
+  ioctl_gate "dri_ioctl_version" "drm ioctl"
   has "dri_open_rdwr: errno=13 (EACCES)" && ok "drm write-open denied" || bad "drm write-open NOT denied"
 else
   note "/dev/dri/card0 absent — dri group skipped"
 fi
 # ptmx always present
 has "ptmx_open_rdwr: errno=13 (EACCES)" && ok "ptmx write-open denied" || bad "ptmx write-open NOT denied"
-has "ptmx_ioctl_TIOCGPTN: errno=13 (EACCES)" && ok "pty alloc chain dead (TIOCGPTN denied)" || bad "pty alloc chain ALIVE"
+ioctl_gate "ptmx_ioctl_TIOCGPTN" "pty alloc ioctl"
 has "pty_chain_openpty: errno=13 (EACCES)" && ok "openpty denied" || bad "openpty succeeded"
 
 # --- inherited-tty surface ---
@@ -197,6 +233,27 @@ has "netlink_getifaddrs: OK getifaddrs ok" && ok "netlink/getifaddrs alive" || b
 # --- notes: environment-dependent lines ---
 grep 'input_mouse_open' "$WORK/out" | grep -q ': OK' && note "input device readable (group membership grants DAC read)" || note "input device denied: $(grep input_mouse_open "$WORK/out")"
 grep 'bluetooth_l2cap' "$WORK/out" | grep -q ': OK' && note "bluetooth socket creation OK (connect hits broker deny, vsock class)" || note "bluetooth create: $(grep bluetooth_l2cap "$WORK/out")"
+
+# --- seeded control (G-1 Koch criterion): with the probe's opens
+# failing, the EACCES ioctl greps must go dark — proof the gate cannot
+# PASS without a real ioctl. Second enforced session.
+echo "== seeded control: open-failure must not read as ioctl denial =="
+SOUT="$WORK/seeded.raw"
+LS=$(printf '%q launch --harness claude --project %q --enforce -- env P17_SEED_OPEN_FAIL=1 python3 %q' "$BIN/castellan" "$WORK/proj" "$PROBE")
+script -qec "$LS" /dev/null > "$SOUT" 2>&1
+tr -d '\r' < "$SOUT" > "$WORK/seeded"
+SID2=$(grep -oE 's[0-9a-f]{10,}' "$WORK/seeded" | head -1)
+[ -n "$SID2" ] && SIDS+=("$SID2")
+if ! grep -q 'P17-PROBE-DONE' "$WORK/seeded"; then
+  bad "seeded probe did not complete"
+elif grep -qF 'kvm_ioctl_getapi: NOT-REACHED' "$WORK/seeded" \
+  && grep -qF 'ptmx_ioctl_TIOCGPTN: NOT-REACHED' "$WORK/seeded" \
+  && ! grep -qF 'kvm_ioctl_getapi: errno=13 (EACCES)' "$WORK/seeded" \
+  && ! grep -qF 'ptmx_ioctl_TIOCGPTN: errno=13 (EACCES)' "$WORK/seeded"; then
+  ok "seeded control: open-failure degrades to NOT-REACHED; ioctl EACCES gate cannot fire"
+else
+  bad "seeded control: probe conflates open-failure with ioctl denial"
+fi
 
 echo "P17-DEVICE: $PASS pass, $FAIL fail, $NOTE note"
 [ "$FAIL" -eq 0 ] && echo "P17-DEVICE-PASS" || echo "P17-DEVICE-FAIL"

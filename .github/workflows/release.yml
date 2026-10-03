@@ -15,10 +15,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      # Privilege-bearing job (id-token: write + contents: write): every
+      # action is SHA-pinned (review F-1 — the repo's own pinning rule).
+      # rust-toolchain: pin is the stable BRANCH head (the action infers
+      # the toolchain from the ref name, so the input makes it explicit);
+      # rust-cache: annotated tag v2 peels to the v2.9.2 commit.
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable@2026-10-03
         with:
+          toolchain: stable
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cross linker
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
       - name: Build release binaries (Linux x86_64 + aarch64)

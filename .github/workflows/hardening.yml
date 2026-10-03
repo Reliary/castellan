@@ -14,6 +14,28 @@ permissions:
 # a second copy (drift hazard; the P14 lesson: one source of truth or
 # the copies diverge silently).
 jobs:
+  # Privilege-bearing pin lint (review F-1): release.yml holds
+  # id-token: write + contents: write — a mutable action ref there can
+  # mint a valid keyless cosign signature for forged artifacts. Every
+  # `uses:` in release.yml must be a full 40-hex SHA. The grep is
+  # written so a SHA-with-comment matches and anything else fails.
+  action-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: release.yml action refs must be SHA-pinned
+        run: |
+          rc=0
+          for ref in $(grep -ohE 'uses: *[^ ]+' .github/workflows/release.yml | sed 's/.*@//'); do
+            if echo "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "  pinned ok: $ref"
+            else
+              echo "  MUTABLE action ref in release.yml: $ref"
+              rc=1
+            fi
+          done
+          exit $rc
+
   # Binary hardening assertions. Readelf-based, no third-party checksec
   # script pulled into CI (borrowing checksec would mean curling a shell
   # script from the internet into the trust boundary). The ci-audit plan

@@ -22,7 +22,11 @@
 #   4. a kernel capability the table never classifies (new-syscall drift)
 set -u
 
-REPO=${CASTELLAN_REPO:-$HOME/src/castellan}
+# Default to the tree this script lives in (same correction as the
+# gate itself in P14): `$HOME/src/castellan` only exists on the dev
+# box, so on CI seed() copied from a nonexistent path, every mutation
+# hit FileNotFoundError, and the selftest reported "did not apply".
+REPO=${CASTELLAN_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 PASS=0
 FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }

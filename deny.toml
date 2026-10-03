@@ -5,31 +5,15 @@ all-features = false
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
-# RUSTSEC-2022-0093 (ed25519-dalek double-pubkey oracle): not exploitable
-# here. The oracle needs an attacker-supplied PUBLIC KEY fed into the
-# SIGNING function; castellan-proof::signing generates the keypair
-# in-process from /dev/urandom (public derived from secret) and sign()
-# takes only the message. External keys enter verify() only, never sign().
-# Upgrade to v2 tracked separately (API break: Keypair/SecretKey split).
-ignore = [
-  "RUSTSEC-2022-0093",
-  # RUSTSEC-2024-0344 (curve25519-dalek Scalar sub timing): potential
-  # secret-dependent branch in scalar subtraction. Castellan signs
-  # short-lived per-boot cert digests on a local daemon socket, not
-  # high-rate secrets beside an attacker timer. Same informational
-  # posture as sibling projects (audit/deny non-blocking there too).
-  # Revisit on ed25519-dalek v2 upgrade.
-  "RUSTSEC-2024-0344",
-  # RUSTSEC-2026-0097 (rand 0.7.x unsound with a custom logger that
-  # re-enters thread_rng): type INFO; requires a log feature + a custom
-  # logger calling rand::rng() during reseed — castellan installs no
-  # such logger, and rand reaches us only as a transitive dep of
-  # ed25519-dalek v1. No patch exists for the 0.7 line (patched floors
-  # start at 0.8.6), so the only fix is the dalek v2 upgrade already
-  # tracked above. Mirrored into ci.yml's `cargo audit --ignore` flags
-  # (cargo-audit does not read this file).
-  "RUSTSEC-2026-0097",
-]
+# No ignores as of 2026-10-03: the long-tracked ed25519-dalek v2 upgrade
+# landed (2.2.0; curve25519-dalek 4.1.3; rand dropped from the graph
+# entirely), retiring RUSTSEC-2022-0093 (double-pubkey oracle),
+# RUSTSEC-2024-0344 (scalar-sub timing) and RUSTSEC-2026-0097 (rand
+# 0.7 custom-logger unsoundness). If a future advisory needs a written
+# rationale before a fix exists, record it here AND mirror it into
+# ci.yml's `cargo audit --ignore` flags (cargo-audit does not read this
+# file).
+ignore = []
 
 [bans]
 multiple-versions = "warn"

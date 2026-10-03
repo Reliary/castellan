@@ -1,0 +1,46 @@
+[package]
+name = "castellan-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+
+[dependencies.castellan-core]
+path = "../crates/castellan-core"
+
+[dependencies.castellan-proxy]
+path = "../crates/castellan-proxy"
+features = ["fuzz"]
+
+[dependencies.castellan-canary]
+path = "../crates/castellan-canary"
+features = ["fuzz"]
+
+[[bin]]
+name = "proxy_fuzz"
+path = "fuzz_targets/proxy_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_fuzz"
+path = "fuzz_targets/rpc_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ledger_fuzz"
+path = "fuzz_targets/ledger_fuzz.rs"
+test = false
+doc = false
+bench = false

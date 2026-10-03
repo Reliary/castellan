@@ -7,4 +7,4 @@ description = "Per-project trust scoring: EWMA score, tier mapping, single-write
 
 [dependencies]
 castellan-core = { path = "../castellan-core" }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }

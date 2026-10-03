@@ -8,7 +8,7 @@ description = "Placebo-controlled proof pipeline: danger signal + guard-insertio
 [dependencies]
 castellan-core = { path = "../castellan-core" }
 castellan-ledger = { path = "../castellan-ledger" }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

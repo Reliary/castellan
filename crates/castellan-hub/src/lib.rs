@@ -173,7 +173,8 @@ pub fn index_sha(project: &Path) -> Option<String> {
   let bytes = std::fs::read(&path).ok()?;
   let mut h = Sha256::new();
   h.update(&bytes);
-  Some(format!("{:x}", h.finalize()))
+  let out = h.finalize();
+  Some(out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(test)]

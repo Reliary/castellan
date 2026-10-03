@@ -1155,6 +1155,18 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::process::exit(127);
     }
     Err(e) => {
+      if enforce {
+        // Review D-1: under --enforce the broker carries the C37/C39d
+        // escape denies (deputies, ssh, unknown families). Running the
+        // agent without it would be an unconfined-egress session
+        // labeled "enforced" — fail closed instead. (Audit posture
+        // keeps the warning: observation mode, no containment claim;
+        // plain audit never reaches here — it skips the broker above.)
+        eprintln!("castellan: broker unavailable ({e}); --enforce requires the egress broker — refusing to start");
+        use std::io::Write as _;
+        let _ = std::io::stderr().flush();
+        std::process::exit(1);
+      }
       eprintln!("castellan: broker unavailable ({e}); continuing without egress broker");
       apply_envelope(enforce, net, &session, &harness, &project);
       let err = execvp(&cmd);

@@ -6,19 +6,26 @@ on:
   push:
     branches: [main, quattro, diff-trust]
 
+# Top level stays read-only: scorecard's webapp verifies permission
+# PLACEMENT and rejects the publish with 400 "global perm is set to
+# write" if security-events/id-token are declared globally — the two
+# writes belong to the job that needs them.
 permissions:
-  security-events: write
   contents: read
-  # publish_results: true signs the results with Sigstore/Fulcio. Without
-  # this the action falls back to the interactive device flow — a browser
-  # code no runner completes — and fails with expired_token after ~15 min
-  # of retries (12 consecutive failures before this line). OIDC lets
-  # Fulcio issue the cert non-interactively.
-  id-token: write
 
 jobs:
   analysis:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # SARIF upload to code scanning.
+      security-events: write
+      # publish_results: true signs results with Sigstore/Fulcio via
+      # OIDC. Without it the action falls back to the interactive
+      # device flow — a browser code no runner completes — and fails
+      # with expired_token after ~15 min of retries (12 consecutive
+      # failures before this line).
+      id-token: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

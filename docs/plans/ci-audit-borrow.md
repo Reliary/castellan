@@ -101,3 +101,58 @@ clippy 0 errors · gitleaks v8.30.1 history clean (134 commits) ·
 shellcheck error-class 0 · fuzz 3×60s zero crashes · feature-shim
 `cargo check` clean. Workflows run in CI verified via PR (see push
 record).
+
+### Post-push: first-ever CI execution found 4 pre-existing red jobs (2026-10-02/03)
+
+PR #6 was the first time these workflows ever ran — feature-branch
+pushes never matched the branch triggers, so `check`, `supply-chain`,
+`cross-arch` and `syscall-drift` had been red at every recent quattro
+commit without anyone watching (diff-trust baseline shows the same
+four). All four triaged and fixed; none introduced by the CI-audit
+commits:
+
+- **syscall-drift (kernel gap):** `rseq_slice_yield` is a real
+  syscall (kernel 7.0.3) that CI runner kernels predate — the gate's
+  typo detector false-REDed. Fix keeps knowledge in the table: the
+  gate reads the introducing version from the class rationale
+  ("<name> (X.Y.Z)") and notes expected absence on older kernels;
+  undocumented absence or absence on a kernel that should have it
+  still FAILs. Testing caught a bash pitfall in the comparison helper
+  (`local a=.. b=${a}..` expands before assignment — want_minor
+  captured empty). Gate PASS, selftest 5/5 preserved.
+- **check (clippy -D warnings):** 71 warnings were errors on CI while
+  local clippy (no -D) had been passing — the gate was red from day
+  one. 14 auto-fixes; the rest by hand: memory's index→enum string
+  round-trip replaced with `from_index` (and the now-dead `from_str`,
+  `decode_response`, `ROLE_SELF` removed — the read path is
+  `read_margin` and the self set is the plain list by design);
+  daemon's never-constructed respawn stubs and audit fields kept with
+  `#[allow(dead_code)]` + honest "designed, not wired" status
+  comments; `Caller::Rejected` kept the same way (classification is
+  binary today); two `too_many_arguments` allows with rationale; loop
+  and sort rewrites; cli's `}      if` suspicious-else formatting
+  fixed as a newline only (behavior unchanged — both blocks run,
+  before and after). Final: `-D warnings` exit 0.
+- **supply-chain (cargo audit):** three advisories — two already
+  dispositioned in deny.toml with written rationales (cargo-audit
+  does not read deny.toml) plus RUSTSEC-2026-0097 (rand 0.7 INFO/
+  unsound: custom-logger reentrancy we do not have; no 0.7 patch
+  exists — fix is the tracked dalek v2 upgrade). All three mirrored
+  into `cargo audit --ignore` flags and deny.toml's ignore list.
+  Verified locally with the exact CI flags on a fresh advisory DB:
+  exit 0; `cargo deny check advisories` ok.
+- **cross-arch (aarch64):** `libc::SYS_{iopl,ioperm,chown,lchown}`
+  do not exist on aarch64 (E0425 ×4) — the denylist named x86-only
+  constants unconditionally. Split into `ARCH_ONLY_SYSCALLS` /
+  `ARCH_ONLY_FILTER_NAMES` (present on x86, empty elsewhere —
+  uninvocable syscalls need no entry) with `filter_names()` as the
+  single lookup so an arch-split pair cannot diverge. Local aarch64
+  `cargo check`: zero E0425 (remaining 3 errors are build-scripts
+  needing cross-gcc, which CI installs); envelope suite 12/12.
+
+Also redacted a pre-existing login-name comment in castellan-ledger
+while that file received its auto-fixes.
+
+Verification at close: clippy `-D warnings` 0 · tests 211/211 ·
+audit exit 0 (exact flags) · deny advisories ok · actionlint 0 ·
+drift gate PASS + selftest 5/5 · aarch64 E0425=0.

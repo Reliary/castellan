@@ -265,7 +265,7 @@ impl TrustDb {
          tier = excluded.tier,
          last_event_ts = excluded.last_event_ts,
          last_tier_up_ts = excluded.last_tier_up_ts",
-      params![hash, new_score, new_tier as i64, ev.ts, new_last_up as i64],
+      params![hash, new_score, new_tier as i64, ev.ts as i64, new_last_up as i64],
     )?;
     self.conn.execute(
       "INSERT INTO events (realpath_hash, ts, session_uuid, signal, delta, evidence_json)

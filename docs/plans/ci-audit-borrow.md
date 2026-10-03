@@ -156,3 +156,21 @@ while that file received its auto-fixes.
 Verification at close: clippy `-D warnings` 0 · tests 211/211 ·
 audit exit 0 (exact flags) · deny advisories ok · actionlint 0 ·
 drift gate PASS + selftest 5/5 · aarch64 E0425=0.
+
+### Final CI verdict (2026-10-03, SHA e3814c9, PR #6)
+
+All six PR-triggered workflows green — first fully green ci run in
+this repo's recorded history: ci 11/11 (check, release-build,
+cross-arch, supply-chain, syscall-drift, workload-syscalls,
+diff-trust-gate, escape-regression, lint-workflows,
+shellcheck-report, test-ratchet), Secret scan, Dependency review,
+Supply-chain hardening, Binary size, CodeQL. The last red (selftest)
+was the dev-box REPO default in syscall-drift-selftest.sh — the one
+file P14's self-location correction missed — fixed the same way.
+
+Not exercised by this PR (by design of their triggers): fuzz.yml
+(workflow_dispatch discovers workflows from the default branch — runs
+post-merge or on schedule), Scorecard (push-to-quattro + weekly
+schedule), Release cosign path (first real `v*` tag; local
+verification limited to YAML/actionlint since keyless signing needs
+GitHub OIDC).

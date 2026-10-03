@@ -85,8 +85,16 @@ jobs:
       # No pipes without pipefail: `cmd 2>&1 | tail` masks the exit code
       # and a compromised dependency would pass CI silently. Each check
       # tees to a log AND fails the step on advisories/bans/violations.
+      # The --ignore list mirrors deny.toml's written rationales
+      # (cargo-audit does not read deny.toml): 2022-0093 and 2024-0344
+      # are the dalek oracle/timing notes; 2026-0097 is rand 0.7 INFO/
+      # unsound (custom-logger reentrancy we do not have; no 0.7 patch
+      # exists — fix is the tracked dalek v2 upgrade).
       - name: cargo audit (blocking)
-        run: cargo audit --deny warnings
+        run: >
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2022-0093 --ignore RUSTSEC-2024-0344
+          --ignore RUSTSEC-2026-0097
       - name: cargo deny advisories (blocking)
         run: cargo deny check advisories
       - name: cargo deny bans+licenses+sources (blocking)

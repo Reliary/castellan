@@ -20,6 +20,15 @@ ignore = [
   # posture as sibling projects (audit/deny non-blocking there too).
   # Revisit on ed25519-dalek v2 upgrade.
   "RUSTSEC-2024-0344",
+  # RUSTSEC-2026-0097 (rand 0.7.x unsound with a custom logger that
+  # re-enters thread_rng): type INFO; requires a log feature + a custom
+  # logger calling rand::rng() during reseed — castellan installs no
+  # such logger, and rand reaches us only as a transitive dep of
+  # ed25519-dalek v1. No patch exists for the 0.7 line (patched floors
+  # start at 0.8.6), so the only fix is the dalek v2 upgrade already
+  # tracked above. Mirrored into ci.yml's `cargo audit --ignore` flags
+  # (cargo-audit does not read this file).
+  "RUSTSEC-2026-0097",
 ]
 
 [bans]

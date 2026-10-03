@@ -16,9 +16,27 @@ const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7;
 /// above this bound is x32/unsupported and cannot match the table.
 const X32_NR_BOUND: u32 = 0x3fff_ffff;
 
+/// Syscalls that exist only on x86 (iopl/ioperm) or whose generic-ABI
+/// architectures dropped the legacy nr (aarch64 has no chown/lchown —
+/// glibc wraps them through fchownat). They are uninvocable on the
+/// architectures that lack the constant, so the filter simply does not
+/// mention them there. The cross-arch CI job caught the E0425s this
+/// design previously produced (the const list named them unconditionally).
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+const ARCH_ONLY_SYSCALLS: [libc::c_long; 4] =
+  [libc::SYS_iopl, libc::SYS_ioperm, libc::SYS_chown, libc::SYS_lchown];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+const ARCH_ONLY_SYSCALLS: [libc::c_long; 0] = [];
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+const ARCH_ONLY_FILTER_NAMES: &[(&str, libc::c_long)] =
+  &[("iopl", libc::SYS_iopl), ("ioperm", libc::SYS_ioperm), ("chown", libc::SYS_chown), ("lchown", libc::SYS_lchown)];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+const ARCH_ONLY_FILTER_NAMES: &[(&str, libc::c_long)] = &[];
+
 #[rustfmt::skip]
-fn blocked_syscalls() -> &'static [libc::c_long] {
-  &[
+fn blocked_syscalls() -> Vec<libc::c_long> {
+  let mut v: Vec<libc::c_long> = vec![
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
     libc::SYS_process_vm_writev,
@@ -91,8 +109,7 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     libc::SYS_adjtimex,
     libc::SYS_sethostname,
     libc::SYS_setdomainname,
-    libc::SYS_iopl,
-    libc::SYS_ioperm,
+    // iopl/ioperm live in ARCH_ONLY_SYSCALLS (x86-only constants).
     libc::SYS_acct,
     libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_fsetxattr,
     libc::SYS_removexattr, libc::SYS_lremovexattr, libc::SYS_fremovexattr,
@@ -101,14 +118,18 @@ fn blocked_syscalls() -> &'static [libc::c_long] {
     // kernel finding — verified live: blocking chmod breaks git).
     // The chmod residual is ownership-bounded: the agent can only
     // chmod files it owns inside the Landlock write roots.
-    libc::SYS_chown, libc::SYS_fchown, libc::SYS_lchown, libc::SYS_fchownat,
+    // chown/lchown live in ARCH_ONLY_SYSCALLS (no nr on aarch64);
+    // fchown/fchownat exist everywhere and stay in the core list.
+    libc::SYS_fchown, libc::SYS_fchownat,
     // V3 (2026-09-02): utime family UNBLOCKED. Blocking it broke every
     // compiled workflow: cargo/cc/touch set mtimes for fingerprints
     // and build artifacts (verified live: "touch: setting times ...
     // Operation not permitted", cargo build fails). The original
     // rationale (ownership-bounded timestamp abuse) is preserved by
     // Landlock: utime only works on files inside write roots.
-  ]
+  ];
+  v.extend_from_slice(&ARCH_ONLY_SYSCALLS);
+  v
 }
 
 fn f(code: u32, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
@@ -242,8 +263,6 @@ const FILTER_NAMES: &[(&str, libc::c_long)] = &[
   ("adjtimex", libc::SYS_adjtimex),
   ("sethostname", libc::SYS_sethostname),
   ("setdomainname", libc::SYS_setdomainname),
-  ("iopl", libc::SYS_iopl),
-  ("ioperm", libc::SYS_ioperm),
   ("acct", libc::SYS_acct),
   ("setxattr", libc::SYS_setxattr),
   ("lsetxattr", libc::SYS_lsetxattr),
@@ -251,16 +270,23 @@ const FILTER_NAMES: &[(&str, libc::c_long)] = &[
   ("removexattr", libc::SYS_removexattr),
   ("lremovexattr", libc::SYS_lremovexattr),
   ("fremovexattr", libc::SYS_fremovexattr),
-  ("chown", libc::SYS_chown),
   ("fchown", libc::SYS_fchown),
-  ("lchown", libc::SYS_lchown),
   ("fchownat", libc::SYS_fchownat),
 ];
+
+/// Core table plus the arch-only entries — the sole lookup used by
+/// `blocked_names()` and `syscall_nr`, so an arch-split pair can never
+/// diverge from what the filter blocks on that arch.
+fn filter_names() -> Vec<(&'static str, libc::c_long)> {
+  let mut v = FILTER_NAMES.to_vec();
+  v.extend_from_slice(ARCH_ONLY_FILTER_NAMES);
+  v
+}
 
 pub fn blocked_names() -> Vec<String> {
   blocked_syscalls()
     .iter()
-    .map(|nr| match FILTER_NAMES.iter().find(|(_, v)| v == nr) {
+    .map(|nr| match filter_names().iter().find(|(_, v)| v == nr) {
       Some((n, _)) => (*n).to_string(),
       None => format!("nr:{}", *nr),
     })
@@ -302,7 +328,7 @@ mod tests {
   fn every_blocked_syscall_has_a_hard_class() {
     let hard: Vec<&str> = by_decision(Decision::Hard).flat_map(|c| c.libc_consts.iter().copied()).collect();
     for name in blocked_syscalls() {
-      let key = format!("SYS_{}", syscall_name(*name).unwrap_or("<unknown>"));
+      let key = format!("SYS_{}", syscall_name(name).unwrap_or("<unknown>"));
       assert!(
         hard.contains(&key.as_str()),
         "{key} is in blocked_syscalls() but no Hard class claims it — \
@@ -373,10 +399,11 @@ mod tests {
   }
 
   fn syscall_nr(name: &str) -> Option<libc::c_long> {
-    // P14 F-D: single source of truth (FILTER_NAMES). This used to be a
-    // second copy of the same list, which is how the table and the
-    // filter could drift with every check still green.
-    FILTER_NAMES.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+    // P14 F-D: single source of truth (filter_names = core + arch
+    // entries). This used to be a second copy of the same list, which
+    // is how the table and the filter could drift with every check
+    // still green.
+    filter_names().iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
   }
 
   /// The filter must be a default-ALLOW denylist (commitment #8) with a

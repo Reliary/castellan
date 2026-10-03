@@ -169,7 +169,7 @@ impl TrustDb {
       Ok((score, tier, ts)) => Ok(ProjectTrust {
         score,
         tier: tier_from_i64(tier),
-        last_event_ts: ts as u64,
+        last_event_ts: u64_from_i64(2, ts)?,
       }),
       Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ProjectTrust {
         score: COLD_START_SCORE,
@@ -207,7 +207,7 @@ impl TrustDb {
         params![hash],
         |r| r.get::<_, i64>(0),
       )
-      .map(|v| v as u64)
+      .and_then(|v| u64_from_i64(0, v))
       .unwrap_or(0);
     let has_proof: bool = self
       .conn
@@ -257,6 +257,8 @@ impl TrustDb {
     if new_tier == Tier::Three && before.tier as i64 <= Tier::Two as i64 && !has_proof {
       new_tier = Tier::Two;
     }
+    let ev_ts = u64_to_i64(ev.ts)?;
+    let up_ts = u64_to_i64(new_last_up)?;
     self.conn.execute(
       "INSERT INTO projects (realpath_hash, score, tier, last_event_ts, last_tier_up_ts)
        VALUES (?1, ?2, ?3, ?4, ?5)
@@ -265,14 +267,14 @@ impl TrustDb {
          tier = excluded.tier,
          last_event_ts = excluded.last_event_ts,
          last_tier_up_ts = excluded.last_tier_up_ts",
-      params![hash, new_score, new_tier as i64, ev.ts as i64, new_last_up as i64],
+      params![hash, new_score, new_tier as i64, ev_ts, up_ts],
     )?;
     self.conn.execute(
       "INSERT INTO events (realpath_hash, ts, session_uuid, signal, delta, evidence_json)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
       params![
         hash,
-        ev.ts as i64,
+        ev_ts,
         ev.session,
         ev.signal.as_str(),
         ev.signal.delta(),
@@ -291,7 +293,7 @@ impl TrustDb {
     )?;
     let rows = stmt.query_map(params![hash], |r| {
       Ok(TrustEvent {
-        ts: r.get::<_, i64>(0)? as u64,
+        ts: u64_from_i64(0, r.get::<_, i64>(0)?)?,
         session: r.get::<_, String>(1)?,
         signal: signal_from_str(&r.get::<_, String>(2)?),
         evidence: r.get::<_, String>(3)?,
@@ -299,6 +301,19 @@ impl TrustDb {
     })?;
     rows.collect()
   }
+}
+
+/// rusqlite 0.40 dropped the u64 impls; 0.31's were range-checked
+/// (loud error on negative/overflow) — restore that exact contract.
+/// `as` casts would wrap: a poisoned -1 becomes u64::MAX and inverts
+/// every comparison it flows into (review C-1).
+fn u64_from_i64(idx: usize, v: i64) -> rusqlite::Result<u64> {
+  u64::try_from(v)
+    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Integer, Box::new(e)))
+}
+
+fn u64_to_i64(v: u64) -> rusqlite::Result<i64> {
+  i64::try_from(v).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
 }
 
 fn tier_from_i64(v: i64) -> Tier {
@@ -568,5 +583,30 @@ mod tests {
     db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::UserRevert)).unwrap();
     let t = db.score(Path::new("/tmp/bar")).unwrap();
     assert_eq!(t.score, COLD_START_SCORE);
+  }
+
+  #[test]
+  fn poisoned_future_ts_is_a_loud_error_not_a_wrap() {
+    let mut db = tmp_db();
+    let huge = ev_at(u64::MAX, "s", Signal::CleanSession);
+    let err = db.apply(Path::new("/tmp/poison-ts"), &huge).unwrap_err();
+    assert!(
+      matches!(err, rusqlite::Error::ToSqlConversionFailure(_)),
+      "u64::MAX must error loudly at the SQL boundary, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn negative_stored_ts_is_a_loud_error_on_read() {
+    let mut db = tmp_db();
+    db.apply(Path::new("/tmp/poison-read"), &ev_at(1_000, "s", Signal::CleanSession)).unwrap();
+    db.conn
+      .execute("UPDATE projects SET last_event_ts = -1", [])
+      .unwrap();
+    let err = db.score(Path::new("/tmp/poison-read")).unwrap_err();
+    assert!(
+      matches!(err, rusqlite::Error::FromSqlConversionFailure(..)),
+      "negative stored ts must error loudly on read, got {err:?}"
+    );
   }
 }

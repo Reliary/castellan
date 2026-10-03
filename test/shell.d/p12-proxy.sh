@@ -92,8 +92,11 @@ PW="$W/pw"; mkproj "$PW"
 launch_env() { # $1 proj, $2 outfile-basename, $3 extra flags...
   local proj="$1" out="$2"; shift 2
   local log="${out%.txt}.launch"
+  # ${*} not $@: this expands inside a double-quoted script -qec STRING, so
+  # $@ would splice each flag as its own word into script's argv (SC2145),
+  # turning flag #1 into the typescript filename argument.
   script -qec "
-    XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' $@ -- python3 -c \"
+    XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' ${*} -- python3 -c \"
 import os, pathlib
 p = pathlib.Path('$proj')
 (p / '$out').write_text(

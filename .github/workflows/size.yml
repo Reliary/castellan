@@ -20,10 +20,13 @@ jobs:
       - name: Report size
         run: |
           ls -lh target/release/castellan target/release/castellan-daemon
-          SIZE=$(stat -c %s target/release/castellan-daemon)
-          echo "Daemon size (bytes): $SIZE"
           MAX=15728640 # 15 MB budget, same as sibling projects
-          if [ "$SIZE" -gt "$MAX" ]; then
-            echo "Daemon exceeded 15MB budget"
-            exit 1
-          fi
+          # Both binaries get the budget — the CLI was previously unchecked.
+          for b in castellan castellan-daemon; do
+            SIZE=$(stat -c %s "target/release/$b")
+            echo "$b size (bytes): $SIZE"
+            if [ "$SIZE" -gt "$MAX" ]; then
+              echo "$b exceeded 15MB budget"
+              exit 1
+            fi
+          done

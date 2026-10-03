@@ -9,22 +9,49 @@ on:
 permissions:
   contents: read
 
+# cargo-deny (advisories/sources/bans/licenses) runs ONLY in ci.yml's
+# supply-chain job — this file used to run the identical four checks as
+# a second copy (drift hazard; the P14 lesson: one source of truth or
+# the copies diverge silently).
 jobs:
-  deny:
+  # Binary hardening assertions. Readelf-based, no third-party checksec
+  # script pulled into CI (borrowing checksec would mean curling a shell
+  # script from the internet into the trust boundary). The ci-audit plan
+  # started this as an informational log; the kill criterion ("escalate
+  # to gate on evidence") fired — measured locally on 2026-10-02, both
+  # binaries already satisfy all four (PIE, NX, RELRO, BIND_NOW), so the
+  # assertion cannot produce false-red noise on a passing build.
+  binary-hardening:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked 2>/dev/null || true
-      # Blocking (no tail-pipes): see ci.yml supply-chain for why pipes
-      # without pipefail are a silent-pass hole.
-      - name: cargo-deny advisories
-        run: cargo deny check advisories
-      - name: cargo-deny sources
-        run: cargo deny check sources
-      - name: cargo-deny bans
-        run: cargo deny check bans
-      - name: cargo-deny licenses
-        run: cargo deny check licenses
+      - name: Build release binaries
+        run: cargo build --release -p castellan-cli -p castellan-daemon
+      - name: Assert PIE / NX / Full RELRO (both binaries)
+        run: |
+          rc=0
+          for b in target/release/castellan target/release/castellan-daemon; do
+            echo "== $b =="
+            readelf -hW "$b" | grep -q 'Type:.*DYN' \
+              && echo "  PIE   ok" || { echo "  PIE   MISSING"; rc=1; }
+            # GNU_STACK without E bit = NX (non-executable stack)
+            readelf -lW "$b" | grep 'GNU_STACK' | grep -qE 'RW\s+0x' \
+              && echo "  NX    ok" || { echo "  NX    MISSING"; rc=1; }
+            readelf -lW "$b" | grep -q 'GNU_RELRO' \
+              && echo "  RELRO ok" || { echo "  RELRO MISSING"; rc=1; }
+            # BIND_NOW = full RELRO (no lazy binding window)
+            readelf -dW "$b" | grep -q 'BIND_NOW' \
+              && echo "  FULL-RELRO ok" || { echo "  FULL-RELRO MISSING"; rc=1; }
+          done
+          exit $rc
+      # Build to a file first: grepping a pipe would mask a build failure
+      # (grep's empty-match exit becomes the step's only signal).
+      - name: No secrets in build log
+        run: |
+          cargo build --release -p castellan-cli -p castellan-daemon > /tmp/build.log 2>&1 || { echo "build failed"; cat /tmp/build.log; exit 1; }
+          if grep -iE 'sk-[a-zA-Z0-9]{20,}|AKIA[0-9A-Z]{16}|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY' /tmp/build.log; then
+            echo "secret-looking material in build log"; exit 1
+          fi
+          echo "build log clean"

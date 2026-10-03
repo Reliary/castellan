@@ -5,6 +5,11 @@ on:
     branches: [main, quattro, diff-trust]
   pull_request:
 
+# Rapid push series shouldn't burn runner minutes on superseded runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -74,7 +79,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install tools
-        run: cargo install cargo-audit cargo-deny --locked 2>/dev/null || true
+        # No `|| true`: a failed install must be visible here rather than
+        # surfacing later as a confusing "command not found".
+        run: cargo install cargo-audit cargo-deny --locked
       # No pipes without pipefail: `cmd 2>&1 | tail` masks the exit code
       # and a compromised dependency would pass CI silently. Each check
       # tees to a log AND fails the step on advisories/bans/violations.
@@ -143,7 +150,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p castellan-proof structural -- --nocapture 2>&1 | tail -3
+      # No pipe (F4 rule): `| tail` would mask a structural-test failure —
+      # this step's own exit code is the signal the python gates cannot
+      # replace (they re-derive behavior, not test-suite health).
+      - run: cargo test -p castellan-proof structural
       - name: sig_name precision on repo sources
         run: python3 test/diff-trust-gate.py --check precision --min 0.80
       - name: caller-count agreement vs rg ground truth
@@ -180,3 +190,65 @@ jobs:
       # keeps the Rust invariant in the escape-regression job too.
       - name: envelope suite (Hard-member closure, arch/x32, drift table)
         run: cargo test -p castellan-envelope
+
+  # Workflow-structure lint (borrowed from reliary-agent). Local v1.7.7
+  # run: clean, so it gates per the ci-audit kill criterion (blocking only
+  # if clean at first run). -shellcheck=/-pyflakes= pin the integrations
+  # OFF so this job's result depends only on workflow YAML, not on which
+  # extras the runner happens to ship; shellcheck itself is report-only
+  # below.
+  lint-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install actionlint (pinned)
+        run: |
+          curl -sL "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz" \
+            | tar -xz -C /tmp actionlint
+          /tmp/actionlint --version
+      - name: actionlint
+        run: /tmp/actionlint -shellcheck= -pyflakes= -oneline
+
+  # Report-only: 239 findings at default severity against pre-existing
+  # suite style — gating on that floods PRs with debt. The error class is
+  # kept at zero manually (the one historical error, SC2145 in
+  # p12-proxy.sh launch_env, was a real bug and got fixed); this step's
+  # job is to keep the report visible without gating.
+  shellcheck-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install shellcheck (pinned)
+        run: |
+          curl -sL "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz" \
+            | tar -xJ -C /tmp
+      - name: shellcheck (all severities, not gating)
+        if: always()
+        continue-on-error: true
+        run: |
+          /tmp/shellcheck-v0.10.0/shellcheck -f gcc test/shell.d/*.sh test/*.sh || true
+      - name: error-severity must stay at zero
+        run: |
+          n=$(/tmp/shellcheck-v0.10.0/shellcheck -S error -f gcc test/shell.d/*.sh test/*.sh | wc -l)
+          echo "error-severity findings: $n"
+          [ "$n" -eq 0 ]
+
+  # Test-count ratchet (reliary8 pattern). 211 measured 2026-10-02.
+  # A drop means suites/tests disappeared — bump the floor deliberately
+  # in the same PR that removes a test, never silently.
+  test-ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests (fail the job on failure, unpiped)
+        run: |
+          cargo test --workspace > test.log 2>&1 || { cat test.log; exit 1; }
+          grep -E 'test result:' test.log || true
+      - name: Assert count >= floor
+        run: |
+          FLOOR=211
+          total=$(awk '/test result:/{for(i=1;i<=NF;i++) if($i ~ /^passed/) s+=$(i-1)} END{print s+0}' test.log)
+          echo "workspace tests: $total (floor $FLOOR)"
+          [ "$total" -ge "$FLOOR" ]

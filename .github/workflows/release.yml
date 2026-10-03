@@ -4,8 +4,11 @@ on:
   push:
     tags: ['v*']
 
+# id-token: write — keyless cosign (OIDC → Fulcio). Signing is blocking:
+# a release that cannot be signed must not publish unsigned.
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -32,10 +35,46 @@ jobs:
             cp target/$target/release/castellan-daemon dist/castellan-daemon-v${VERSION}-linux-${short}
           done
           cd dist && tar -czf castellan-v${VERSION}-linux-x86_64.tar.gz *x86_64* && tar -czf castellan-v${VERSION}-linux-aarch64.tar.gz *aarch64*
+      - name: Compute SHA256 checksums
+        run: |
+          cd dist
+          for f in *.tar.gz; do
+            sha256sum "$f"
+          done > SHA256SUMS
+          cat SHA256SUMS
+      - name: Install cosign (SHA-pinned)
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+      - name: Sign tarballs and checksums (keyless, blocking)
+        run: |
+          cd dist
+          for f in *.tar.gz; do
+            cosign sign-blob "$f" --bundle "${f}.sig" --yes
+          done
+          cosign sign-blob SHA256SUMS --bundle SHA256SUMS.sig --yes
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             dist/*.tar.gz
+            dist/*.tar.gz.sig
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
           generate_release_notes: true
+          body: |
+            ## Verify
+
+            ```sh
+            # checksums
+            sha256sum -c --ignore-missing SHA256SUMS
+
+            # signatures (keyless; requires cosign >= 2.x)
+            cosign verify-blob \
+              --bundle SHA256SUMS.sig \
+              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              SHA256SUMS
+            ```
+
+            Each `.tar.gz` also carries its own `.sig` bundle; verify it the
+            same way with `--bundle <tarball>.sig` and the tarball as the blob.
           draft: false

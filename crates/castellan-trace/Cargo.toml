@@ -6,5 +6,5 @@ license.workspace = true
 description = "P9.3 cross-session contact tracing: FTS5 spine index, exposure scoring on canary trip."
 
 [dependencies]
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { workspace = true }

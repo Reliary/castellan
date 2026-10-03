@@ -6,6 +6,6 @@ license.workspace = true
 description = "P9.4 blast-radius-weighted trust: hub scores from the stria phrase index (grammar-free, pure Rust)."
 
 [dependencies]
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { workspace = true }
 sha2 = "0.11"

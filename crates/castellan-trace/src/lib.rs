@@ -59,7 +59,9 @@ pub fn open_index(state_dir: &Path) -> rusqlite::Result<Connection> {
 /// The per-session high-water mark: the largest ts already indexed.
 pub fn watermark(conn: &Connection, session: &str) -> rusqlite::Result<u64> {
   conn
-    .query_row("SELECT max_ts FROM watermark WHERE session = ?1", [session], |r| r.get(0))
+    .query_row("SELECT max_ts FROM watermark WHERE session = ?1", [session], |r| {
+      r.get::<_, i64>(0).map(|v| v as u64)
+    })
     .or_else(|e| match e {
       rusqlite::Error::QueryReturnedNoRows => Ok(0),
       other => Err(other),
@@ -115,7 +117,10 @@ pub fn exposure(
   )?;
   let mut exposed: Vec<(String, u64)> = Vec::new();
   let rows = stmt.query_map(params![compromised, candidate], |r| {
-    Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+    Ok((
+      r.get::<_, String>(0)?,
+      r.get::<_, i64>(1)? as u64,
+    ))
   })?;
   for row in rows.flatten() {
     exposed.push(row);
@@ -129,7 +134,12 @@ pub fn exposure(
   let mut stmt = conn.prepare("SELECT MAX(ts) FROM writes WHERE session = ?1 AND path = ?2")?;
   let mut after: Vec<String> = Vec::new();
   for (path, cand_ts) in &exposed {
-    let comp_ts: Option<u64> = stmt.query_row(params![compromised, path], |r| r.get(0)).ok().flatten();
+    let comp_ts: Option<u64> = stmt
+      .query_row(params![compromised, path], |r| {
+        r.get::<_, Option<i64>>(0).map(|v| v.map(|n| n as u64))
+      })
+      .ok()
+      .flatten();
     if comp_ts.map(|c| *cand_ts > c).unwrap_or(false) {
       after.push(path.clone());
     }

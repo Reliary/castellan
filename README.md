@@ -58,20 +58,21 @@ only, not read or egress blocking.
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified
 kernels: 7.0.3 and 7.1.8 (x86_64). `preflight` runs 6 checks — all 6 must pass.
 
-From the [v0.1.0 release](https://github.com/Reliary/castellan/releases/tag/v0.1.0) (MIT):
+From the [v0.1.0 release](https://github.com/Reliary/castellan/releases/tag/v0.1.0) (MIT).
+That tag ships **only the CLI** (`castellan`); the daemon binary is not in it — build from
+source below for a working daemon until the next tag, which bundles both.
 
 ```sh
 chmod +x castellan
 ./castellan preflight                  # all 6 checks must pass
-./castellan daemon &                   # a systemd user unit outlives the terminal
 ```
 
-Or from source:
+Or from source (builds both binaries):
 
 ```sh
 cargo build --release --workspace
 ./target/release/castellan preflight
-./target/release/castellan daemon &
+./target/release/castellan service install   # user service; daemon runs durable + fail-closed
 ```
 
 Then see Quickstart below.
@@ -79,9 +80,10 @@ Then see Quickstart below.
 ## Quickstart
 
 ```sh
-cargo build --release --workspace          # or download the release binary
+cargo build --release --workspace          # or download the release binaries
 castellan preflight                        # check your kernel: all 6 checks must pass
-castellan daemon &                         # or run as a systemd user unit (recommended)
+castellan service install                  # install + start the user service (durable daemon)
+castellan init                             # scaffold keyring.toml + egress.toml (edit, then restart)
 castellan launch -- claude                 # enforced by default: workspace-only writes
 castellan status                           # see the session
 castellan freeze && castellan thaw         # the panic button
@@ -91,6 +93,8 @@ castellan diff <session>                    # what did it change?
 castellan keep <session>                   # commit it, or `undo` to throw it away
 castellan cert <session>                   # signed ProofCertificate (bounds, placebo, chain)
 castellan verify cert.json                 # re-check the signature + spine chain
+castellan gc --keep-last 20                # prune old session state (none before this)
+castellan uninstall --yes                   # remove service, sessions, state and keyring
 ```
 
 `--harness` is auto-detected from the command (claude, codex, pi, opencode, aider, cursor-agent, gemini, crush); unknown harnesses still get the envelope, just no harness-state protection. `--no-enforce` opts out loudly (audit mode) — for debugging only.

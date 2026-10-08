@@ -254,7 +254,7 @@ jobs:
           grep -E 'test result:' test.log || true
       - name: Assert count >= floor
         run: |
-          FLOOR=218
+          FLOOR=222
           total=$(awk '/test result:/{for(i=1;i<=NF;i++) if($i ~ /^passed/) s+=$(i-1)} END{print s+0}' test.log)
           echo "workspace tests: $total (floor $FLOOR)"
           [ "$total" -ge "$FLOOR" ]
@@ -304,3 +304,10 @@ jobs:
           echo "preflight checks: source=$actual README=$claimed"
           [ "$actual" = "$claimed" ] \
             || { echo "FAIL: README claims $claimed preflight checks; source has $actual."; exit 1; }
+
+      # The 2026-10-08 defect this closes: help advertised `castellan daemon`,
+      # the README echoed it, and the CLI had no such arm — first user command
+      # failed. Every advertised verb must exist. Negative control: adding a
+      # bogus usage line goes red (verified locally 2026-10-08).
+      - name: every advertised CLI command has a match arm
+        run: python3 test/doc-truth-verbs.py

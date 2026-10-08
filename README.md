@@ -122,3 +122,10 @@ docs/
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Security
+
+Found a bypass? Use private vulnerability reporting (**Security → Report a vulnerability**)
+rather than a public issue — see [SECURITY.md](SECURITY.md). Start with its first section:
+confinement is conditional on the agent being launched through castellan, and processes
+you did not launch are unconfined.

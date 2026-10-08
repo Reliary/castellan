@@ -6,7 +6,7 @@ Target: [basecamp/omarchy](https://github.com/basecamp/omarchy) (quattro branch,
 
 The antagonism rounds surfaced heavy architectural commitments (overlayfs undo substrate, egress proxy with credential injection, daemon-owned freezer, user-namespace mounts). These are weeks of greenfield Rust before any owned primitive wires in. Building directly in a fork of omarchy from day one would produce a long-lived divergent branch with no path to merge until the enforcement core is solid. Standalone lets us:
 
-- ship P0 (freeze) as a real upstream PR immediately — it's small, delightful, zero threat-model stakes
+- ship P0 (freeze) as a real upstream PR immediately: it's small, delightful, zero threat-model stakes
 - dogfood P1-P4 on our own machines without forcing omarchy users onto an unstable enforcement core
 - keep the proof-carrying + radar work in our repo where it can mature without omarchy's merge-burden
 - propose adoption once each phase has passed its kill criterion with benchmark evidence
@@ -20,7 +20,7 @@ Each PR is atomic, matches Omarchy's `AGENTS.md` conventions (`omarchy-` prefix,
 - Quickshell QML plugin for the agents panel (freeze toggle, frozen indicator)
 - Hyprland keybind Super+Escape
 - `omarchy-freeze toggle|all|status|thaw` (thaw prompts fp-toggle biometric if available)
-- No Landlock, no daemon, no claims — just cgroup.freeze over processes named like known agents (claude, codex, pi, omp, ori, crush, copilot, agy, grok)
+- No Landlock, no daemon, no claims, just cgroup.freeze over processes named like known agents (claude, codex, pi, omp, ori, crush, copilot, agy, grok)
 - Updates `GROUP_DESCRIPTIONS`
 - Skill entry: "Castellan freeze is a panic button, not a sandbox"
 - **Acceptance:** works on 5 concurrent sessions across 3 harness brands; zero self-thaw; < 50ms; no crash on session exit
@@ -48,10 +48,10 @@ Each PR is atomic, matches Omarchy's `AGENTS.md` conventions (`omarchy-` prefix,
 ### PR 5 — proof-carrying session export (Phase 4)
 - Adds `omarchy-agent-proof <session>` command exporting a ProofCertificate via evidence-pack
 - `omarchy-agent-replay <session> --under-envelope <profile>` for forensic replay
-- **Acceptance:** known-bad/known-good classification rates reported honestly in PR description with placebo-controlled methodology
+- **Acceptance:** known-bad/known-good classification rates reported in the PR description with placebo-controlled methodology
 
 ### PR 6+ — opt-in analysis (Phase 5)
-- HV radar, engfield priors, sentinel hint — all opt-in, all off-by-default
+- HV radar, engfield priors, sentinel hint, all opt-in, all off-by-default
 - Documented as experimental; no default-omarchy behavior change
 
 ## What stays in castellan, never proposed for omarchy

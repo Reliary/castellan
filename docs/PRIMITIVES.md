@@ -1,6 +1,6 @@
 # Owned primitives inventory
 
-Every primitive we already have, with its **real-data verdict** (where one exists) and its role in castellan. Primitives marked KILL or MARGINAL are demoted to advisory-only or dropped — they are NOT load-bearing.
+Every primitive we already have, with its **real-data verdict** (where one exists) and its role in castellan. Primitives marked KILL or MARGINAL are demoted to advisory-only or dropped. They are NOT load-bearing.
 
 ## Built and load-bearing for castellan
 
@@ -9,7 +9,7 @@ Every primitive we already have, with its **real-data verdict** (where one exist
 | agent-audit-trail | agent-audit-trail | Python | PASS | advisory event layer (tamper-evident hash chain); compared against kernel truth for mismatches |
 | agent-profile | structural-stack/agent-profile | Rust | BUILT (442 LOC) | session fingerprint + drift detection; auto-detects Cursor/Claude/Aider/JSONL |
 | carrion | carrion | Rust | BUILT (227 LOC) | dead-code detection; reused for harness-state anomaly baseline |
-| cert-evals | cert-evals | Python | BUILT | benchmark methodology — interleaved + placebo + SHA-256 cert; directly satisfies the interleaving directive |
+| cert-evals | cert-evals | Python | BUILT | benchmark methodology: interleaved + placebo + SHA-256 cert; directly satisfies the interleaving directive |
 | config-radar | config-radar | Rust | BUILT (validated) | post-session completeness check (missing config keys); proof-carrying component |
 | cortex-rs | cortex-rs | Rust | BUILT (~3000 LOC) | tier-promotion trust engine (recall-based, NOT time-decay); consolidation; Hebbian HV |
 | engfield | engfield | Rust | BUILT (substantial) | predictive memory priors, SDM 65K locations, zero-token context influence; opt-in Phase 5 |
@@ -29,8 +29,8 @@ Every primitive we already have, with its **real-data verdict** (where one exist
 
 | Primitive | Repo | Verdict | Why | Castellan role (if any) |
 |---|---|---|---|---|
-| refactor-proof | refactor-proof | KILL | 100% false-negative on Defects4J — real bugfixes change operators/args, not line shapes | NONE. Was originally the trust positive signal; replaced by placebo-controlled proof-fixes |
-| seq-engine | seq-engine | KILL (2026-08-27 probe) | completeness auditor is tautological on event-derived token sets (78% of learned expectations co-emitted by the same event); composite-only encoding learns ZERO expectations; ordered fingerprint adds no separation over radar's order-agnostic encoding (identical cosine 0.0150 on real spines); trust stream has 5 distinct tokens in 30 events — nothing to learn. Probe: /tmp/opencode/seq_probe.py on 29 real local spines | NONE. N1 campaign detector is a maximal-run scan, not seq-engine |
+| refactor-proof | refactor-proof | KILL | 100% false-negative on Defects4J: real bugfixes change operators/args, not line shapes | NONE. Was originally the trust positive signal; replaced by placebo-controlled proof-fixes |
+| seq-engine | seq-engine | KILL (2026-08-27 probe) | completeness auditor is tautological on event-derived token sets (78% of learned expectations co-emitted by the same event); composite-only encoding learns ZERO expectations; ordered fingerprint adds no separation over radar's order-agnostic encoding (identical cosine 0.0150 on real spines); trust stream has 5 distinct tokens in 30 events, nothing to learn. Probe: /tmp/opencode/seq_probe.py on 29 real local spines | NONE. N1 campaign detector is a maximal-run scan, not seq-engine |
 | half-life | half-life | KILL | vocabulary persistence decay falsified as a signal | NONE. Trust uses cortex-rs tier-promotion (recall-based) instead. No time-decay. |
 | vuln-fix-genome | vuln-fix-genome | KILL | BLAST-for-security lookup, falsified | NONE |
 | sec-commit-label | sec-commit-label | MARGINAL | k-NN retroactive tag, not predictive | advisory hint only, off-by-default |
@@ -41,7 +41,7 @@ Every primitive we already have, with its **real-data verdict** (where one exist
 
 | Primitive | Repo | Verdict | Castellan role |
 |---|---|---|---|
-| sensor-regime | sensor-regime | BUILT (synthetic AUROC 1.0 on 3 seeds — NOT real data) | sentinel hint; off-by-default; must show AUROC > 0.7 on real labelled corpus or stays off forever |
+| sensor-regime | sensor-regime | BUILT (synthetic AUROC 1.0 on 3 seeds, NOT real data) | sentinel hint; off-by-default; must show AUROC > 0.7 on real labelled corpus or stays off forever |
 | sensor-hdc | sensor-hdc | BUILT (286 LOC) | HV radar encoding; zero-dep |
 
 ## Greenfield (no owned primitive — must be built fresh)
@@ -70,14 +70,14 @@ Every primitive we already have, with its **real-data verdict** (where one exist
 
 ## CVEfixes DB location correction
 
-The DB is at `/home/john/data/cvefixes/cvefixes.db` (49.3 GB) and `/home/john/src/ideation-data/cvefixes/cvefixes_v3.db` (49.3 GB). It is NOT at `~/.cache/relay-vuln/` (that directory does not exist). The DB never ships, never gets committed, never gets vendored. relay-vuln integration is strictly local and opt-in.
+The DB is at `~/data/cvefixes/cvefixes.db` (49.3 GB) and `~/src/ideation-data/cvefixes/cvefixes_v3.db` (49.3 GB). It is NOT at `~/.cache/relay-vuln/` (that directory does not exist). The DB never ships, never gets committed, never gets vendored. relay-vuln integration is strictly local and opt-in.
 
 ## What this inventory changes about the architecture
 
-1. The enforcement plane is entirely greenfield. Honest framing: owned primitives cover observation + analysis; enforcement is new Rust.
+1. The enforcement plane is entirely greenfield. Framing: owned primitives cover observation + analysis; enforcement is new Rust.
 2. The trust positive signal is placebo-controlled proof (was proof-fixes in Python, rewritten as Rust in castellan-proof), NOT refactor-proof (which is KILLed). This is the commitment #3 verifier pattern.
 3. Trust uses cortex-rs tier-promotion (recall-based), NOT half-life (KILLed). No time-decay unless a future real-data verdict revives it.
 4. Output compression is sift, NOT agent-log-compress (KILLed).
 5. The daemon pattern is reused from reliary-agent (unix socket, lock-protected state), but the daemon code is new.
-6. The HTTP proxy from reliary-agent is gone — the egress proxy is built fresh, with credential injection (a different threat model than reliary's pass-through).
-7. **The daemon is pure Rust — no Python subprocess in the trusted path.** relay-vuln is already pure Rust (52K LOC, links as a crate). skein, carrion, sensor-hdc, cortex-rs, config-radar, engfield, stria are already Rust. The three Python-only primitives in the daemon's path (agent-audit-trail 109 LOC, evidence-pack 302 LOC, proof-fixes 270 LOC) are rewritten as Rust crates (~680 lines total, all algorithmic). seq-engine was KILLed 2026-08-27 by real-data probe — not rewritten (see the KILL row above). cert-evals and llm-replay stay Python — they're dev/CI tooling, not shipped, not in the daemon.
+6. The HTTP proxy from reliary-agent is gone; the egress proxy is built fresh, with credential injection (a different threat model than reliary's pass-through).
+7. **The daemon is pure Rust, with no Python subprocess in the trusted path.** relay-vuln is already pure Rust (52K LOC, links as a crate). skein, carrion, sensor-hdc, cortex-rs, config-radar, engfield, stria are already Rust. The three Python-only primitives in the daemon's path (agent-audit-trail 109 LOC, evidence-pack 302 LOC, proof-fixes 270 LOC) are rewritten as Rust crates (~680 lines total, all algorithmic). seq-engine was KILLed 2026-08-27 by real-data probe, not rewritten (see the KILL row above). cert-evals and llm-replay stay Python: they're dev/CI tooling, not shipped, not in the daemon.

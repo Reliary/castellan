@@ -4,14 +4,14 @@ Per-project, deterministic trust score gating ONLY envelope expansion (egress un
 
 ## Why this design and not the obvious one
 
-The obvious design: "trust gates how much the agent can do." Killed by D5 — cold-start gating punishes power users and conflicts with Omarchy's ethos. The hardened design: "the envelope is always on (the floor); trust gates only the ceiling (expansion)." Power users get full-auto within the workspace from day one. Safety is the kernel floor; trust is the ceiling.
+The obvious design: "trust gates how much the agent can do." Killed by D5: cold-start gating punishes power users and conflicts with Omarchy's ethos. The hardened design: "the envelope is always on (the floor); trust gates only the ceiling (expansion)." Power users get full-auto within the workspace from day one. Safety is the kernel floor; trust is the ceiling.
 
 ## Scoring
 
-Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spine and the daemon-verified proof pipeline. **No time-decay** — half-life is KILLed (D2). Cortex-rs tier-promotion (recall-based: 10+ recalls promote episodic → semantic → consolidated) is the decay substitute if one is needed; v0 ships without decay.
+Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spine and the daemon-verified proof pipeline. **No time-decay**; half-life is KILLed (D2). Cortex-rs tier-promotion (recall-based: 10+ recalls promote episodic → semantic → consolidated) is the decay substitute if one is needed; v0 ships without decay.
 
 ### Positive signals (hard to game)
-- **+10** placebo-controlled proof passed: a real fix dropped danger_signal more than a neutral placeholder (Factor B, row-level evidence — one row per passing file, `evidence` names the strength). The daemon independently re-running the pre-existing test suite (Factor A) earns its OWN +10 row. Row-level OR, cert-level AND: STRONG certificates require both factors; see C12 in DESIGN_DECISIONS.md. This is the only positive signal that raises tier. See proof-carrying.md. (Prior art: AWS graduated autonomy uses honeypot-injection → demotion and rollback, but no placebo control; no placebo-controlled agent-fix methodology was found in the Aug 2026 survey — see PRIOR_ART.md.)
+- **+10** placebo-controlled proof passed: a real fix dropped danger_signal more than a neutral placeholder (Factor B, row-level evidence, one row per passing file, `evidence` names the strength). The daemon independently re-running the pre-existing test suite (Factor A) earns its OWN +10 row. Row-level OR, cert-level AND: STRONG certificates require both factors; see C12 in DESIGN_DECISIONS.md. This is the only positive signal that raises tier. See proof-carrying.md. (Prior art: AWS graduated autonomy uses honeypot-injection → demotion and rollback, but no placebo control; no placebo-controlled agent-fix methodology was found in the Aug 2026 survey — see PRIOR_ART.md.)
 - **+1** clean session (no reverts, no envelope-escape attempts, no canary hits, non-empty ledger). The `keep` gate awards this unconditionally on commit — the kernel-witnessed spine is advisory here, not a gate; see the C13 erratum below.
 
 ### Negative signals (dominant — trust is negative-dominant)
@@ -23,9 +23,9 @@ Per-project EWMA in [0, 100]. Events feed it from the kernel-witnessed event spi
 
 ### Anti-gaming
 - Tests added or modified by the session don't count toward the positive signal (only pre-existing tests, daemon-re-run).
-- Sybil defense: trust is per-project; tier follows upward at most once per 86_400s wall-clock (`last_tier_up_ts`; C14a — score is never clamped, only the tier is held); tier-3 entry requires a `proof_passed` ledger row (C14b — farmed keeps buy score, not the expansion surface). Downgrades always land immediately.
-- Slow-drip: residual (D7/A8) — ceiling + deny-list means worst-case = egress unlock, not escape. Egress proxy restricts reach even when unlocked.
-- **R3-lite verdict (2026-09-03, V3 corpus): 30 rapid keep-shaped sessions on a fresh project moved score 50.0 → 80.0, tier 2 → 3.** Was OPEN (A7); **CLOSED by C14, 2026-09-05** — the same probe now holds tier at 2 (score still climbs honestly; tier follows only after the window opens AND a proof row exists).
+- Sybil defense: trust is per-project; tier follows upward at most once per 86_400s wall-clock (`last_tier_up_ts`; C14a: score is never clamped, only the tier is held); tier-3 entry requires a `proof_passed` ledger row (C14b: farmed keeps buy score, not the expansion surface). Downgrades always land immediately.
+- Slow-drip: residual (D7/A8): ceiling + deny-list means worst-case = egress unlock, not escape. Egress proxy restricts reach even when unlocked.
+- **R3-lite verdict (2026-09-03, V3 corpus): 30 rapid keep-shaped sessions on a fresh project moved score 50.0 → 80.0, tier 2 → 3.** Was OPEN (A7); **CLOSED by C14, 2026-09-05**: the same probe now holds tier at 2 (score still climbs, unclamped; tier follows only after the window opens AND a proof row exists).
 
 ## Tier → envelope profile mapping
 
@@ -64,11 +64,11 @@ Trust can sync across machines via Omarchy's existing usage-sync-folder mechanis
 
 ## Antagonism survivors
 
-- A5 (fake tests): closed — placebo control + daemon re-run + pre-existing-only.
-- A6 (fake placebo): closed — two-factor (danger-drop + existing-tests-still-pass).
-- A7 (Sybil): closed — per-project, non-empty-ledger, ceiling per window.
+- A5 (fake tests): closed: placebo control + daemon re-run + pre-existing-only.
+- A6 (fake placebo): closed: two-factor (danger-drop + existing-tests-still-pass).
+- A7 (Sybil): closed: per-project, non-empty-ledger, ceiling per window.
 - A8 (slow-drip): residual, mitigated by ceiling + deny-list + egress proxy.
-- D2 (half-life killed): closed — no time-decay, cortex-rs tier-promotion if needed.
+- D2 (half-life killed): closed: no time-decay, cortex-rs tier-promotion if needed.
 - D5 (cold-start punishes): closed — floor always on, trust gates only ceiling.
 - Cold-start posture (decision 2026-08-30, C11): a project with NO trust history runs its first session with undo+net forced (enforce is the post-B6 default; an explicit --no-enforce is honored). One clean keep earns the tier-2 default. Verified live; see docs/DESIGN_DECISIONS.md C11.
 
@@ -90,4 +90,4 @@ Monotonic relationship between trust tier and user-revert outcomes on a labelled
 Greenfield scoring engine; owned positive-signal pipeline. Phase 3, ~2 weeks.
 
 ### C13 erratum (2026-09-03): keep-gate trust rows are witness-graded, not spine-gated
-**Found by V3 antagonism:** `undo_commit` awards `clean_session` (+1) unconditionally — it checks neither `applied.is_empty()` (an empty commit still earns +1) nor the session's spine for `envelope_escape`/`decoy_trip`/`vuln_introduced` kinds. The "(no reverts, no escape attempts, no canary hits)" line above describes the INTENT, not the code: revert sessions never reach `undo_commit` (they take the `undo_discard` path, −30), but a session that committed clean file changes AND tripped the honeypot mid-run still earns +1 alongside its −50. The net (−49) preserves negative-dominance, so this is a grading imprecision, not a gaming hole — but the doc must not claim a gate the code does not enforce. Candidates for a real gate (spine check before awarding, empty-commit earns nothing) are deferred to the V3 corpus tightening pass; this erratum records the gap honestly until then.
+**Found by V3 antagonism:** `undo_commit` awards `clean_session` (+1) unconditionally — it checks neither `applied.is_empty()` (an empty commit still earns +1) nor the session's spine for `envelope_escape`/`decoy_trip`/`vuln_introduced` kinds. The "(no reverts, no escape attempts, no canary hits)" line above describes the INTENT, not the code: revert sessions never reach `undo_commit` (they take the `undo_discard` path, −30), but a session that committed clean file changes AND tripped the honeypot mid-run still earns +1 alongside its −50. The net (−49) preserves negative-dominance, so this is a grading imprecision, not a gaming hole — but the doc must not claim a gate the code does not enforce. Candidates for a real gate (spine check before awarding, empty-commit earns nothing) are deferred to the V3 corpus tightening pass; this erratum records the gap until then.

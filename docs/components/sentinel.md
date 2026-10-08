@@ -4,7 +4,7 @@ The regime-detection hint component. **Off-by-default. Advisory-only.** Detects 
 
 ## Why off-by-default
 
-sensor-regime's AUROC 1.0 is on **synthetic data (3 seeds)**. There is no real labelled corpus. Claiming AUROC would violate the honesty directives. Sentinel ships off-by-default; it must show AUROC > 0.7 on a real labelled corpus before it can even be toggled on by users, and it stays advisory-only (no enforcement) forever unless a separate decision record promotes it.
+sensor-regime's AUROC 1.0 is on **synthetic data (3 seeds)**, and there is no real labelled corpus; an AUROC claim on this would be an overstatement. Sentinel ships off-by-default; it must show AUROC > 0.7 on a real labelled corpus before it can even be toggled on by users, and it stays advisory-only (no enforcement) forever unless a separate decision record promotes it.
 
 ## Mechanism (when enabled)
 
@@ -22,11 +22,11 @@ sensor-regime's AUROC 1.0 is on **synthetic data (3 seeds)**. There is no real l
 
 ## Why not auto-freeze
 
-The honest answer: we don't have the labelled corpus to tune the threshold. Auto-freezing on a synthetic-tuned threshold would either freeze too many legit sessions (false positive) or miss real attacks (false negative). Without real data, the only honest choice is advisory. The canary-credential trigger is deterministic and high-specificity, so it CAN auto-freeze. Sentinel is probabilistic and unvalidated, so it CANNOT.
+The reason: we don't have the labelled corpus to tune the threshold. Auto-freezing on a synthetic-tuned threshold would either freeze too many legit sessions (false positive) or miss real attacks (false negative). Without real data, advisory is the only choice. The canary-credential trigger is deterministic and high-specificity, so it CAN auto-freeze. Sentinel is probabilistic and unvalidated, so it CANNOT.
 
 ## Antagonism survivors
 
-- D4 (sentinel auto-freeze killed): closed — demoted to hint, no auto-freeze.
+- D4 (sentinel auto-freeze killed): closed: demoted to hint, no auto-freeze.
 
 ## Residual risks
 
@@ -37,7 +37,7 @@ The honest answer: we don't have the labelled corpus to tune the threshold. Auto
 
 - `castellan-ledger` (event stream)
 - `castellan-trust` (decrement on detection)
-- Owned primitive: `sensor-regime` (BUILT, synthetic-only — honestly labeled).
+- Owned primitive: `sensor-regime` (BUILT, synthetic-only).
 - NOT used: `constellation-drift` (KILL), `half-life` (KILL).
 
 ## Status

@@ -10,7 +10,7 @@ probe both uid 1000, the probe run **inside an enforced castellan session**
 | `process_vm_readv` | denied | denied | Yama |
 | `ptrace(PTRACE_ATTACH)` | denied | denied | Yama + seccomp |
 | **`coredump` (`kill -6`)** | **EXTRACTED** | (same uid can signal) | `core_pattern=systemd-coredump`, `RLIMIT_CORE=unlimited`, process dumpable |
-| **disk key 0600 (read)** | readable | **readable** | read roots are `/` — a same-uid file is readable |
+| **disk key 0600 (read)** | readable | **readable** | read roots are `/`: a same-uid file is readable |
 | disk key 0600 (write) | — | denied | Landlock write roots exclude the state dir |
 | spine / `sessions/` / `trust.db` (write) | — | **denied** | Landlock |
 
@@ -36,7 +36,7 @@ probe both uid 1000, the probe run **inside an enforced castellan session**
    `/proc/<daemon>/status` is served **owned by `root:root`** (the kernel's
    non-dumpable rule), so a same-uid agent cannot read `maps`, `mem`, or
    `status`; `RLIMIT_CORE` is `0`; and `SIGABRT` produces **no core**
-   (`coredumpctl` count unchanged). The S0 finding below predates the fix —
+   (`coredumpctl` count unchanged). The S0 finding below predates the fix;
    both the leak and the closure are recorded so the claim is reproducible.
 
 4. **The anchor is already safe.** The spine, `sessions/`, and `trust.db` are
@@ -44,14 +44,14 @@ probe both uid 1000, the probe run **inside an enforced castellan session**
    evidence the certificate is assembled from. This is the property that makes
    hash-chaining meaningful.
 
-## The honest claim
+## The claim as stated
 
 With a memory-only, non-dumpable key and an agent-unwritable spine:
 
 - **Against the agent's own uid (while the daemon runs):** the key is not
   reachable by any probed vector. The residual is a kernel-level attack
   (ptrace bypass, `/proc/pid/mem` via a setuid helper, a future coredump
-  vector) — out of scope, documented.
+  vector), out of scope, documented.
 - **Against cross-machine fabrication and post-hoc edits by another user:**
   signatures hold. This is the claim the certificate can make.
 - **Against a same-uid attacker who restarts the daemon:** the key must not
@@ -61,4 +61,4 @@ With a memory-only, non-dumpable key and an agent-unwritable spine:
 
 What the certificate therefore proves is **integrity and provenance within a
 boot**, not non-repudiation against a same-uid adversary with kernel access.
-That is the honest scope and it is written into the cert's factor text.
+That is the scope, and it is written into the cert's factor text.

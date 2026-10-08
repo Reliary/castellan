@@ -62,7 +62,7 @@ Row-level OR, cert-level AND (see C12 in DESIGN_DECISIONS.md):
   drop the danger_signal more than a neutral placeholder would. `assert True`
   and no-op edits fail; a real guard that drops danger passes. Each passing
   file earns its own `proof_passed` ledger row (`evidence` "placebo-controlled").
-- Factor A is skipped and honestly labeled `test_rerun_passed: false` when the
+- Factor A is skipped and labeled `test_rerun_passed: false` when the
   project configures no test command.
 
 ### 3. Artifact scan (P9.2)
@@ -75,7 +75,7 @@ safety.
 ### 4. Spine chain + signature (chapter 5)
 The spine is a sha256 hash chain; `verify_chain` reports the first broken link.
 The certificate is signed with an in-process ed25519 key (memory-only,
-non-dumpable daemon — S0 probe). `castellan verify` re-checks both.
+non-dumpable daemon, S0 probe). `castellan verify` re-checks both.
 
 ## Quality labels (implemented)
 
@@ -92,7 +92,7 @@ does not raise the label.
 
 The agent does NOT generate the certificate. The daemon assembles it from the
 kernel-witnessed spine, the trust ledger (scoped to this session), the census
-file, the scanner evidence, and — when a key exists — signs it.
+file, the scanner evidence, and (when a key exists) signs it.
 
 ## Residual risks
 
@@ -113,7 +113,7 @@ file, the scanner evidence, and — when a key exists — signs it.
 - `castellan-trust` — ledger rows feeding the placebo factor.
 - `castellan-ledger` — overlay diff for the pair-placebo.
 - Scanner adapter (P9.2) — relay-vuln or semgrep behind one interface.
-- CVEfixes DB: local at `/home/john/data/`, never shipped.
+- CVEfixes DB: local at `~/data/`, never shipped.
 
 ## Status
 

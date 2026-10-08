@@ -42,17 +42,17 @@ castellan/
 
 ## Dependency policy
 
-- **rusqlite (bundled)** for trust.db, blob store index, HV store — matches reliary-agent.
+- **rusqlite (bundled)** for trust.db, blob store index, HV store; matches reliary-agent.
 - **zbus** (pure Rust, no libdbus) for systemd user manager `StartTransientUnit` and dbus nonce-gated bless broker.
-- **nix** crate for Landlock, seccomp, cgroup, inotify, overlayfs, user-namespace syscalls — well-maintained, idiomatic.
+- **nix** crate for Landlock, seccomp, cgroup, inotify, overlayfs, user-namespace syscalls; well-maintained, idiomatic.
 - **blake3** for content-addressed before-images (matches stria/relay).
-- **ed25519-dalek 2.x** for per-boot certificate signing (S2, built: `castellan-proof::signing` generates the key in-process at daemon start; never written to disk). Was listed here as DESIGN-ONLY when this file was written — stale status, corrected 2026-10-03.
+- **ed25519-dalek 2.x** for per-boot certificate signing (S2, built: `castellan-proof::signing` generates the key in-process at daemon start; never written to disk). Was listed here as DESIGN-ONLY when this file was written; stale status, corrected 2026-10-03.
 - **mimalloc** global allocator.
 - **rustc-hash FxHash** maps in hot paths (matches reliary-agent).
 - **ahash** where insertion-heavy and not security-sensitive (matches reliary-compress).
 - **rayon** for parallel ingest/reindex/scavenger (matches reliary-agent).
 - **NO HTTP framework** for the egress proxy — hyper or a minimal hand-rolled parser. The proxy is in the trusted path and must be auditable; small surface. Shipped (P12): **httparse** (head parsing only) + **rustls** (ring provider, both hops) + **rcgen** (per-session CA and leaf minting) — no framework, no async runtime, threads only.
-- **NO parsers, ASTs, tree-sitter, per-language code** — grammar-free, no exceptions.
+- **NO parsers, ASTs, tree-sitter, per-language code**: grammar-free, no exceptions.
 
 ## Crate dependency graph (proposed)
 
@@ -79,9 +79,9 @@ castellan-policycheck → castellan-replay, castellan-trust, castellan-policy (P
 
 ## Pure Rust — no Python in the daemon
 
-The daemon is the trusted core. It must be one static binary with no Python runtime, no subprocess spawns in the hot path, no version drift, no missing-dependency failures. Every primitive that runs inside the daemon's proof-generation, trust-scoring, or observation flow is Rust — either already Rust (linked as a workspace member or vendored) or rewritten as a Rust crate.
+The daemon is the trusted core. It must be one static binary with no Python runtime, no subprocess spawns in the hot path, no version drift, no missing-dependency failures. Every primitive that runs inside the daemon's proof-generation, trust-scoring, or observation flow is Rust: either already Rust (linked as a workspace member or vendored) or rewritten as a Rust crate.
 
-This mirrors the project directive: "relay must be pure Rust (no Python runtime)." The same principle applies to castellan — the daemon is the trusted path.
+This mirrors the project directive: "relay must be pure Rust (no Python runtime)." The same principle applies to castellan: the daemon is the trusted path.
 
 **What's already pure Rust** (verified by inspecting the repos):
 - relay-vuln: 52,258 lines of Rust in `src/`, zero Python in the scanner. The 20 Python files are `scripts/` (mining/eval tooling), not the scanner. Links as a Rust crate.
@@ -92,17 +92,17 @@ This mirrors the project directive: "relay must be pure Rust (no Python runtime)
 
 | Primitive | Python LOC | Rust crate | Rewrite cost |
 |---|---|---|---|
-| agent-audit-trail | 109 | castellan-audit (in castellan-ledger) | trivial — hash chain + JSON |
-| evidence-pack | 302 | castellan-proof (export module) | trivial — serde_json + quality labels |
-| proof-fixes | 270 | castellan-proof (placebo module) | small — placebo orchestration over relay-vuln |
+| agent-audit-trail | 109 | castellan-audit (in castellan-ledger) | trivial: hash chain + JSON |
+| evidence-pack | 302 | castellan-proof (export module) | trivial: serde_json + quality labels |
+| proof-fixes | 270 | castellan-proof (placebo module) | small: placebo orchestration over relay-vuln |
 
 ~680 lines of Python total, all small, all algorithmic, all in the proof pipeline. Rewrite as Rust crates and the daemon is pure Rust.
 
-**seq-engine is NOT rewritten.** KILLed 2026-08-27 by real-data probe on 29 local spines: 78% of learned expectations are within-event tautologies (tokens co-emitted by the same event); the composite-only encoding learns zero expectations; ordered fingerprints add no separation over radar's order-agnostic encoding (identical cosine 0.0150); the trust stream has 5 distinct tokens in 30 events. The earlier claim of a 1,368-LOC Rust port was false — the Rust crate is a "Hello, world!" stub. See PRIMITIVES.md.
+**seq-engine is NOT rewritten.** KILLed 2026-08-27 by real-data probe on 29 local spines: 78% of learned expectations are within-event tautologies (tokens co-emitted by the same event); the composite-only encoding learns zero expectations; ordered fingerprints add no separation over radar's order-agnostic encoding (identical cosine 0.0150); the trust stream has 5 distinct tokens in 30 events. The earlier claim of a 1,368-LOC Rust port was false; the Rust crate is a "Hello, world!" stub. See PRIMITIVES.md.
 
 **What stays Python** (dev/CI tooling, NOT shipped, NOT in the daemon):
-- cert-evals (319 LOC) — benchmark harness run by humans/CI, not user-facing
-- llm-replay (152 LOC) — forensic replay tooling, run by developers
-- relay-vuln `scripts/` — mining/eval, not the scanner
+- cert-evals (319 LOC): benchmark harness run by humans/CI, not user-facing
+- llm-replay (152 LOC): forensic replay tooling, run by developers
+- relay-vuln `scripts/`: mining/eval, not the scanner
 
 These are developer tools. They don't ship to users, don't run inside the daemon, and aren't in the trusted path. Python is fine for dev tooling.

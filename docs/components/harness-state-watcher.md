@@ -1,6 +1,6 @@
 # Harness-state watcher
 
-Monitors `~/.claude/skills/`, `~/.codex/skills/`, `~/.pi/agent/skills/`, `~/.gemini/config/skills/`, `~/.agents/skills/` (and harness hook dirs) for changes. The harness state dir MUST be writable for the harness to function — so the envelope allows writes there — which means it's the persistence vector Landlock can't close. This watcher closes it.
+Monitors `~/.claude/skills/`, `~/.codex/skills/`, `~/.pi/agent/skills/`, `~/.gemini/config/skills/`, `~/.agents/skills/` (and harness hook dirs) for changes. The harness state dir MUST be writable for the harness to function, so the envelope allows writes there, which makes it the persistence vector Landlock can't close. This watcher closes it.
 
 ## The hole
 
@@ -16,7 +16,7 @@ At castellan install (and at each daemon start), `castellan-watch` baselines the
 At each session end (and on a 60s inotify poll of the harness state dirs during sessions), the watcher recomputes fingerprints and diffs against baseline:
 - **New file:** NEW_SKILL_DETECTED → notify + quarantine (move to `~/.local/state/castellan/quarantine/<uuid>/` and symlink a stub back) pending human approval.
 - **Modified existing file:** fingerprint delta above threshold → notify + show diff, pending approval.
-- **Deleted file:** notify (a deleted skill is suspicious — could be an attacker clearing defensive skills).
+- **Deleted file:** notify (a deleted skill is suspicious: it could be an attacker clearing defensive skills).
 
 ## Quarantine flow
 
@@ -27,7 +27,7 @@ At each session end (and on a 60s inotify poll of the harness state dirs during 
 5. Approve → restore the file, update baseline.
 6. Reject → keep in quarantine, baseline unchanged.
 
-This is analogous to how Omarchy's migrations work — explicit, reviewed, reversible.
+This is analogous to how Omarchy's migrations work: explicit, reviewed, reversible.
 
 ## Integration with Omarchy
 
@@ -40,17 +40,17 @@ Omarchy symlinks its default skill into all the harness skill dirs. The watcher 
 - **skein:** vocabulary fingerprint of the skill file. Fast, grammar-free. Detects "this file's content changed semantically" even if line-by-line edits are sneaky.
 - **carrion:** identifier inventory. Detects "this file references new symbols" (e.g., a skill that suddenly imports `requests` and `subprocess` is suspicious).
 
-Both are built, both Rust, both linked as workspace crates (skein, carrion) — no subprocess spawn.
+Both are built, both Rust, both linked as workspace crates (skein, carrion), no subprocess spawn.
 
 ## Antagonism survivors
 
-- C3 (poisoned skill): closed — new/modified skill quarantined pending approval.
-- C1 (compromised harness writing skills): closed — same quarantine flow.
+- C3 (poisoned skill): closed: new/modified skill quarantined pending approval.
+- C1 (compromised harness writing skills): closed: same quarantine flow.
 
 ## Residual risks
 
 - A harness that loads skills from a path outside the watched set (e.g., a custom `--skills-dir`). Mitigation: the watcher enumerates harness config to discover skill paths; if undiscovered, document the gap.
-- An attacker who modifies the baseline file directly — the baseline is in `~/.local/state/castellan/` which is OUTSIDE the envelope (daemon path). The agent cannot modify it.
+- An attacker who modifies the baseline file directly: the baseline is in `~/.local/state/castellan/` which is OUTSIDE the envelope (daemon path). The agent cannot modify it.
 - Race: attacker writes + harness loads in the 60s poll window. Mitigation: inotify is event-driven (not polling); the 60s is a fallback. The race window is sub-second.
 
 ## Dependencies

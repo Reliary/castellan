@@ -6,7 +6,7 @@ Castellan uses cert-evals as the methodological foundation. cert-evals is built,
 
 The user directives are explicit:
 - baseline and gate conditions must run **interleaved in the same session batch** (never sequential, never historical baselines) to control for 2.7x LLM variance from provider-side factors (cache state, load)
-- weighted cost = input + 4× output tokens (output tokens cost ~2-4x more and are generated linearly) — though DeepSeek V4 Flash is 1:2, so use model-aware WC via `weighted_cost()` helper, never hardcoded
+- weighted cost = input + 4× output tokens (output tokens cost ~2-4x more and are generated linearly), though DeepSeek V4 Flash is 1:2, so use model-aware WC via `weighted_cost()` helper, never hardcoded
 - no savings/percentage claims until results are stable and repeatable
 - placebo control is mandatory for any causal claim
 
@@ -15,7 +15,7 @@ cert-evals implements all four. We use it unchanged.
 ## Per-phase kill metrics
 
 ### Phase 0 (freeze)
-- **Metric:** functional — 5 concurrent sessions across 3 harness brands, zero self-thaw attempts succeed, latency < 50ms, no daemon crash on session exit.
+- **Metric:** functional: 5 concurrent sessions across 3 harness brands, zero self-thaw attempts succeed, latency < 50ms, no daemon crash on session exit.
 - **Method:** not a benchmark; a deterministic acceptance test run in `test/shell.d/`.
 - **No claims:** none. P0 makes no security claims.
 
@@ -23,7 +23,7 @@ cert-evals implements all four. We use it unchanged.
 - **Metric:** false-block rate on a legit Omarchy-workload corpus.
 - **Corpus:** run Omarchy's own acceptance-test-like scenarios (config refresh, theme switch, package install, migration apply, hyprland edit) under audit mode; count Landlock denials on legitimate operations.
 - **Kill criterion:** false-block rate < 2%. If it does not pass, Phase 1 ships audit-only indefinitely; enforce-default is deferred. No exceptions.
-- **Benchmark shape:** not LLM-driven — these are deterministic shell scenarios, so interleaving isn't required. The metric is the denial count on a fixed corpus.
+- **Benchmark shape:** not LLM-driven; these are deterministic shell scenarios, so interleaving isn't required. The metric is the denial count on a fixed corpus.
 
 ### Phase 2 (undo + canary)
 - **Undo metric:** 20 test sessions with concurrent user edits to unrelated files; undo must reverse 100% of kernel-witnessed writes with zero collateral damage.
@@ -33,14 +33,14 @@ cert-evals implements all four. We use it unchanged.
 ### Phase 3 (trust)
 - **Metric:** monotonic relationship between trust tier and user-revert outcomes on a labelled corpus.
 - **Corpus:** 100 sessions labelled kept vs reverted by the user (we dogfood on our own machines to assemble this).
-- **Kill criterion:** monotonic relationship (Spearman ρ > 0.3 between tier and keep-rate). If absent, trust is demoted to advisory-only — expansion gates stay at manual approval, no auto-tiering.
-- **Method:** not interleaved LLM trials — this is a labelled-corpus evaluation. Interleaving applies when comparing LLM-driven conditions, not when evaluating a deterministic scoring function against labels.
+- **Kill criterion:** monotonic relationship (Spearman ρ > 0.3 between tier and keep-rate). If absent, trust is demoted to advisory-only: expansion gates stay at manual approval, no auto-tiering.
+- **Method:** not interleaved LLM trials; this is a labelled-corpus evaluation. Interleaving applies when comparing LLM-driven conditions, not when evaluating a deterministic scoring function against labels.
 
 ### Phase 4 (proof-carrying)
 - **Metric:** ProofCertificate classification accuracy on known-bad and known-good session pairs.
 - **Corpus:** 20 known-bad sessions (agent removed validation, broke completeness, or wrote a fake test) + 20 known-good sessions. Constructed by us, labelled, committed to the repo as a benchmark corpus.
-- **Kill criterion:** known-bad sessions classified NOT-EVIDENTIAL or WEAK; known-good classified STRONG or MODERATE. False-negative rate on known-bad < 20%. We accept relay-vuln is grammar-free and not perfect — the proof is honestly labeled "best-effort detection," not "proven safe."
-- **Method:** deterministic — the corpus is fixed, the classifier is deterministic, so no interleaving needed.
+- **Kill criterion:** known-bad sessions classified NOT-EVIDENTIAL or WEAK; known-good classified STRONG or MODERATE. False-negative rate on known-bad < 20%. We accept relay-vuln is grammar-free and not perfect; the proof is labeled "best-effort detection," not "proven safe."
+- **Method:** deterministic: the corpus is fixed, the classifier is deterministic, so no interleaving needed.
 
 ### Phase 5 (radar + sentinel)
 - **Radar kill criterion:** reproduces a known-injected session as an outlier on ≥ 1 machine before any fleet claim.
@@ -55,8 +55,8 @@ cert-evals implements all four. We use it unchanged.
 
 ## What we DO claim, and how
 
-- Functional acceptance: "freeze works on N harnesses with zero self-thaw" — deterministic test, no variance.
-- Best-effort detection: "relay-vuln flags X% of known-bad sessions, with Y% false-negative rate, on this labelled corpus" — honest numbers, labelled corpus, no generalization claim.
+- Functional acceptance: "freeze works on N harnesses with zero self-thaw": deterministic test, no variance.
+- Best-effort detection: "relay-vuln flags X% of known-bad sessions, with Y% false-negative rate, on this labelled corpus": the numbers are on a labelled corpus, with no generalization claim.
 - Causal improvement (when applicable): via cert-evals verdicts (CAUSAL_IMPROVEMENT / NO_CAUSAL_EFFECT), interleaved, placebo-controlled, SHA-256 cert.
 - Residual risks: documented in THREAT_MODEL.md, repeated in any PR description that touches the relevant surface.
 
@@ -64,15 +64,15 @@ cert-evals implements all four. We use it unchanged.
 
 For benchmarks that compare agent behavior with and without castellan (e.g., "does enforced envelope change task success rate?"), we use:
 - **Interleaved paired trials** in a single session batch (cert-evals).
-- **Model-aware weighted cost** via `weighted_cost()` from `scripts/bench_lib.py` — never hardcoded 4×. DeepSeek V4 Flash is 1:2 input:output; other models differ.
+- **Model-aware weighted cost** via `weighted_cost()` from `scripts/bench_lib.py`, never hardcoded 4×. DeepSeek V4 Flash is 1:2 input:output; other models differ.
 - **300s+ turn timeouts** for multi-turn benchmarks (accumulated conversation + test outputs need more than the 120s single-turn default).
-- **Single accumulated multi-turn session** per condition, not independent single-turn calls — IR compression, sift, and conv-window only exercise under accumulated history.
-- **Kill the old daemon before starting a fresh binary** — stale daemon with different cache-key schema causes collision bugs.
-- **Check `/tmp/reliary_proxy.jsonl` for SSE stream-ended errors** before attributing outlier tokens to castellan — broken streams produce 0-token outputs that look like compression wins but are actually failures.
+- **Single accumulated multi-turn session** per condition, not independent single-turn calls; IR compression, sift, and conv-window only exercise under accumulated history.
+- **Kill the old daemon before starting a fresh binary**: stale daemon with different cache-key schema causes collision bugs.
+- **Check `/tmp/reliary_proxy.jsonl` for SSE stream-ended errors** before attributing outlier tokens to castellan: broken streams produce 0-token outputs that look like compression wins but are actually failures.
 
 ## Corpus we need to build before P1 can ship
 
-A "legit Omarchy workload corpus" — deterministic shell scenarios exercising the operations an agent legitimately does on an Omarchy machine:
+A "legit Omarchy workload corpus": deterministic shell scenarios exercising the operations an agent legitimately does on an Omarchy machine:
 - refresh a config (hypr/hyprland.lua, waybar, quickshell)
 - switch theme
 - install a package (pacman + AUR paths)

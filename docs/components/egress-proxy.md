@@ -1,4 +1,4 @@
-# Egress proxy (BUILT — P12, 2026-09-26)
+# Egress proxy (BUILT, P12, 2026-09-26)
 
 **Status: built and acceptance-tested.** `castellan-keyring` +
 `castellan-proxy` crates ship in the workspace; the daemon starts a
@@ -21,7 +21,7 @@ daemon-side.
 - **`castellan-keyring`** — daemon-resident credential store, loaded
   ONCE at daemon start from `$XDG_CONFIG_HOME/castellan/keyring.toml`
   (outside every envelope; the agent's project paths are never
-  consulted — K5). Secrets are zeroized on drop, never logged, never
+  consulted, K5). Secrets are zeroized on drop, never logged, never
   written to state. Each credential binds to host patterns
   (`exact` or `*.suffix`); the proxy consults this binding, never a
   request-header hint. The config file's sha256 is pinned into the
@@ -33,11 +33,11 @@ daemon-side.
   system roots. Strips any agent-supplied `Authorization` /
   `Proxy-Authorization` / `X-API-Key` / `api-key`, injects the bound
   credential's header, forces `Connection: close` (one exchange per
-  connection — v0 model, documented below). Allowlist = the session's
+  connection, v0 model, documented below). Allowlist = the session's
   resolved destination policy (same list the B8 broker gets), so proxy
   and kernel never disagree.
 - **Launcher env at spawn** — `HTTP(S)_PROXY`, `NO_PROXY` (keeps the
-  canary honeypot on the direct path — a proxied canary probe would
+  canary honeypot on the direct path: a proxied canary probe would
   never trip the wire, C5), and `SSL_CERT_FILE` /
   `NODE_EXTRA_CA_CERTS` / `REQUESTS_CA_BUNDLE` / `CARGO_HTTP_CAINFO` /
   `CURL_CA_BUNDLE` pointing at the session CA file. Landlock's
@@ -48,19 +48,19 @@ daemon-side.
 - **Kill switch** — `castellan proxy off [session]` (or the
   `proxy_off` op): listener closes; kernel posture unchanged
   (K4: session itself observes ECONNREFUSED, direct egress still
-  EPERM — fail-closed both ways).
+  EPERM, fail-closed both ways).
 
-## Mechanism notes (v0, honest)
+## Mechanism notes (v0)
 
 - **TLS termination is the point.** C4 ("real credentials never enter
   the envelope") cannot be satisfied for HTTPS without the proxy
   seeing plaintext. The alternative (CONNECT-only tunnel) cannot
   inject and was rejected in the plan pre-build. The session trusts
-  the session CA by env; the CA *cert* is agent-readable (intended —
+  the session CA by env; the CA *cert* is agent-readable (intended;
   it is public), the CA *key* is daemon-memory-only under the S0
   hardening (K1d: `/proc/<daemon>/mem` is EACCES).
 - **Per-session CA** (the plan said per-boot; implemented per-session,
-  strictly tighter — K8: fingerprints differ across sessions).
+  strictly tighter, K8: fingerprints differ across sessions).
 - **One exchange per connection**: forwarded requests force
   `Connection: close`; responses pipe until EOF, `close_notify` sent
   on both hops (rustls0.23 treats FIN-without-notify as an error —
@@ -129,7 +129,7 @@ intact under concurrent proxy + audit emission.
 ~1–5ms per request for the proxy hop (plan estimate; no benchmark
 claim — not separately measured). Every session pays a listener thread
 + one thread per active connection. Empty keyring degrades to
-proxy-without-injection (B8 + canaries posture, honest fallback).
+proxy-without-injection (B8 + canaries posture, fallback).
 
 ## Status
 

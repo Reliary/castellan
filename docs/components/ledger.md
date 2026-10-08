@@ -7,7 +7,7 @@ The kernel-witnessed record of what a session wrote. Primary substrate: overlayf
 - **Kernel truth** (`source: kernel`): inotify events on allowed paths, overlayfs upper-layer enumeration, seccomp-audit denials. These are what actually happened. Cannot be faked by the agent.
 - **Agent advisory** (`source: agent`): events the agent declares via the audit hash chain (was agent-audit-trail, rewritten as Rust in castellan-ledger). These are what the agent claims happened. Cross-checked against kernel truth; mismatches decrement trust and weaken ProofCertificates.
 
-This split is the core honesty move: the agent is the prover, the kernel is the verifier, the daemon is the recorder. No trust decision rests on agent-reported data alone.
+This split is the core of the design: the agent is the prover, the kernel is the verifier, the daemon is the recorder. No trust decision rests on agent-reported data alone.
 
 ## Event spine schema
 
@@ -18,7 +18,7 @@ Per session: `~/.local/state/castellan/sessions/<uuid>/events.jsonl`, append-onl
 {"ts": 1234567891, "session": "uuid", "type": "exec", "target": "/usr/bin/cargo", "args_hash": "blake3", "source": "kernel"}
 {"ts": 1234567892, "session": "uuid", "type": "net", "target": "api.github.com:443", "source": "kernel"}
 {"ts": 1234567893, "session": "uuid", "type": "claim", "claim": "tests_passed", "claim_ok": true, "source": "agent"}
-{"ts": 1234567894, "session": "uuid", "type": "deny", "target": "/home/john/.ssh/id_rsa", "syscall": "openat", "source": "kernel"}
+{"ts": 1234567894, "session": "uuid", "type": "deny", "target": "~/.ssh/id_rsa", "syscall": "openat", "source": "kernel"}
 ```
 
 ## Blob store
@@ -32,7 +32,7 @@ When overlayfs is available:
 - Enumerating the upper layer at session end gives the complete set of created/modified files.
 - For each file in upper, the lower layer has the pre-session version (or "did not exist").
 - before_hash = blake3 of lower version; after_hash = blake3 of upper version.
-- No inotify needed — the upper layer IS the ledger.
+- No inotify needed. The upper layer IS the ledger.
 
 ## inotify substrate (fallback, degrade tier 3)
 
@@ -44,8 +44,8 @@ When overlayfs / user namespaces are unavailable:
 
 ## Antagonism survivors
 
-- A10 (corrupt the ledger): closed — lower layer is read-only mount; blob store is outside envelope.
-- B2 (agent lies about what it touched): closed — kernel truth cross-checked against agent claims.
+- A10 (corrupt the ledger): closed: lower layer is read-only mount; blob store is outside envelope.
+- B2 (agent lies about what it touched): closed: kernel truth cross-checked against agent claims.
 - D9 (inotify race): closed by overlayfs; documented for the fallback.
 
 ## Dependencies
@@ -54,7 +54,7 @@ When overlayfs / user namespaces are unavailable:
 - `castellan-undo` (blob store shared)
 - `nix` crate (inotify)
 - `blake3` (hashing)
-- Owned primitive: audit hash chain (was agent-audit-trail, BUILT in Python — rewritten as Rust in castellan-ledger).
+- Owned primitive: audit hash chain (was agent-audit-trail, BUILT in Python, rewritten as Rust in castellan-ledger).
 
 ## Status
 

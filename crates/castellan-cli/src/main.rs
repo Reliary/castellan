@@ -94,7 +94,27 @@ fn main() {
       std::process::exit(1);
     }
     Ok(_) => {
-      print!("{}", render(&line));
+      // P21.2: `cert --json` emits the raw certificate object so the
+      // documented flow (`cert <session> --json > cert.json` then
+      // `verify cert.json`) works. Everything else renders for humans.
+      let as_json = args[0] == "cert" && args.iter().any(|a| a == "--json");
+      if as_json {
+        let out = serde_json::from_str::<serde_json::Value>(&line)
+          .ok()
+          .and_then(|v| v.get("extra").and_then(|e| e.get("cert")).cloned());
+        match out {
+          Some(cert) => println!(
+            "{}",
+            serde_json::to_string_pretty(&cert).unwrap_or_else(|_| "{}".into())
+          ),
+          None => {
+            eprintln!("cert: daemon returned no certificate");
+            std::process::exit(1);
+          }
+        }
+      } else {
+        print!("{}", render(&line));
+      }
       // scripts must be able to detect daemon-side failures
       let ok = serde_json::from_str::<serde_json::Value>(&line)
         .ok()
@@ -409,8 +429,9 @@ fn replay_req(args: &[String]) -> serde_json::Value {
 }
 
 fn cert_req(args: &[String]) -> serde_json::Value {
-  let Some(session) = args.first() else {
-    eprintln!("usage: castellan cert <session>");
+  let session = args.iter().find(|a| !a.starts_with("--"));
+  let Some(session) = session else {
+    eprintln!("usage: castellan cert <session> [--json]");
     std::process::exit(2);
   };
   serde_json::json!({"op": "cert", "session": session})

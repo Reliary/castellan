@@ -98,7 +98,7 @@ castellan launch --undo -- claude          # every write lands in a discardable 
 castellan launch --net-restrict -- claude   # egress denied to an IP allowlist (LLM host declared)
 castellan diff <session>                    # what did it change?
 castellan keep <session>                   # commit it, or `undo` to throw it away
-castellan cert <session>                   # signed ProofCertificate (bounds, placebo, chain)
+castellan cert <session> --json > cert.json # signed ProofCertificate (bounds, placebo, chain)
 castellan verify cert.json                 # re-check the signature + spine chain
 castellan gc --keep-last 20                # prune old session state (none before this)
 castellan uninstall --yes                   # remove service, sessions, state and keyring

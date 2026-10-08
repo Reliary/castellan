@@ -258,3 +258,49 @@ jobs:
           total=$(awk '/test result:/{for(i=1;i<=NF;i++) if($i ~ /^passed/) s+=$(i-1)} END{print s+0}' test.log)
           echo "workspace tests: $total (floor $FLOOR)"
           [ "$total" -ge "$FLOOR" ]
+
+  # Doc-truth gate (2026-10-08). Ties two README claims to the code that
+  # makes them true. Motivation: "default mode is audit ... decides
+  # whether enforce becomes the default" survived on the front page for
+  # months after P1/B6 flipped the default — enforce has been the default
+  # since (`let mut enforce = true;`, only `--no-enforce` disables it).
+  # Stale status in a security document is dishonesty by neglect, and
+  # nothing caught it because prose was the only source of truth.
+  doc-truth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: README default-posture claim matches the CLI source
+        run: |
+          set -euo pipefail
+          SRC=crates/castellan-cli/src/main.rs
+          # The claim is only true while the CLI defaults enforce on.
+          if ! grep -qE '^\s*let mut enforce = true;' "$SRC"; then
+            echo "FAIL: $SRC no longer defaults enforce=true."
+            echo "      Update the README default-posture wording in the same PR."
+            exit 1
+          fi
+          # And the old stale phrasing must not come back.
+          if grep -qiE 'default mode is audit|decides whether enforce becomes the default' README.md; then
+            echo "FAIL: README still claims audit is the default posture."
+            exit 1
+          fi
+          grep -qF 'The default is enforced' README.md \
+            || { echo "FAIL: README does not state the default posture."; exit 1; }
+          echo "default-posture claim: ok"
+
+      - name: README preflight check count matches the CLI source
+        run: |
+          set -euo pipefail
+          SRC=crates/castellan-cli/src/main.rs
+          actual=$(grep -c 'check!(' "$SRC")
+          claimed=$(grep -oE 'preflight` runs [0-9]+ checks' README.md \
+            | grep -oE '[0-9]+' || true)
+          if [ -z "$claimed" ]; then
+            echo "FAIL: README no longer states a preflight check count."
+            exit 1
+          fi
+          echo "preflight checks: source=$actual README=$claimed"
+          [ "$actual" = "$claimed" ] \
+            || { echo "FAIL: README claims $claimed preflight checks; source has $actual."; exit 1; }

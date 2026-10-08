@@ -52,29 +52,58 @@ Each session has a mutex in the daemon's `DaemonState`. Writes to `trust.db`, th
 - sentinel-vs-undo races (sentinel fires while undo is reverting)
 - concurrent proof writes (two proofs for the same session)
 
-## Watchdog (commitment #7)
+## Watchdog (commitment #7) — built, but in the launcher, not the daemon
 
-- systemd `Type=notify` + `WatchdogSec=10s`. The daemon sends `sd_notify(WATCHDOG=1)` every 5s.
-- Heartbeat loss → systemd restarts the daemon AND runs `castellan-freeze all` as an `ExecStartPost`/restart hook.
-- Landlock + cgroup persist without the daemon (kernel-enforced), so enforcement survives daemon death. Fail-closed: agents are frozen on daemon loss, not freed.
+The fail-closed-on-daemon-loss property is real and lives in the **launcher supervisor**,
+not in the daemon (`crates/castellan-cli/src/main.rs`): a detached thread probes the
+daemon socket every 2s and, after a 5s grace with the daemon unreachable, freezes the
+session through the pre-opened scope fd (`openat`→`/proc/self/fd/<n>/cgroup.freeze`;
+fds survive the mount-ns switch), falling back to `CgroupRoot::detect()`. This is the
+mechanism behind "agents are frozen on daemon loss, not freed" — **for sessions started
+with `castellan launch`**.
+
+Honest limits, measured against the code rather than the design:
+
+- **Only `castellan launch` sessions get a watchdog.** `castellan spawn` and `castellan
+  adopt` create a session with no supervisor, so a daemon loss leaves them un-frozen.
+- **The supervisor is the launcher's child.** If its terminal closes before the daemon
+  does, it dies with the tty and the fail-closed promise lapses silently. Survival
+  across terminal loss is **not implemented and not tested**.
+- Landlock + cgroup membership persist without the daemon (kernel-enforced), so
+  *enforcement* survives daemon death regardless — only the active freeze action needs
+  the watchdog.
+
+Design target, **not built**: daemon-side `Type=notify` + `WatchdogSec=10s` with
+`sd_notify(WATCHDOG=1)`. No `sd_notify`, `NOTIFY_SOCKET`, or `WatchdogSec` exists in the
+tree. If it is built, it complements the launcher watchdog; it does not replace it.
 
 ## Lifecycle
 
-- `castellan-daemon start` — daemonizes, opens socket, starts watchers.
-- `castellan-daemon stop` — freezes all sessions, closes socket, exits.
-- `castellan-daemon status` — socket query: running sessions, trust tiers, daemon tier.
-- systemd user unit `castellan-daemon.service` in `~/.config/systemd/user/`.
+- `castellan-daemon` — starts the daemon in the **foreground**; opens the unix socket
+  and starts watchers. It does **not** daemonize (no fork/setsid/pidfile). Run it under
+  the user manager (`castellan.service`) or a terminal supervisor.
+- The CLI connects to the daemon's unix socket; a missing daemon is a hard error
+  (`castellan daemon not reachable ...`), not auto-started.
+- Design target, **not built**: a `castellan-daemon start|stop|status` CLI and a shipped
+  `castellan.service` unit. Today the unit (if present) is operator-written; see the
+  Devex roadmap in [../ROADMAP.md](../ROADMAP.md).
+
+`castellan status` (socket query) reports running sessions and freeze states; trust
+tiers and daemon tier are read from the durable session JSON and `trust.db`.
 
 ## Degrade modes
 
-- Daemon absent: `castellan-*` CLI shims print "castellan daemon not running; install castellan or run `castellan-daemon start`." No crash. Omarchy's `cmd-present` philosophy.
+- Daemon absent: the CLI prints "castellan daemon not reachable at <socket>: ..." then "start it with: castellan-daemon". No crash.
 - Daemon present but overlayfs unavailable: undo returns "not available (overlayfs required)"; ledger falls back to inotify; envelope still works.
 - Daemon present but Landlock unavailable: envelope returns "Landlock ABI insufficient; running in audit-only mode"; launch refuses in enforce mode.
 
 ## Antagonism survivors
 
 - A11 (event flooding DoS): closed — per-session rate limit on ingest.
-- C7 (daemon crash): closed — watchdog + auto-freeze + kernel persistence.
+- C7 (daemon crash): **partly closed** — the launcher supervisor watchdog freezes
+  `castellan launch` sessions on daemon loss (see Watchdog above); `spawn`/`adopt`
+  sessions and supervisor-death-before-daemon-loss are open. Kernel enforcement
+  (Landlock + cgroup membership) persists either way.
 
 ## Dependencies
 

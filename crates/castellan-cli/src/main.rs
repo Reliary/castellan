@@ -62,7 +62,7 @@ fn main() {
     Ok(s) => s,
     Err(e) => {
       eprintln!("castellan daemon not reachable at {path}: {e}");
-      eprintln!("start it with: castellan daemon");
+      eprintln!("start it with: castellan-daemon");
       std::process::exit(1);
     }
   };
@@ -1767,6 +1767,6 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan proxy [status|off [session]]   egress proxy control (P12)");
-  eprintln!("  castellan daemon                 start the daemon (foreground)");
+  eprintln!("  castellan-daemon                 start the daemon (foreground; no `daemon` verb in the CLI)");
   std::process::exit(2);
 }

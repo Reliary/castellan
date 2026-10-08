@@ -58,20 +58,21 @@ only, not read or egress blocking.
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified
 kernels: 7.0.3 and 7.1.8 (x86_64). `preflight` runs 6 checks — all 6 must pass.
 
-From the [v0.1.0 release](https://github.com/Reliary/castellan/releases/tag/v0.1.0) (MIT):
+From the [v0.1.0 release](https://github.com/Reliary/castellan/releases/tag/v0.1.0) (MIT).
+That tag ships **only the CLI** (`castellan`); the daemon binary is not in it — build from
+source below for a working daemon until the next tag, which bundles both.
 
 ```sh
 chmod +x castellan
 ./castellan preflight                  # all 6 checks must pass
-./castellan daemon &                   # a systemd user unit outlives the terminal
 ```
 
-Or from source:
+Or from source (builds both binaries):
 
 ```sh
 cargo build --release --workspace
 ./target/release/castellan preflight
-./target/release/castellan daemon &
+./target/release/castellan-daemon &    # foreground server; unit guidance in Quickstart
 ```
 
 Then see Quickstart below.
@@ -79,9 +80,9 @@ Then see Quickstart below.
 ## Quickstart
 
 ```sh
-cargo build --release --workspace          # or download the release binary
+cargo build --release --workspace          # or download the release binaries
 castellan preflight                        # check your kernel: all 6 checks must pass
-castellan daemon &                         # or run as a systemd user unit (recommended)
+castellan-daemon &                         # foreground server; run under the user manager for durability
 castellan launch -- claude                 # enforced by default: workspace-only writes
 castellan status                           # see the session
 castellan freeze && castellan thaw         # the panic button

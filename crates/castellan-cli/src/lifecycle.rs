@@ -308,16 +308,14 @@ fn cmd_service(args: &[String]) -> ! {
       // unit's daemon exit 3 (singleton) and Restart=on-failure would
       // thrash it against the socket forever. Refuse instead.
       let unit_active = systemctl_ok(&["is-active", UNIT_NAME]);
-      if !unit_active {
-        if std::os::unix::net::UnixStream::connect(sock_path()).is_ok() {
-          eprintln!(
-            "service install: a castellan-daemon is already serving {} but it is not",
-            sock_path().display()
-          );
-          eprintln!("systemd-managed (manual run). Stop it first — `castellan service stop`");
-          eprintln!("or `pkill -f castellan-daemon` — then re-run install.");
-          std::process::exit(1);
-        }
+      if !unit_active && std::os::unix::net::UnixStream::connect(sock_path()).is_ok() {
+        eprintln!(
+          "service install: a castellan-daemon is already serving {} but it is not",
+          sock_path().display()
+        );
+        eprintln!("systemd-managed (manual run). Stop it first — `castellan service stop`");
+        eprintln!("or `pkill -f castellan-daemon` — then re-run install.");
+        std::process::exit(1);
       }
       let rollback = |reason: &str| -> ! {
         let _ = systemctl(&["disable", "--now", UNIT_NAME]);

@@ -212,10 +212,18 @@ fi
 
 echo
 echo "== K2/K6/K3c-integration: proxy crate tests =="
-if (cd "$REPO" && cargo test -p castellan-proxy -p castellan-keyring > "$W/proxy-tests.log" 2>&1); then
-  ok "K2/K6: end-to-end MITM tests pass (injection, no-injection, 403, poison)"
+# The proxy crate tests need cargo. The exercise box has no Rust
+# toolchain by design (it runs the release binaries), so this leg is a
+# NOTE there, never a pass and never a fail: the `ci` workflow's
+# workspace `cargo test` covers the same four tests on every push.
+if command -v cargo >/dev/null 2>&1; then
+  if (cd "$REPO" && cargo test -p castellan-proxy -p castellan-keyring > "$W/proxy-tests.log" 2>&1); then
+    ok "K2/K6: end-to-end MITM tests pass (injection, pass-through, 403, poison)"
+  else
+    bad "K2/K6: proxy tests failed — see $W/proxy-tests.log"
+  fi
 else
-  bad "K2/K6: proxy tests failed — see $W/proxy-tests.log"
+  echo "  NOTE: no cargo on this box; proxy crate tests covered by CI workspace tests"
 fi
 
 echo

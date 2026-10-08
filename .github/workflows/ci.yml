@@ -254,7 +254,7 @@ jobs:
           grep -E 'test result:' test.log || true
       - name: Assert count >= floor
         run: |
-          FLOOR=218
+          FLOOR=222
           total=$(awk '/test result:/{for(i=1;i<=NF;i++) if($i ~ /^passed/) s+=$(i-1)} END{print s+0}' test.log)
           echo "workspace tests: $total (floor $FLOOR)"
           [ "$total" -ge "$FLOOR" ]

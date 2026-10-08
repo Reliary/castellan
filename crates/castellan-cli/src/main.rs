@@ -1,5 +1,7 @@
 use std::io::Write;
 
+mod lifecycle;
+
 fn main() {
   let path = match std::env::var("XDG_RUNTIME_DIR") {
     Ok(dir) => format!("{dir}/castellan.sock"),
@@ -16,6 +18,12 @@ fn main() {
     "launch" => launch(&args[1..], &path),
     "audit" => audit_report(&args[1..]),
     "preflight" => preflight(),
+    "service" => lifecycle::run_service(&args[1..]),
+    "uninstall" => lifecycle::run_uninstall(&args[1..]),
+    "gc" => lifecycle::run_gc(&args[1..]),
+    "init" => lifecycle::run_init(&args[1..]),
+    "doctor" => lifecycle::run_doctor(),
+    "version" | "--version" | "-V" => lifecycle::version(),
     _ => {}
   }
   let request = match args[0].as_str() {
@@ -137,10 +145,19 @@ fn preflight() -> ! {
   check!("inotify", inotify, "init works");
 
   let scratch = std::env::temp_dir().join("castellan-preflight");
+  let deny = std::env::temp_dir().join("castellan-preflight-deny");
+  // Reap any previous run's leftovers BEFORE applying the envelope. Once
+  // Landlock is on this process cannot write /tmp, so it cannot remove its
+  // own scratch dir afterwards — cleanup must precede enforcement. Net
+  // effect: at most one empty `castellan-preflight` dir persists between
+  // runs (it was previously the deny-file too, and accumulated); it is
+  // reaped on the next `preflight`. The enforcement check is last.
+  let _ = std::fs::remove_file(&deny);
+  let _ = std::fs::remove_dir_all(&scratch);
   let _ = std::fs::create_dir_all(&scratch);
   let policy = castellan_policy::Policy::new("preflight-probe", "preflight", scratch.clone());
   let enforced = castellan_envelope::apply_envelope(&policy).is_ok()
-    && std::fs::write("/tmp/castellan-preflight-deny", b"x").is_err()
+    && std::fs::write(&deny, b"x").is_err()
     && std::fs::write(scratch.join("probe"), b"x").is_ok();
   let _ = std::fs::remove_file(scratch.join("probe"));
   check!("landlock-enforcement", enforced, "scratch write allowed, /tmp write denied");
@@ -1767,6 +1784,12 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan proxy [status|off [session]]   egress proxy control (P12)");
+  eprintln!("  castellan service [install|uninstall|stop|status|logs [-f]]   user service lifecycle");
+  eprintln!("  castellan uninstall [--yes] [--keep-data] [--keep-config]   remove service, sessions, state, keyring");
+  eprintln!("  castellan gc [--yes] [--keep-last N] [--older-than DAYS]    prune old session state");
+  eprintln!("  castellan init [--force]         scaffold keyring.toml + egress.toml");
+  eprintln!("  castellan doctor                 diagnose daemon/service/keyring/session state");
+  eprintln!("  castellan --version              print the CLI version");
   eprintln!("  castellan-daemon                 start the daemon (foreground; no `daemon` verb in the CLI)");
   std::process::exit(2);
 }

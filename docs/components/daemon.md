@@ -67,8 +67,11 @@ Honest limits, measured against the code rather than the design:
 - **Only `castellan launch` sessions get a watchdog.** `castellan spawn` and `castellan
   adopt` create a session with no supervisor, so a daemon loss leaves them un-frozen.
 - **The supervisor is the launcher's child.** If its terminal closes before the daemon
-  does, it dies with the tty and the fail-closed promise lapses silently. Survival
-  across terminal loss is **not implemented and not tested**.
+  does, it dies with the tty. An agent that ignores SIGHUP (or otherwise outlives its
+  tty) is then reparented and keeps running, with no guard left: killing the daemon
+  leaves it un-frozen. **Measured live on .227, 2026-10-08** (`test/shell.d/p19-watchdog-survival.sh`:
+  ARM A freezes as documented; ARM B proves the gap). Tracked as THREAT_MODEL C43;
+  fix is daemon-side supervision (or `PR_SET_CHILD_SUBREAPER`), not yet built.
 - Landlock + cgroup membership persist without the daemon (kernel-enforced), so
   *enforcement* survives daemon death regardless — only the active freeze action needs
   the watchdog.
@@ -81,15 +84,23 @@ tree. If it is built, it complements the launcher watchdog; it does not replace 
 
 - `castellan-daemon` — starts the daemon in the **foreground**; opens the unix socket
   and starts watchers. It does **not** daemonize (no fork/setsid/pidfile). Run it under
-  the user manager (`castellan.service`) or a terminal supervisor.
+  the user manager or a terminal supervisor.
+- `castellan service install` — writes `~/.config/systemd/user/castellan.service`
+  (`Type=simple`, `ExecStartPre=<cli> preflight`, `Restart=on-failure`,
+  `NoNewPrivileges=yes`), then `systemctl --user enable --now`. `service stop`,
+  `service status`, `service logs [-f]` round it out. `--skip-preflight` omits the
+  `ExecStartPre` check (for boxes where preflight is known to warn).
+- `castellan uninstall --yes` — the destructive inverse: stop+disable+remove the unit,
+  kill the daemon, tear down every session scope and `castellan.slice`, remove the
+  socket, then delete state (`--keep-data` to keep it) and config incl. the keyring
+  (`--keep-config` to keep it). Deletion is chmod-aware: session `overlay/work/work`
+  dirs are mode `000` and a naive `rm -rf` fails on the first one (verified).
+- `castellan gc [--keep-last N] [--older-than DAYS] --yes` — prunes old session state,
+  skipping any session with a live scope. There was previously no retention at all.
+- `castellan init` — scaffolds `keyring.toml` and `egress.toml`. `castellan doctor`
+  reports daemon/socket/service/keyring/session health in one place.
 - The CLI connects to the daemon's unix socket; a missing daemon is a hard error
   (`castellan daemon not reachable ...`), not auto-started.
-- Design target, **not built**: a `castellan-daemon start|stop|status` CLI and a shipped
-  `castellan.service` unit. Today the unit (if present) is operator-written; see the
-  Devex roadmap in [../ROADMAP.md](../ROADMAP.md).
-
-`castellan status` (socket query) reports running sessions and freeze states; trust
-tiers and daemon tier are read from the durable session JSON and `trust.db`.
 
 ## Degrade modes
 

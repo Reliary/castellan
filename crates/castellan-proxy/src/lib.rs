@@ -317,6 +317,18 @@ fn leaf_server_config(host: &str, ca: &Ca) -> std::io::Result<Arc<rustls::Server
 
 const STRIP: [&str; 4] = ["authorization", "proxy-authorization", "x-api-key", "api-key"];
 
+/// P21.1: credential handling is conditional on a keyring binding.
+/// - A host with a bound credential: the agent's own auth headers are
+///   stripped and the real credential is injected (the P12 behavior —
+///   the real secret never lives in the envelope).
+/// - A host with no binding: the agent's own headers pass through
+///   untouched. Without this, an empty keyring (a fresh install) strips
+///   the agent's OAuth bearer and injects nothing, so every provider
+///   answers 401 and the tool is unusable until the user hand-writes a
+///   keyring. Threat model: a binding can only be removed by the human
+///   owner (keyring lives outside the envelope's write roots, config
+///   sha-pinned, daemon control is human-only), so an agent cannot force
+///   the pass-through path for a host the operator bound.
 struct ReqHead {
   method: String,
   target: String,
@@ -343,6 +355,10 @@ fn rewrite_request(raw: &[u8], host: &str, cfg: &ProxyConfig) -> std::io::Result
   let mut content_length = None;
   let mut content_length_seen = 0u32;
   let mut was_chunked = false;
+  // P21.1: strip only when we are going to inject. With a binding, the
+  // agent's auth headers are replaced by the real credential; with no
+  // binding, they pass through so the agent's own OAuth works.
+  let bound = cfg.keyring.inject_for(host).is_some();
   // R6 (ninja review): normalize framing. Duplicate Content-Length is a
   // classic desync vector (first-vs-last); Transfer-Encoding + CL cohabit
   // is another; trailers can smuggle STRIP-class headers past the head
@@ -350,7 +366,7 @@ fn rewrite_request(raw: &[u8], host: &str, cfg: &ProxyConfig) -> std::io::Result
   // entirely (de-chunk to identity below), strip trailers.
   for h in req.headers.iter() {
     let name = h.name.to_ascii_lowercase();
-    if STRIP.contains(&name.as_str()) {
+    if bound && STRIP.contains(&name.as_str()) {
       continue;
     }
     if name == "host" {
@@ -695,15 +711,61 @@ mod tests {
   }
 
   #[test]
-  fn rewrite_without_binding_injects_nothing() {
+  fn rewrite_without_binding_passes_agent_auth() {
     let c = cfg_with(&["open.host"], true);
-    let raw = b"GET / HTTP/1.1\r\nHost: open.host\r\nAuthorization: Bearer canary\r\n\r\n";
+    let raw = b"GET / HTTP/1.1\r\nHost: open.host\r\nAuthorization: Bearer user-oauth\r\n\r\n";
     let req = rewrite_request(raw, "open.host", &c).unwrap();
     let head = String::from_utf8_lossy(&req.head).to_string();
-    assert!(!head.to_lowercase().contains("authorization"), "{head}");
-    assert!(!head.contains("Bearer"), "{head}");
+    assert!(
+      head.to_lowercase().contains("authorization: bearer user-oauth"),
+      "unbound host must pass the agent's own auth through: {head}"
+    );
   }
 
+  #[test]
+  fn rewrite_with_binding_still_strips_agent_auth() {
+    let k = Keyring::parse(
+      b"[[credential]]\nname=\"gh\"\nscheme=\"bearer\"\ntoken=\"REAL\"\nhosts=[\"api.github.com\"]\n",
+    )
+    .unwrap();
+    let c = ProxyConfig {
+      session: "t".into(),
+      state_dir: std::env::temp_dir(),
+      allow_hosts: vec!["api.github.com".into()],
+      restrict: true,
+      keyring: Arc::new(k),
+      client_tls: native_tls_config(),
+      deny_ports: vec![],
+    };
+    let raw = b"GET / HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer user-oauth\r\n\r\n";
+    let req = rewrite_request(raw, "api.github.com", &c).unwrap();
+    let head = String::from_utf8_lossy(&req.head).to_string();
+    assert!(!head.contains("user-oauth"), "bound host must strip the agent's auth: {head}");
+    assert!(head.contains("authorization: Bearer REAL"), "bound host must inject: {head}");
+  }
+
+
+  #[test]
+  fn k5_form_body_token_exchange_passes_intact() {
+    // P21.1 K5: OAuth-first agents exchange tokens via body parameters
+    // (POST /oauth/token with form fields), not STRIP-class headers.
+    // Header logic must leave the body byte-for-byte intact for an
+    // unbound host — the agent's login flow has to work under the proxy.
+    let c = cfg_with(&["open.host"], true);
+    let body = "grant_type=device_code&code=abc123&client_id=xyz";
+    let raw = format!(
+      "POST /oauth/token HTTP/1.1\r\nHost: open.host\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+      body.len()
+    );
+    let req = rewrite_request(raw.as_bytes(), "open.host", &c).unwrap();
+    assert_eq!(req.content_length, Some(body.len()));
+    let head = String::from_utf8_lossy(&req.head).to_string();
+    assert!(head.contains("Content-Type: application/x-www-form-urlencoded"), "{head}");
+    let mut up = Vec::new();
+    let mut client = std::io::Cursor::new(body.as_bytes().to_vec());
+    forward_body(&mut client, &mut up, &req, &[]).unwrap();
+    assert_eq!(String::from_utf8_lossy(&up), body, "token-exchange body must pass intact");
+  }
 
   #[test]
   fn duplicate_cl_rejected() {

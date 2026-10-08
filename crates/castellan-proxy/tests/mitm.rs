@@ -241,13 +241,20 @@ fn k6_unbound_host_gets_no_injection() {
   let h = start(cfg).unwrap();
   let ca_pem = std::fs::read_to_string(&h.ca_path).unwrap();
 
-  let resp = tunnel_request(&ca_pem, h.port, port, "GET /open HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-    .expect("tunnel");
+  // P21.1 K3b: no binding -> the agent's own auth passes through intact
+  // (an OAuth-first agent would otherwise 401 on every call).
+  let resp = tunnel_request(
+    &ca_pem,
+    h.port,
+    port,
+    "GET /open HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer user-oauth-token\r\n\r\n",
+  )
+  .expect("tunnel");
   assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
   let hit = hits.lock().unwrap().pop().expect("stub hit");
   assert!(
-    !hit.headers.to_lowercase().contains("authorization"),
-    "no injection for unbound host: {}",
+    hit.headers.to_lowercase().contains("authorization: bearer user-oauth-token"),
+    "unbound host must pass the agent's auth through: {}",
     hit.headers
   );
 }

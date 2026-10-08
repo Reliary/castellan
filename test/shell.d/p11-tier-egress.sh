@@ -18,7 +18,8 @@
 #   K5 no regression    the census distinguishes the two postures, and
 #                       broker denies reach the session spine
 set -u
-BIN_DIR=/home/john/src/castellan/target/release
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
+BIN_DIR="$REPO/target/release"
 BIN="$BIN_DIR/castellan"
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -107,7 +108,7 @@ drive_low() {
   local proj="$1"
   for _ in 1 2 3 4 5; do
     mkproj "$proj"
-    script -qec "
+    SHELL=/bin/sh script -qec "
       $RL
       rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' -- bash -c 'true' >/dev/null 2>&1
       SID=\$(ls -t '$XDG_STATE_HOME/castellan/sessions'/*.json 2>/dev/null | head -1 | xargs basename | sed 's/\.json//')
@@ -132,7 +133,7 @@ echo "== K1: declared LLM host stays reachable, agent is not bricked =="
 # use the machine's hostname to prove the allowlist path works end to end.
 ALLOWED=$(python3 -c "import socket;print(socket.gethostbyname(socket.gethostname()))" 2>/dev/null)
 mkproj "$P0"
-script -qec "$RL
+SHELL=/bin/sh script -qec "$RL
   rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --allow-host '$ALLOWED' -- bash -c 'echo WORKED > out.txt'
 " /dev/null >"$W/k1.out" 2>&1
 SID1=$(tr -d '\r' < "$W/k1.out" | grep -o 's[0-9a-f]\{12,\}' | head -1)
@@ -149,7 +150,7 @@ grep -q "egress restricted" "$W/k1.out" && ok "K1b: the launcher announced the e
 echo
 echo "== K2: with no declared host, public egress is denied =="
 mkproj "$P0"
-script -qec "$RL
+SHELL=/bin/sh script -qec "$RL
   rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- python3 '$W/probe.py'
 " /dev/null >"$W/k2.out" 2>/dev/null
 K2=$(tr -d '\r' < "$W/k2.out" | grep -o 'tcp_public=E[0-9]*' | head -1)
@@ -159,7 +160,7 @@ echo "  $K2"
 echo
 echo "== K3: a warm project is untouched by the floor =="
 PW="$W/warm"; mkproj "$PW"
-SIDW=$(script -qec "$RL
+SIDW=$(SHELL=/bin/sh script -qec "$RL
   rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$PW' -- bash -c 'echo hi > $PW/w.txt'
 " /dev/null 2>"$W/k3.err" | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
 if grep -q "trust tier <= 1" "$W/k3.err"; then bad "K3: the floor fired on a cold/warm project"; else ok "K3: the floor did not fire on a non-low project"; fi
@@ -217,7 +218,7 @@ except Exception:
 XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' bless approve "\$NONCE" > "$W/k4b.out" 2>&1
 echo K4-INNER-DONE
 EOS
-script -qec "sh $W/k4-inner.sh" /dev/null >"$W/k4-inner.log" 2>&1
+SHELL=/bin/sh script -qec "sh $W/k4-inner.sh" /dev/null >"$W/k4-inner.log" 2>&1
 if grep -qi "approved\|ok" "$W/k4b.out" 2>/dev/null; then
   ok "K4a: the egress grant was approved from the launcher terminal"
 else
@@ -226,12 +227,12 @@ fi
 # the next launch asks for and consumes the one-shot grant
 if grep -q K4-INNER-DONE "$W/k4-inner.log" 2>/dev/null; then
   mkproj "$P0"
-  script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --grant egress -- bash -c 'echo H > out.txt'" /dev/null >"$W/k4c.out" 2>&1
+  SHELL=/bin/sh script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --grant egress -- bash -c 'echo H > out.txt'" /dev/null >"$W/k4c.out" 2>&1
   grep -q "consumed expansion grant" "$W/k4c.out" && ok "K4b: the launcher consumed the egress grant" \
     || bad "K4b: the grant was not consumed: $(grep -i 'grant\|tier' "$W/k4c.out" | tr '\n' ' ')"
   # and the one after it is floored again — the grant is one-shot
   mkproj "$P0"
-  script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'true'" /dev/null >"$W/k4d.out" 2>&1
+  SHELL=/bin/sh script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'true'" /dev/null >"$W/k4d.out" 2>&1
   grep -q "trust tier <= 1" "$W/k4d.out" && ok "K4c: the floor returns after the one-shot grant is spent" \
     || bad "K4c: the grant did not expire (floor still lifted): $(grep -i 'tier\|grant' "$W/k4d.out" | tr '\n' ' ')"
 else
@@ -240,7 +241,7 @@ fi
 
 echo
 echo "== K5b: broker denies reach the session spine =="
-SIDB=$(script -qec "$RL
+SIDB=$(SHELL=/bin/sh script -qec "$RL
   rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- python3 '$W/probe.py'
 " /dev/null 2>/dev/null | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
 SPINE="$XDG_STATE_HOME/castellan/events/${SIDB}.jsonl"

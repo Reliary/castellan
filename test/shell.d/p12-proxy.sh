@@ -19,8 +19,9 @@
 #   K5  workspace-poisoned keyring.toml is never consulted: the
 #       session's keyring_sha equals the config-dir file's sha256 and
 #       the poison token appears nowhere in state
-#   K6  unbound host inside the allowlist is proxied with NO injection
-#       -> cargo test -p castellan-proxy
+#   K6  unbound host inside the allowlist is proxied with NO injection,
+#       and the agent's own auth headers pass through intact (P21.1
+#       conditional strip) -> cargo test -p castellan-proxy
 #   K7  session env carries HTTPS_PROXY + SSL_CERT_FILE, and the CA
 #       bundle parses (CERTIFICATE present)
 #   K8  two sessions get distinct per-session CA files
@@ -211,10 +212,18 @@ fi
 
 echo
 echo "== K2/K6/K3c-integration: proxy crate tests =="
-if (cd "$REPO" && cargo test -p castellan-proxy -p castellan-keyring > "$W/proxy-tests.log" 2>&1); then
-  ok "K2/K6: end-to-end MITM tests pass (injection, no-injection, 403, poison)"
+# The proxy crate tests need cargo. The exercise box has no Rust
+# toolchain by design (it runs the release binaries), so this leg is a
+# NOTE there, never a pass and never a fail: the `ci` workflow's
+# workspace `cargo test` covers the same four tests on every push.
+if command -v cargo >/dev/null 2>&1; then
+  if (cd "$REPO" && cargo test -p castellan-proxy -p castellan-keyring > "$W/proxy-tests.log" 2>&1); then
+    ok "K2/K6: end-to-end MITM tests pass (injection, pass-through, 403, poison)"
+  else
+    bad "K2/K6: proxy tests failed — see $W/proxy-tests.log"
+  fi
 else
-  bad "K2/K6: proxy tests failed — see $W/proxy-tests.log"
+  echo "  NOTE: no cargo on this box; proxy crate tests covered by CI workspace tests"
 fi
 
 echo

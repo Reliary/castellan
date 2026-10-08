@@ -137,6 +137,12 @@ pub enum Request {
     /// the LLM provider, and anything else the human wants reachable.
     #[serde(default)]
     allow_hosts: Vec<String>,
+    /// P21.1: launcher-derived fallback destinations, used only when
+    /// neither the operator nor the config declared any. Each entry is
+    /// `(host, source)` so the launch profile and spine can say where a
+    /// destination came from (env endpoint vs harness brand default).
+    #[serde(default)]
+    derived_hosts: Vec<(String, String)>,
     /// Expansion wants this launch wants to consume. The daemon
     /// consumes daemon-side one-shot grants (keyed project:want);
     /// a consumed grant overrides the tier floor (human decision).

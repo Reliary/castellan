@@ -75,7 +75,7 @@ fn main() {
     Ok(s) => s,
     Err(e) => {
       eprintln!("castellan daemon not reachable at {path}: {e}");
-      eprintln!("start it with: castellan-daemon");
+      eprintln!("install and start it with: castellan service install");
       std::process::exit(1);
     }
   };
@@ -172,6 +172,9 @@ fn preflight() -> ! {
     6 - failures,
     if failures == 0 { " — castellan should work here" } else { " — castellan will be degraded" }
   );
+  if failures > 0 {
+    eprintln!("castellan: failed checks are kernel/environment facts; `castellan doctor` explains the full posture");
+  }
   std::process::exit(if failures == 0 { 0 } else { 1 })
 }
 
@@ -649,6 +652,19 @@ fn launch(args: &[String], sock: &str) -> ! {
   if outside_user_service() {
     hop_into_user_service();
   }
+  // P21.1: derived destinations for an enforced launch that declares
+  // none. Computed unconditionally (not only when --net-restrict was
+  // requested): the daemon may force the destination policy from the
+  // trust floor, and a floor-forced restrict with an empty allowlist is
+  // a deny-all deadlock for the agent's own provider. The daemon applies
+  // these only when `net_restrict` is on AND its own resolution (flags,
+  // env, egress.toml) is empty, recording each host with its source.
+  // Env is read HERE, in the launcher shell's process — an enveloped
+  // agent cannot influence it.
+  let defaults_off = std::env::var("CASTELLAN_EGRESS_DEFAULTS")
+    .map(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+    .unwrap_or(false);
+  let derived_hosts = castellan_policy::derive_allow_hosts(&harness, defaults_off);
   let resp = rpc(sock, &serde_json::json!({
     "op": "spawn",
     "harness": harness,
@@ -660,6 +676,7 @@ fn launch(args: &[String], sock: &str) -> ! {
     "net": net,
     "net_restrict": net_restrict,
     "allow_hosts": allow_hosts,
+    "derived_hosts": derived_hosts,
     "grants": grants,
     "launcher_tty": launcher_tty(),
     "launcher_sid": launcher_sid()
@@ -1007,6 +1024,59 @@ fn launch(args: &[String], sock: &str) -> ! {
     eprintln!("exec failed: {err}");
     std::process::exit(127);
   }
+  // P11: the broker's IP allowlist is a separate mechanism from
+  // Landlock's port-scoped rule. `--net` (or the floor) sets
+  // restrict_ip; the operator's allowlist is the LLM provider plus
+  // anything else declared. An empty allowlist under restrict_ip is
+  // deny-all-by-exception, and that is the honest fail-closed state.
+  //
+  // P13 ninja F12: under --no-enforce the base is EgressPolicy::audit()
+  // (all default denies off — the banner); an explicit net_restrict
+  // then layers the operator-requested destination policy on top.
+  //
+  // P21.1 fix (found live on .227, 2026-10-08): `with_hosts` resolves
+  // hostnames via getaddrinfo, which issues a connect() to the
+  // resolver. The supervisor runs under the same seccomp notif filter it
+  // is about to service, so resolving AFTER spawn_broker deadlocks the
+  // launch at seccomp_do_user_notification (the decision loop has not
+  // started). Build the policy and print the banner BEFORE the fork;
+  // resolution then happens unconstrained in the launcher, exactly like
+  // the daemon's own spawn-time resolution.
+  let mut bpolicy = if enforce {
+    castellan_broker::EgressPolicy::new()
+  } else {
+    castellan_broker::EgressPolicy::audit()
+  };
+  if net_restrict {
+    bpolicy = bpolicy.with_llm_only(&allow_hosts);
+    let derived: Vec<&str> = profile
+      .as_ref()
+      .and_then(|p| p.get("derived_hosts").and_then(|d| d.as_array()))
+      .map(|a| {
+        a.iter()
+          .filter_map(|v| v.as_array())
+          .filter_map(|pair| pair.first().and_then(|h| h.as_str()))
+          .collect()
+      })
+      .unwrap_or_default();
+    if !allow_hosts.is_empty() {
+      eprintln!(
+        "castellan: egress restricted to loopback + {} host(s): {}",
+        allow_hosts.len(),
+        allow_hosts.join(", ")
+      );
+      if !derived.is_empty() {
+        eprintln!(
+          "castellan: {} of these were derived for harness `{}` (no allowlist declared) — pin them with --allow-host or egress.toml to silence this",
+          derived.len(),
+          harness
+        );
+      }
+    } else {
+      eprintln!("castellan: egress restricted to loopback only — the agent will not reach its LLM API");
+      eprintln!("castellan: declare one with --allow-host HOST, CASTELLAN_EGRESS_ALLOW_HOSTS, or egress.toml [llm] hosts");
+    }
+  }
   let broker = castellan_broker::spawn_broker();
   match broker {
     Ok(castellan_broker::Spawn::Supervisor(mut sup)) => {
@@ -1022,32 +1092,6 @@ fn launch(args: &[String], sock: &str) -> ! {
           nix::sys::signal::Signal::SIGHUP,
           nix::sys::signal::SigHandler::SigIgn,
         );
-      }
-      // P11: the broker's IP allowlist is a separate mechanism from
-      // Landlock's port-scoped rule. `--net` (or the floor) sets
-      // restrict_ip; the operator's allowlist is the LLM provider plus
-      // anything else declared. An empty allowlist under restrict_ip is
-      // deny-all-by-exception, and that is the honest fail-closed state.
-      //
-      // P13 ninja F12: under --no-enforce the base is EgressPolicy::audit()
-      // (all default denies off — the banner); an explicit net_restrict
-      // then layers the operator-requested destination policy on top.
-      let mut bpolicy = if enforce {
-        castellan_broker::EgressPolicy::new()
-      } else {
-        castellan_broker::EgressPolicy::audit()
-      };
-      if net_restrict {
-        bpolicy = bpolicy.with_llm_only(&allow_hosts);
-        if !allow_hosts.is_empty() {
-          eprintln!(
-            "castellan: egress restricted to loopback + {} declared host(s): {}",
-            allow_hosts.len(),
-            allow_hosts.join(", ")
-          );
-        } else {
-          eprintln!("castellan: egress restricted to loopback only — the agent will not reach its LLM API");
-        }
       }
       let (btx, brx) = castellan_broker::broker_log();
       let state_dir = std::env::var("XDG_STATE_HOME")
@@ -1393,7 +1437,7 @@ fn rpc(sock: &str, req: &serde_json::Value) -> String {
   let mut stream =
     std::os::unix::net::UnixStream::connect(sock).unwrap_or_else(|e| {
       eprintln!("castellan daemon not reachable at {sock}: {e}");
-      eprintln!("start it with: castellan-daemon");
+      eprintln!("install and start it with: castellan service install");
       std::process::exit(1);
     });
   stream

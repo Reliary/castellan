@@ -131,6 +131,104 @@ pub fn always_allow_write() -> Vec<PathBuf> {
   ["/dev/null", "/dev/full", "/dev/tty"].map(PathBuf::from).to_vec()
 }
 
+/// P21.1: default LLM endpoints per harness, for allowlist derivation.
+/// Exact hosts only (no wildcards — `*.openai.com` would admit
+/// chatgpt.com's consumer UI and every sibling; the API host is what an
+/// agent needs). Verified against the installed binaries on the dev box
+/// 2026-10-08 (`strings` on /opt/claude-code/bin/claude, /usr/bin/codex,
+/// the gemini-cli bundle): api.anthropic.com, api.openai.com +
+/// auth.openai.com (OAuth token exchange), cloudcode-pa.googleapis.com +
+/// generativelanguage.googleapis.com + oauth2.googleapis.com.
+fn brand_hosts(harness: &str) -> &'static [&'static str] {
+  match harness {
+    "claude" => &["api.anthropic.com"],
+    "codex" => &["api.openai.com", "auth.openai.com"],
+    "gemini" => &[
+      "cloudcode-pa.googleapis.com",
+      "generativelanguage.googleapis.com",
+      "oauth2.googleapis.com",
+    ],
+    _ => &[],
+  }
+}
+
+/// P21.1: derive the LLM destination set for a launch when the operator
+/// declared none. Sources, in order: an explicit endpoint env var the
+/// launcher shell already holds (`<HARNESS>_BASE_URL`-style), then the
+/// harness's brand defaults. An in-envelope agent cannot set the
+/// launcher's environment, so these sources are launcher/human
+/// provenance; agent-writable config files (`settings.json`, `.claude/*`)
+/// are deliberately NOT consulted — the agent could then authorize its
+/// own egress.
+///
+/// `defaults_off` (`CASTELLAN_EGRESS_DEFAULTS=0`) yields only the
+/// env-derived set. A provider-specific base URL (e.g.
+/// `ANTHROPIC_BASE_URL` for claude) *suppresses* brand defaults: the
+/// operator pointing the harness at a gateway means the gateway, not the
+/// vendor. `OLLAMA_HOST` is additive (a local endpoint, never an
+/// override). Each entry is `(host, source)` so the launch profile and
+/// spine can record where a destination came from.
+pub fn derive_allow_hosts(harness: &str, defaults_off: bool) -> Vec<(String, String)> {
+  derive_allow_hosts_from(harness, defaults_off, |k| std::env::var(k).ok())
+}
+
+/// Pure core of [`derive_allow_hosts`], with the environment injected so
+/// tests do not mutate process-global state (cargo runs tests in
+/// parallel threads; `set_var` in a test is a race).
+pub fn derive_allow_hosts_from(
+  harness: &str,
+  defaults_off: bool,
+  env: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+  let mut hosts: Vec<(String, String)> = Vec::new();
+  let mut push = |h: String, src: &str| {
+    let h = h.trim().trim_end_matches('/').to_string();
+    if !h.is_empty() && !hosts.iter().any(|(x, _)| *x == h) {
+      hosts.push((h, src.to_string()));
+    }
+  };
+  let provider_envs: &[&str] = match harness {
+    "claude" => &["ANTHROPIC_BASE_URL", "CLAUDE_BASE_URL"],
+    "codex" | "openai" => &["OPENAI_BASE_URL", "CODEX_BASE_URL"],
+    _ => &[],
+  };
+  let mut provider_override = false;
+  for name in provider_envs {
+    if let Some(raw) = env(name) {
+      if let Some(host) = host_from_url(&raw) {
+        push(host, &format!("env:{name}"));
+        provider_override = true;
+      }
+    }
+  }
+  if let Some(raw) = env("OLLAMA_HOST") {
+    if let Some(host) = host_from_url(&raw) {
+      push(host, "env:OLLAMA_HOST");
+    }
+  }
+  if !defaults_off && !provider_override {
+    for h in brand_hosts(harness) {
+      push((*h).to_string(), "brand");
+    }
+  }
+  hosts
+}
+
+/// Extract the host (with port stripped) from a URL or bare host:port.
+fn host_from_url(raw: &str) -> Option<String> {
+  let s = raw.trim();
+  let s = s
+    .strip_prefix("https://")
+    .or_else(|| s.strip_prefix("http://"))
+    .unwrap_or(s);
+  let host = s.split(['/', '?']).next()?.split('@').next_back()?;
+  let host = host.split(':').next()?;
+  if host.is_empty() || !host.contains('.') {
+    return None;
+  }
+  Some(host.to_string())
+}
+
 impl Policy {
   pub fn new(session: &str, harness: &str, project: PathBuf) -> Self {
     let config = custom_harness_config();
@@ -291,6 +389,71 @@ mod tests {
     assert_eq!(detect_harness("codex"), Some("codex"));
     assert_eq!(detect_harness("/usr/local/bin/opencode"), Some("opencode"));
     assert_eq!(detect_harness("/usr/bin/python3"), None);
+  }
+
+  #[test]
+  fn k4_derivation_brand_defaults_are_exact_hosts() {
+    let none = |_: &str| None;
+    let claude = derive_allow_hosts_from("claude", false, none);
+    assert!(claude.iter().any(|(h, s)| h == "api.anthropic.com" && s == "brand"));
+    for (h, _) in &claude {
+      assert!(!h.contains('*'), "no wildcards in derived hosts: {h}");
+    }
+    let codex = derive_allow_hosts_from("codex", false, none);
+    assert!(codex.iter().any(|(h, _)| h == "api.openai.com"));
+    assert!(codex.iter().any(|(h, _)| h == "auth.openai.com"));
+    assert!(
+      !codex.iter().any(|(h, _)| h == "chatgpt.com"),
+      "consumer UI host must not be derived"
+    );
+    let gem = derive_allow_hosts_from("gemini", false, none);
+    assert!(gem.iter().any(|(h, _)| h == "cloudcode-pa.googleapis.com"));
+    assert!(derive_allow_hosts_from("unknown-harness", false, none).is_empty());
+  }
+
+  #[test]
+  fn k4_derivation_off_switch_drops_brand() {
+    let none = |_: &str| None;
+    let off = derive_allow_hosts_from("claude", true, none);
+    assert!(off.iter().all(|(_, s)| s != "brand"), "off switch must drop brand hosts: {off:?}");
+  }
+
+  #[test]
+  fn k4_derivation_env_endpoint_wins_and_parses() {
+    let env = |k: &str| {
+      (k == "ANTHROPIC_BASE_URL").then(|| "https://proxy.internal.example:8443/v1".to_string())
+    };
+    let d = derive_allow_hosts_from("claude", false, env);
+    assert_eq!(d.first().map(|(h, _)| h.as_str()), Some("proxy.internal.example"));
+    assert_eq!(d.first().map(|(_, s)| s.as_str()), Some("env:ANTHROPIC_BASE_URL"));
+    assert!(
+      d.iter().all(|(h, _)| h != "api.anthropic.com"),
+      "a provider base URL suppresses the brand default (gateway means gateway): {d:?}"
+    );
+    assert!(host_from_url("not-a-host").is_none());
+    assert!(host_from_url("").is_none());
+    assert_eq!(host_from_url("http://user@example.com:8080/x").as_deref(), Some("example.com"));
+  }
+
+  #[test]
+  fn k5_derivation_sources_are_only_env_and_brand() {
+    // P21.1 K5: derivation must consult ONLY the launcher shell's env
+    // and the compiled brand defaults. Agent-writable config inside the
+    // project (`settings.json`, `.claude/*`) must never widen the set —
+    // that would let the agent authorize its own egress. Any new source
+    // class fails this test on purpose.
+    let env = |k: &str| (k == "OLLAMA_HOST").then(|| "127.0.0.1:11434".to_string());
+    for harness in ["claude", "codex", "gemini", "unknown"] {
+      for off in [false, true] {
+        for (host, source) in derive_allow_hosts_from(harness, off, env) {
+          assert!(
+            source == "brand" || source.starts_with("env:"),
+            "unexpected derivation source {source:?} for {host:?} — \
+             if this is a new source class, get it reviewed (agent-writable = forbidden)"
+          );
+        }
+      }
+    }
   }
 
   #[test]

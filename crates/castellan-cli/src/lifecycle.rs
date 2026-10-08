@@ -219,11 +219,25 @@ fn unit_contents(daemon: &Path, cli: &Path, skip_preflight: bool) -> String {
     "[Unit]\n\
      Description=castellan daemon (OS trust boundary for AI agents)\n\
      After=default.target\n\
+     # P20/F11: give up visibly after a burst instead of thrashing the\n\
+     # socket against a competing daemon every 2s forever.\n\
+     StartLimitBurst=5\n\
+     StartLimitIntervalSec=60\n\
      \n\
      [Service]\n\
      Type=simple\n\
      {pre}\
      ExecStart={} \n\
+     # P20/C43: the daemon is gone when this runs (any exit — crash,\n\
+     # SIGKILL, systemctl stop, restart). Freeze every session scope\n\
+     # directly via cgroupfs: no daemon, no registry, no tty gate. Pairs\n\
+     # with daemon-side rehydration so thaw works after the restart.\n\
+     ExecStopPost={} freeze --daemonless\n\
+     # A killed daemon leaves its socket file behind; a stale socket makes
+     # `-S` checks lie and clients report ECONNREFUSED against a path
+     # that exists. %t is the manager's XDG_RUNTIME_DIR (same dir the
+     # daemon binds). `-` = ignore failure (already gone).
+     ExecStopPost=-/bin/rm -f %t/castellan.sock\n\
      Restart=on-failure\n\
      RestartSec=2\n\
      # The agent runs in child scopes, not this unit; the daemon needs no\n\
@@ -232,13 +246,54 @@ fn unit_contents(daemon: &Path, cli: &Path, skip_preflight: bool) -> String {
      \n\
      [Install]\n\
      WantedBy=default.target\n",
-    daemon.display()
+    daemon.display(),
+    cli.display()
   )
+}
+
+/// P20.2: freeze every session scope via cgroupfs — no daemon, no
+/// registry, no tty gate. Invoked by the unit's ExecStopPost (the daemon
+/// is already dead) and available to operators as
+/// `castellan freeze --daemonless`.
+///
+/// F12 surface: an ENVELOPED agent running this cannot write
+/// cgroup.freeze — the same Landlock /sys denial that stops a direct
+/// write stops this binary it spawns (live-verified EPERM). An
+/// UNCONFINED same-uid process can already write cgroup.freeze without
+/// this verb. Equal power in both directions: no new capability.
+pub fn freeze_all_local() -> ! {
+  let scopes = live_scopes();
+  if scopes.is_empty() {
+    println!("no session scopes to freeze");
+    std::process::exit(0);
+  }
+  let root = match castellan_freezer::CgroupRoot::detect() {
+    Ok(r) => r,
+    Err(e) => {
+      eprintln!("freeze --daemonless: cgroup root unavailable: {e}");
+      std::process::exit(1);
+    }
+  };
+  let mut froze = 0u32;
+  let mut failed = 0u32;
+  for path in &scopes {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    let scope = name.trim_end_matches(".scope").to_string();
+    match root.set_freeze(&scope, true) {
+      Ok(_) => froze += 1,
+      Err(_) => failed += 1,
+    }
+  }
+  println!("froze {froze} session scope(s), {failed} failed");
+  std::process::exit(if failed > 0 { 1 } else { 0 });
 }
 
 fn cmd_service(args: &[String]) -> ! {
   let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
   let skip_preflight = args.iter().any(|a| a == "--skip-preflight");
+  let no_start = args.iter().any(|a| a == "--no-start");
   match sub {
     "install" => {
       let daemon = match sibling_bin("castellan-daemon") {
@@ -249,6 +304,26 @@ fn cmd_service(args: &[String]) -> ! {
           std::process::exit(1);
         }
       };
+      // P20/F4: a manually-run daemon answering the socket would make the
+      // unit's daemon exit 3 (singleton) and Restart=on-failure would
+      // thrash it against the socket forever. Refuse instead.
+      let unit_active = systemctl_ok(&["is-active", UNIT_NAME]);
+      if !unit_active && std::os::unix::net::UnixStream::connect(sock_path()).is_ok() {
+        eprintln!(
+          "service install: a castellan-daemon is already serving {} but it is not",
+          sock_path().display()
+        );
+        eprintln!("systemd-managed (manual run). Stop it first — `castellan service stop`");
+        eprintln!("or `pkill -f castellan-daemon` — then re-run install.");
+        std::process::exit(1);
+      }
+      let rollback = |reason: &str| -> ! {
+        let _ = systemctl(&["disable", "--now", UNIT_NAME]);
+        let _ = std::fs::remove_file(unit_path());
+        let _ = systemctl(&["daemon-reload"]);
+        eprintln!("service install: {reason}");
+        std::process::exit(1);
+      };
       let cli = std::env::current_exe().unwrap_or_else(|_| daemon.clone());
       let _ = std::fs::create_dir_all(unit_dir());
       if let Err(e) = std::fs::write(unit_path(), unit_contents(&daemon, &cli, skip_preflight)) {
@@ -257,10 +332,29 @@ fn cmd_service(args: &[String]) -> ! {
       }
       println!("wrote {}", unit_path().display());
       let _ = systemctl(&["daemon-reload"]);
+      // P20/F7: systemctl --user is a singleton bound to the MANAGER's
+      // config env. A unit written under a shell-set XDG_CONFIG_HOME the
+      // manager never saw is invisible (measured on .227). Verify, do not
+      // assume — then either start or roll back so no half-state remains.
+      let visible = systemctl(&["cat", UNIT_NAME])
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+      if !visible {
+        rollback(
+          "the unit file was written but the user manager cannot see it\n\
+         (or the manager is unreachable) — XDG_RUNTIME_DIR/XDG_CONFIG_HOME\n\
+         in this shell must match the manager's environment. Unit rolled back.",
+        );
+      }
+      if no_start {
+        println!("service installed (not started, --no-start)");
+        std::process::exit(0);
+      }
       if !systemctl_ok(&["enable", "--now", UNIT_NAME]) {
-        eprintln!("service install: `systemctl --user enable --now {UNIT_NAME}` failed");
-        eprintln!("unit written; inspect with: systemctl --user status {UNIT_NAME}");
-        std::process::exit(1);
+        rollback(
+          "`systemctl --user enable --now` failed (preflight? see\n\
+         `journalctl --user -u castellan.service`). Unit rolled back.",
+        );
       }
       print!("{}", exec_stdout(&["is-active", UNIT_NAME]));
       println!("service installed and started");
@@ -301,7 +395,14 @@ fn cmd_service(args: &[String]) -> ! {
         c.arg("-f");
       }
       match c.status() {
-        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+        Ok(s) => {
+          // journalctl exits 4 for "no entries yet" — a fresh unit, not
+          // an error (P20 polish).
+          match s.code() {
+            Some(0) | Some(4) => std::process::exit(0),
+            other => std::process::exit(other.unwrap_or(1)),
+          }
+        }
         Err(e) => {
           eprintln!("service logs: journalctl unavailable: {e}");
           std::process::exit(1);
@@ -309,7 +410,7 @@ fn cmd_service(args: &[String]) -> ! {
       }
     }
     other => {
-      eprintln!("usage: castellan service [install [--skip-preflight]|uninstall|status|stop|logs [-f]]");
+      eprintln!("usage: castellan service [install [--skip-preflight]|[--no-start]|uninstall|status|stop|logs [-f]]");
       eprintln!("  (unknown subcommand: {other})");
       std::process::exit(2);
     }
@@ -513,18 +614,115 @@ fn cmd_doctor() -> ! {
       problems += 1;
     }
   };
-  report(sock_path().exists(), "daemon socket", &sock_path().display().to_string());
+  // P20/F1: every check must be falsifiable — no `|| true`.
+  let sock = sock_path();
+  let sock_present = sock.exists();
+  let sock_alive = sock_present && std::os::unix::net::UnixStream::connect(&sock).is_ok();
+  report(
+    sock_alive,
+    "daemon socket",
+    if sock_present { "present and answering" } else { "absent" },
+  );
   let active = systemctl_ok(&["is-active", UNIT_NAME]);
   report(active, "service active", UNIT_NAME);
-  report(unit_path().exists(), "unit installed", &unit_path().display().to_string());
+  let unit_exists = unit_path().exists();
+  report(unit_exists, "unit installed", &unit_path().display().to_string());
+  // P20/F17: a field unit predating the P20 directives (ExecStopPost
+  // freeze, StartLimit) reports "active" while C43 is still open on this
+  // box. Regenerate and diff (ExecStartPre ignored: --skip-preflight is a
+  // legitimate install variant).
+  if unit_exists {
+    let installed = std::fs::read_to_string(unit_path()).unwrap_or_default();
+    let normalized = |s: &str| -> String {
+      s.lines()
+        .filter(|l| !l.starts_with("ExecStartPre"))
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    match sibling_bin("castellan-daemon") {
+      Some(daemon) => {
+        let cli = std::env::current_exe().unwrap_or_else(|_| daemon.clone());
+        let fresh = unit_contents(&daemon, &cli, false);
+        let stale = normalized(&installed) != normalized(&fresh);
+        report(
+          !stale,
+          "unit up to date",
+          if stale {
+            "STALE — re-run `castellan service install`"
+          } else {
+            "matches generated"
+          },
+        );
+      }
+      None => println!("INFO  {:<24} daemon binary missing — cannot check unit freshness", "unit"),
+    }
+    let exec_start = installed
+      .lines()
+      .find(|l| l.starts_with("ExecStart="))
+      .and_then(|l| l.strip_prefix("ExecStart="))
+      .map(|s| s.trim().to_string());
+    match exec_start {
+      Some(p) => report(std::path::Path::new(&p).exists(), "ExecStart path", &p),
+      None => report(false, "ExecStart path", "no ExecStart= line found"),
+    }
+  }
   let keyring = castellan_config().join("keyring.toml");
   report(keyring.exists(), "keyring present", &keyring.display().to_string());
   let daemon = sibling_bin("castellan-daemon");
-  report(daemon.is_some(), "daemon binary present", &daemon.map(|p| p.display().to_string()).unwrap_or_else(|| "(not found)".into()));
-  report(live_scopes().is_empty() || true, "scope listing", &format!("{} scope(s)", live_scopes().len()));
+  report(
+    daemon.is_some(),
+    "daemon binary present",
+    &daemon.map(|p| p.display().to_string()).unwrap_or_else(|| "(not found)".into()),
+  );
+  // P20/F16: registry-vs-cgroupfs drift. Live scopes with a reachable
+  // daemon but a registry that missed them = rehydration failure (the
+  // freeze button would not reach them). Live scopes with NO daemon =
+  // the C43 running-unmanaged state.
+  let scopes = live_scopes();
+  let scope_names: Vec<String> = scopes
+    .iter()
+    .filter_map(|p| {
+      p.file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(".scope").to_string())
+    })
+    .collect();
+  let managed = sock_alive || active;
+  report(
+    scope_names.is_empty() || managed,
+    "scopes managed",
+    &format!(
+      "{} live scope(s), daemon {}",
+      scope_names.len(),
+      if managed { "reachable" } else { "UNREACHABLE" }
+    ),
+  );
+  if sock_alive && !scope_names.is_empty() {
+    let resp = crate::rpc(&sock.to_string_lossy(), &serde_json::json!({ "op": "status" }));
+    let registered: std::collections::HashSet<String> =
+      serde_json::from_str::<serde_json::Value>(&resp)
+        .ok()
+        .and_then(|v| {
+          v.get("sessions")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+              a.iter()
+                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+            })
+        })
+        .unwrap_or_default();
+    let missing = scope_names.iter().filter(|s| !registered.contains(*s)).count();
+    let detail = if missing == 0 {
+      "all live scopes registered".to_string()
+    } else {
+      format!("{missing} scope(s) NOT in registry — rehydration drift")
+    };
+    report(missing == 0, "registry vs scopes", &detail);
+  }
   let sessions = castellan_state().join("sessions");
   let n = std::fs::read_dir(&sessions).map(|r| r.flatten().count()).unwrap_or(0);
   println!("INFO  {:<24} {n} session(s) on disk", "state");
+  println!("INFO  {:<24} {} scope(s) live", "cgroup", scope_names.len());
   println!("\n{} problem(s)", problems);
   std::process::exit(if problems == 0 { 0 } else { 1 });
 }
@@ -610,5 +808,26 @@ mod tests {
     assert!(u.contains("Type=simple"));
     let u2 = unit_contents(Path::new("/x/castellan-daemon"), Path::new("/x/castellan"), true);
     assert!(!u2.contains("ExecStartPre"));
+  }
+
+  // P20/F11: the unit must fail visibly (start-limit) instead of
+  // thrashing the socket against a competing daemon forever.
+  #[test]
+  fn unit_contents_has_start_limit() {
+    let u = unit_contents(Path::new("/x/d"), Path::new("/x/c"), false);
+    assert!(u.contains("StartLimitBurst=5"));
+    assert!(u.contains("StartLimitIntervalSec=60"));
+    assert!(u.contains("Restart=on-failure"));
+  }
+
+  // P20/C43: ExecStopPost must freeze the fleet on any stop, via the
+  // daemonless path (the daemon is gone when it runs), and must clean
+  // the stale socket so existence checks stay truthful.
+  #[test]
+  fn unit_contents_freezes_on_stop() {
+    let u = unit_contents(Path::new("/x/d"), Path::new("/x/c"), false);
+    assert!(u.contains("ExecStopPost=/x/c freeze --daemonless"));
+    assert!(!u.contains("ExecStopPost=/x/d"), "freeze must not need the daemon");
+    assert!(u.contains("ExecStopPost=-/bin/rm -f %t/castellan.sock"));
   }
 }

@@ -920,7 +920,10 @@ pub fn decide_signal(req: &SeccompNotif) -> (Verdict, &'static str, String) {
       Some(p) => (Some(p), p == tracee),
       None => return (Verdict::Deny, "signal-unreadable", format!("pidfd={fd}")),
     },
-    SignalTarget::None => return (Verdict::Allow, "signal-other", String::new()),
+    // P20/F8: fail-closed default. None means the notification carried a
+    // syscall this matcher does not know — a filter/table mismatch (the
+    // "guard does not guard" class). Unknown must deny, not allow.
+    SignalTarget::None => return (Verdict::Deny, "signal-unknown-nr", String::new()),
   };
   if self_ok {
     return (Verdict::Allow, "signal-self", String::new());
@@ -2286,6 +2289,21 @@ mod tests {
   }
 
   #[test]
+  fn signal_unknown_nr_denied() {
+    // P20/F8: a syscall number the matcher does not know (filter/table
+    // mismatch reaching decide_signal) must deny, never allow.
+    let req = SeccompNotif {
+      id: 0,
+      pid: 100,
+      flags: 0,
+      data: SeccompData { nr: 424_242, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
+    };
+    let (v, r, _) = decide_signal(&req);
+    assert_eq!(v, Verdict::Deny);
+    assert_eq!(r, "signal-unknown-nr");
+  }
+
+  #[test]
   fn abstract_socket_denied() {
     // R4: abstract (leading NUL) and empty unix paths deny.
     let p = EgressPolicy::new();
@@ -2391,13 +2409,21 @@ mod tests {
 
   #[test]
   fn signal_unknown_nr_falls_through() {
+    // P20/F8 contract change (was: Allow / "signal-other"). A syscall
+    // number decide_signal does not recognize means the filter routed
+    // something the matcher cannot classify — a table mismatch. Old
+    // behavior was fail-open for exactly that class; it now denies.
+    // SYS_getpid here stands in for "a real syscall that reached the
+    // signal matcher by mistake"; signal_unknown_nr_denied covers a
+    // garbage nr.
     let req = SeccompNotif {
       id: 0,
       pid: 1,
       flags: 0,
       data: SeccompData { nr: libc::SYS_getpid as i32, arch: 0, instruction_pointer: 0, args: [0, 0, 0, 0, 0, 0] },
     };
-    // not a signal nr: decide_signal treats it as non-signal.
-    assert_eq!(decide_signal(&req).1, "signal-other");
+    let (v, r, _) = decide_signal(&req);
+    assert_eq!(v, Verdict::Deny);
+    assert_eq!(r, "signal-unknown-nr");
   }
 }

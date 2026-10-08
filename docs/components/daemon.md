@@ -33,13 +33,13 @@ This mirrors the reliary-agent daemon pattern (TCP line protocol, lock-protected
 `/run/user/<uid>/castellan.sock` (or `$XDG_RUNTIME_DIR/castellan.sock`). Newline-delimited JSON. Examples:
 
 ```
--> {"op": "spawn", "harness": "claude", "project": "/home/john/Work/foo", "tier": 2}
+-> {"op": "spawn", "harness": "claude", "project": "~/Work/foo", "tier": 2}
 <- {"ok": true, "session": "uuid", "scope": "castellan-uuid.scope"}
 -> {"op": "freeze", "session": "uuid"}
 <- {"ok": true, "frozen": true}
 -> {"op": "undo", "session": "uuid", "mode": "dry-run"}
 <- {"ok": true, "changes": [...]}
--> {"op": "trust", "project": "/home/john/Work/foo", "action": "explain"}
+-> {"op": "trust", "project": "~/Work/foo", "action": "explain"}
 <- {"ok": true, "score": 62, "tier": 2, "events": [...]}
 -> {"op": "bless", "action": "request", "want": "egress", "reason": "..."}
 <- {"ok": true, "nonce": "..."}
@@ -66,12 +66,24 @@ Honest limits, measured against the code rather than the design:
 
 - **Only `castellan launch` sessions get a watchdog.** `castellan spawn` and `castellan
   adopt` create a session with no supervisor, so a daemon loss leaves them un-frozen.
-- **The supervisor is the launcher's child.** If its terminal closes before the daemon
-  does, it dies with the tty. An agent that ignores SIGHUP (or otherwise outlives its
-  tty) is then reparented and keeps running, with no guard left: killing the daemon
-  leaves it un-frozen. **Measured live on .227, 2026-10-08** (`test/shell.d/p19-watchdog-survival.sh`:
-  ARM A freezes as documented; ARM B proves the gap). Tracked as THREAT_MODEL C43;
-  fix is daemon-side supervision (or `PR_SET_CHILD_SUBREAPER`), not yet built.
+- **The supervisor is the launcher's child — P20 closed the gap this
+  created (THREAT_MODEL C43, found and fixed 2026-10-08).** The original
+  measurement: a terminal closing killed the supervisor (SIGHUP), and
+  then `eprintln` to the dead pty would panic it anyway (`panic=abort`
+  would have taken the watchdog down mid-freeze). The fix has three
+  parts, all in the supervisor branch: SIGHUP is ignored **after**
+  `spawn_broker` forked (the agent child keeps default SIGHUP — a normal
+  agent still dies with its terminal), stderr is redirected to
+  `sessions/<id>/supervisor.log` right after the launch banner (a closed
+  pty can no longer panic the process; the freeze record now survives
+  the terminal too), and the watchdog writes `cgroup.freeze` **before**
+  it logs (a failing log must never preempt the action it describes).
+  Verified live on .227 by `test/shell.d/p19-watchdog-survival.sh`,
+  run twice: ARM A (terminal intact, daemon killed) and ARM B
+  (SIGHUP-ignoring agent, terminal closed, orphaned, daemon killed)
+  both freeze — 5/0, 5/0. Residual: if the state dir is unwritable AND
+  the pty is dead, the log redirect fails and a later print can still
+  panic (documented at the redirect site).
 - Landlock + cgroup membership persist without the daemon (kernel-enforced), so
   *enforcement* survives daemon death regardless — only the active freeze action needs
   the watchdog.

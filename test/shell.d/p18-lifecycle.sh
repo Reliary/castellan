@@ -34,6 +34,8 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/castellan"
 SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID_}/castellan.sock"
 SLICE="/sys/fs/cgroup/user.slice/user-$UID_.slice/user@$UID_.service/castellan.slice"
 SNAP="${TMPDIR:-/tmp}/castellan-p18-snapshot-$(date +%s).txt"
+W=/tmp/cast-p18-work
+mkdir -p "$W"
 PASS=0; FAIL=0; NOTE=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -49,7 +51,10 @@ fi
 cleanup() {
   systemctl --user stop "$UNIT" 2>/dev/null
   systemctl --user disable "$UNIT" 2>/dev/null
-  pkill -9 -f castellan-daemon 2>/dev/null
+  rm -f "$UNIT_PATH"
+  systemctl --user daemon-reload 2>/dev/null
+  pkill -9 -x castellan-daemo 2>/dev/null
+  pkill -9 -f 'sleep 120' 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -81,27 +86,51 @@ echo
 echo "===== install produces a working unit ====="
 "$BIN/castellan" service install >/dev/null 2>&1 && ok "service install exits 0" || bad "service install nonzero"
 [[ -f "$UNIT_PATH" ]] && ok "unit written to $UNIT_PATH" || bad "unit not written"
+# P20/C43+F11: the generated unit must carry the fail-closed directives.
+grep -q "ExecStopPost=.*freeze --daemonless" "$UNIT_PATH" \
+  && ok "unit has ExecStopPost freeze-on-stop" || bad "unit missing ExecStopPost freeze"
+grep -q "StartLimitBurst" "$UNIT_PATH" \
+  && ok "unit has start-limit (no restart thrash)" || bad "unit missing StartLimit"
 systemctl --user is-enabled "$UNIT" >/dev/null 2>&1 && ok "unit enabled" || bad "unit not enabled"
 for _ in $(seq 1 30); do systemctl --user is-active "$UNIT" >/dev/null 2>&1 && break; sleep 0.2; done
 systemctl --user is-active "$UNIT" >/dev/null 2>&1 && ok "unit active" || bad "unit not active"
-for _ in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 0.2; done
-[[ -S "$SOCK" ]] && ok "daemon socket present after install" || bad "socket absent after install"
+for _ in $(seq 1 50); do "$BIN/castellan" status >/dev/null 2>&1 && break; sleep 0.2; done
+# connect-based, not `-S`: a stale socket file makes existence checks
+# lie (measured: p18 launched against ECONNREFUSED against a stale path)
+"$BIN/castellan" status >/dev/null 2>&1 \
+  && ok "daemon answering after install" || bad "daemon not answering after install"
 
 echo
-echo "===== a confined session is visible in status ====="
+echo "===== a confined session is visible in status (stays live for the run) ====="
+LIVE_PID=""
 if [[ -S "$SOCK" ]]; then
   mkdir -p /tmp/cast-p18
-  # SHELL=/bin/sh: `script -qec` uses $SHELL; on boxes where the login shell
-  # is fish (e.g. .227) a POSIX body fails. Force sh so the harness is
-  # portable and the body is actually the bash we wrote.
-  out=$(SHELL=/bin/sh script -qec "
-    BIN=$BIN/castellan
-    OUT=\$(\$BIN launch --project /tmp/cast-p18 -- true 2>&1)
-    SID=\$(echo \"\$OUT\" | grep -oE 's[0-9a-f]{16,24}' | head -1)
-    \$BIN status
-    \$BIN kill \$SID >/dev/null 2>&1
-  " /dev/null 2>&1)
-  echo "$out" | grep -qE 's[0-9a-f]{16,24}' && ok "status lists the session" || bad "status did not list the session"
+  # Long-lived agent: kept alive so later steps exercise stop/uninstall
+  # against a REAL live session (P20 G10) instead of planted files.
+  # SHELL=/bin/sh: `script -qec` uses $SHELL; on fish boxes (e.g. .227)
+  # a POSIX body fails.
+  ( SHELL=/bin/sh script -qec "
+      BIN=$BIN/castellan
+      \$BIN launch --project /tmp/cast-p18 -- sleep 120
+    " /dev/null >"$W/p18-live.log" 2>&1 & )
+  for _ in $(seq 1 50); do
+    grep -qE 's[0-9a-f]{16,24}' "$W/p18-live.log" 2>/dev/null && break
+    sleep 0.2
+  done
+  SID_LIVE=$(grep -oE 's[0-9a-f]{16,24}' "$W/p18-live.log" 2>/dev/null | head -1)
+  # the agent execs AFTER the sid line prints — poll for it
+  for _ in $(seq 1 30); do
+    LIVE_PID=$(pgrep -f 'sleep 120' | head -1)
+    [[ -n "$LIVE_PID" ]] && break
+    sleep 0.2
+  done
+  if [[ -n "$SID_LIVE" ]]; then
+    ok "session launched live (sid=$SID_LIVE agent=$LIVE_PID)"
+    "$BIN/castellan" status 2>/dev/null | grep -q "$SID_LIVE" \
+      && ok "status lists the session" || bad "status did not list the session"
+  else
+    bad "live launch produced no session (see $W/p18-live.log)"
+  fi
 else
   note "skipped: no daemon running"
 fi
@@ -117,6 +146,19 @@ echo "===== service stop drops the socket ====="
 sleep 0.5
 systemctl --user is-active "$UNIT" >/dev/null 2>&1 && bad "unit still active after stop" || ok "unit stopped"
 [[ -S "$SOCK" ]] && bad "socket still present after stop" || ok "socket removed after stop"
+# P20/G8: a live scope with NO reachable daemon is the C43
+# running-unmanaged state — doctor must flag it, not wave it through.
+if [[ -n "${LIVE_PID:-}" ]] && kill -0 "$LIVE_PID" 2>/dev/null; then
+  ok "live agent still running after stop (test subject intact)"
+  if "$BIN/castellan" doctor >"$W/doc-drift.out" 2>&1; then
+    bad "G8: doctor PASSed with a live scope and no daemon"
+  else
+    grep -q "UNREACHABLE" "$W/doc-drift.out" \
+      && ok "G8: doctor FAILs naming the unreachable scopes" || { bad "G8: doctor failed but not on drift"; cat "$W/doc-drift.out"; }
+  fi
+else
+  note "live agent died before the drift check — G8 drift assert skipped"
+fi
 
 echo
 echo "===== gc reclaims old session state (mode-000-aware) ====="
@@ -145,6 +187,15 @@ fi
 [[ -S "$SOCK" ]] && bad "socket survived uninstall" || ok "socket removed"
 [[ -d "$SLICE" ]] && bad "castellan.slice survived uninstall" || ok "cgroup slice removed"
 [[ -f "$UNIT_PATH" ]] && bad "unit file survived uninstall" || ok "unit file removed"
+# P20/G10: against the REAL live session, not planted files — the agent
+# must be dead once its scope is torn down.
+if [[ -n "${LIVE_PID:-}" ]]; then
+  sleep 0.5
+  kill -0 "$LIVE_PID" 2>/dev/null && bad "G10: live agent SURVIVED uninstall (pid $LIVE_PID)" \
+    || ok "G10: live agent killed by uninstall"
+else
+  note "G10: no live agent recorded — uninstall e2e incomplete"
+fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $NOTE notes"

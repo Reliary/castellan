@@ -97,13 +97,24 @@ PY
 mkproj() { mkdir -p "$1"; printf 'x = 1\n' > "$1/a.py"; }
 
 drive_low() {
-  # 5 reverts to walk a project to tier 0
+  # 5 reverts to walk a project to tier 0.
+  # P20/F18: undo is a session-scoped human-only op bound to the
+  # launcher's terminal INSTANCE (kernel session id), so launch and
+  # undo must run in the SAME pty invocation — a second `script` gets a
+  # fresh session id even on a recycled pts minor, which is exactly the
+  # spoof the gate denies. The pre-P20 harness ran on that spoof (A/B
+  # verified: baseline reached tier 0, sid-bound build did not).
   local proj="$1"
   for _ in 1 2 3 4 5; do
     mkproj "$proj"
-    SID=$(script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' -- bash -c 'true' >/dev/null 2>&1; ls -t '$XDG_STATE_HOME/castellan/sessions'/*.json 2>/dev/null | head -1 | xargs basename | sed 's/\.json//'" /dev/null 2>/dev/null | tail -1 | tr -d '\r')
-    [ -n "$SID" ] || return 1
-    script -qec "XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' undo '$SID'" /dev/null >/dev/null 2>&1
+    script -qec "
+      $RL
+      rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$proj' -- bash -c 'true' >/dev/null 2>&1
+      SID=\$(ls -t '$XDG_STATE_HOME/castellan/sessions'/*.json 2>/dev/null | head -1 | xargs basename | sed 's/\.json//')
+      [ -n \"\$SID\" ] || exit 1
+      XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' undo \"\$SID\" >/dev/null 2>&1
+      exit 0
+    " /dev/null >/dev/null 2>&1 || true
   done
 }
 
@@ -167,24 +178,53 @@ echo "$AUD" | grep -q "udp *OPEN" && echo "$RES" | grep -q "udp *DENIED" \
 echo
 echo "== K4: a human egress grant lifts the floor for one launch =="
 mkproj "$P0"
-SIDG=$(script -qec "$RL
-  rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'echo G > out.txt'
-" /dev/null 2>/dev/null | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
-# request (the agent may ask), then the human approves from the SAME terminal
-rpc "{\"op\":\"bless_request\",\"session\":\"${SIDG}\",\"want\":\"egress\",\"reason\":\"p11 test\"}" >/dev/null
-NONCE=$(rpc '{"op":"bless_show"}' | python3 -c '
+# P20/F18: bless_approve is bound to the launcher's terminal INSTANCE
+# (kernel session id). Launch, request and approve therefore share ONE
+# pty invocation — a second `script` is a different terminal instance
+# even when its pts minor is recycled, and the gate denies it. The
+# pre-P20 harness passed only because minor-equality (and the inert
+# inode check) were spoofable by exactly that pattern; A/B verified
+# against 4e504eb (baseline approved, sid-bound build denied).
+cat > "$W/k4-inner.sh" <<EOS
+$RL
+rpcin() { python3 -c '
+import json,os,socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(30)
+s.connect(f"/run/user/{os.getuid()}/castellan.sock")
+s.sendall((sys.argv[1]+"\\n").encode())
+d=b""
+while True:
+    c=s.recv(65536)
+    if not c: break
+    d+=c
+    try: json.loads(d.decode()); break
+    except Exception: continue
+print(d.decode())' "\$1"; }
+OUT=\$(rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'echo G > out.txt' 2>/dev/null)
+SIDG=\$(printf '%s\\n' "\$OUT" | grep -o 's[0-9a-f]\\{12,\\}' | head -1)
+[ -n "\$SIDG" ] || { echo NO-SID; exit 1; }
+REQ=\$(printf '{"op":"bless_request","session":"%s","want":"egress","reason":"p11 test"}' "\$SIDG")
+rpcin "\$REQ" >/dev/null
+NONCE=\$(rpcin '{"op":"bless_show"}' | python3 -c '
 import json,sys
 try:
-    r = json.load(sys.stdin)
-    p = r.get("extra",{}).get("bless",{}).get("pending",[])
+    r=json.load(sys.stdin)
+    p=r.get("extra",{}).get("bless",{}).get("pending",[])
     print(p[0]["nonce_hint"] if p else "")
 except Exception:
-    print("")' 2>/dev/null)
-if [ -n "$NONCE" ]; then
-  script -qec "XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' bless approve '$NONCE'" /dev/null >"$W/k4b.out" 2>&1
-  grep -qi "approved\|ok" "$W/k4b.out" && ok "K4a: the egress grant was approved from the launcher terminal" \
-    || bad "K4a: approval failed: $(tail -2 "$W/k4b.out" | tr '\n' ' ')"
-  # the next launch asks for and consumes the one-shot grant
+    print("")')
+[ -n "\$NONCE" ] || { echo NO-NONCE; exit 1; }
+XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' bless approve "\$NONCE" > "$W/k4b.out" 2>&1
+echo K4-INNER-DONE
+EOS
+script -qec "sh $W/k4-inner.sh" /dev/null >"$W/k4-inner.log" 2>&1
+if grep -qi "approved\|ok" "$W/k4b.out" 2>/dev/null; then
+  ok "K4a: the egress grant was approved from the launcher terminal"
+else
+  bad "K4a: approval failed: $(tail -2 "$W/k4-inner.log" "$W/k4b.out" 2>/dev/null | tr '\n' ' ')"
+fi
+# the next launch asks for and consumes the one-shot grant
+if grep -q K4-INNER-DONE "$W/k4-inner.log" 2>/dev/null; then
   mkproj "$P0"
   script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --grant egress -- bash -c 'echo H > out.txt'" /dev/null >"$W/k4c.out" 2>&1
   grep -q "consumed expansion grant" "$W/k4c.out" && ok "K4b: the launcher consumed the egress grant" \
@@ -195,7 +235,7 @@ if [ -n "$NONCE" ]; then
   grep -q "trust tier <= 1" "$W/k4d.out" && ok "K4c: the floor returns after the one-shot grant is spent" \
     || bad "K4c: the grant did not expire (floor still lifted): $(grep -i 'tier\|grant' "$W/k4d.out" | tr '\n' ' ')"
 else
-  bad "K4: could not read a bless nonce hint from bless show"
+  bad "K4: inner pty did not complete (see $W/k4-inner.log)"
 fi
 
 echo

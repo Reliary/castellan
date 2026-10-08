@@ -44,6 +44,9 @@ struct CallerInfo {
   pid: u32,
   start_ticks: u64,
   tty_nr: u64,
+  /// P20/F18: the caller's kernel session id — the per-open tty
+  /// identity paired with tty_nr at the gate.
+  sid: u64,
 }
 
 fn proc_field(pid: u32, index: usize) -> Option<String> {
@@ -61,44 +64,23 @@ fn caller_tty_nr(pid: u32) -> Option<u64> {
   proc_field(pid, 4).and_then(|f| f.parse().ok())
 }
 
+/// P20/F18: the caller's kernel session id (after-comm index 3).
+fn caller_sid(pid: u32) -> Option<u64> {
+  proc_field(pid, 3).and_then(|f| f.parse().ok())
+}
+
 fn caller_start_ticks(pid: u32) -> Option<u64> {
   // after comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4) ... starttime(19)
   proc_field(pid, 19).and_then(|f| f.parse().ok())
 }
 
-/// B7: resolve a tty_nr to its pts inode. tty_nr encodes the dev minor
-/// (bits 8-20 for pts); the inode uniquely identifies the CURRENT
-/// allocation of that minor number. A closed pts is freed and its minor
-/// can be reused — the inode changes. Binding trust to the inode
-/// defeats tty_nr recycling and fresh-pty spoofs (an attacker-allocated
-/// pty is a minor the daemon never witnessed).
-fn tty_inode(tty_nr: u64) -> Option<u64> {
-  if tty_nr == 0 {
-    return None;
-  }
-  // /proc/stat tty_nr encodes MAJOR<<8 | MINOR (for minor < 256).
-  // pts devices are major 136: tty_nr = 34816 + minor. Extract the
-  // MINOR (the low byte), not the major — extracting (tty_nr >> 8)
-  // yielded 136 for every pts and resolved /dev/pts/136 (nonexistent),
-  // so witnessing silently never happened (found via suite failure).
-  let major = (tty_nr >> 8) & 0xff;
-  if major != 136 {
-    return None;
-  }
-  let minor = tty_nr & 0xff;
-  let path = format!("/dev/pts/{minor}");
-  let meta = std::fs::metadata(&path).ok()?;
-  use std::os::unix::fs::MetadataExt;
-  Some(meta.ino())
-}
-
 /// P20.1: validated parse of one durable session row (see
-/// `Daemon::rehydrate`). Returns `(session, spawn-time tty inode,
-/// undo)` or None — corrupt JSON, a `session` field that does not match
-/// the filename, or missing required fields are all None (fail-closed;
-/// rehydrate counts them). Never panics: `panic=abort` would take the
-/// daemon down on attacker- or entropy-controlled input.
-fn parse_session_row(id: &str, raw: &str, mtime_fallback: u64) -> Option<(Session, Option<u64>, bool)> {
+/// `Daemon::rehydrate`). Returns `(session, undo)` or None — corrupt
+/// JSON, a `session` field that does not match the filename, or
+/// missing required fields are all None (fail-closed; rehydrate counts
+/// them). Never panics: `panic=abort` would take the daemon down on
+/// attacker- or entropy-controlled input.
+fn parse_session_row(id: &str, raw: &str, mtime_fallback: u64) -> Option<(Session, bool)> {
   let v: serde_json::Value = serde_json::from_str(raw).ok()?;
   if v.get("session").and_then(|s| s.as_str()) != Some(id) {
     return None;
@@ -106,7 +88,7 @@ fn parse_session_row(id: &str, raw: &str, mtime_fallback: u64) -> Option<(Sessio
   let project = PathBuf::from(v.get("project").and_then(|p| p.as_str())?);
   let harness = v.get("harness").and_then(|h| h.as_str())?.to_string();
   let launcher_tty = v.get("launcher_tty").and_then(|t| t.as_u64()).unwrap_or(0);
-  let launcher_tty_ino = v.get("launcher_tty_ino").and_then(|t| t.as_u64());
+  let launcher_sid = v.get("launcher_sid").and_then(|t| t.as_u64()).unwrap_or(0);
   // Legacy rows predate started_at: caller supplies an mtime fallback
   // (≈ spawn) rather than 0 — an epoch window would make the N6 orphan
   // census claim every process on the box.
@@ -123,8 +105,8 @@ fn parse_session_row(id: &str, raw: &str, mtime_fallback: u64) -> Option<(Sessio
       started_at,
       hub_index_sha,
       launcher_tty,
+      launcher_sid,
     },
-    launcher_tty_ino,
     undo,
   ))
 }
@@ -134,12 +116,13 @@ fn probe_caller(stream: &UnixStream) -> Option<CallerInfo> {
   let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
   let start_ticks = caller_start_ticks(pid)?;
   let tty_nr = caller_tty_nr(pid)?;
+  let sid = caller_sid(pid)?;
   let caller = if cgroup.contains("castellan.slice") {
     Caller::Agent
   } else {
     Caller::Human
   };
-  Some(CallerInfo { caller, pid, start_ticks, tty_nr })
+  Some(CallerInfo { caller, pid, start_ticks, tty_nr, sid })
 }
 
 /// Dispatch-time re-verification: the identity snapshot must still
@@ -147,6 +130,7 @@ fn probe_caller(stream: &UnixStream) -> Option<CallerInfo> {
 fn caller_still_current(info: &CallerInfo) -> bool {
   let Some(start) = caller_start_ticks(info.pid) else { return false };
   let Some(tty) = caller_tty_nr(info.pid) else { return false };
+  let Some(sid) = caller_sid(info.pid) else { return false };
   let Ok(cgroup) = std::fs::read_to_string(format!("/proc/{}/cgroup", info.pid)) else {
     return false;
   };
@@ -156,7 +140,7 @@ fn caller_still_current(info: &CallerInfo) -> bool {
   } else {
     !in_slice
   };
-  start == info.start_ticks && tty == info.tty_nr && still_caller
+  start == info.start_ticks && tty == info.tty_nr && sid == info.sid && still_caller
 }
 
 /// Ops a session process may call over the socket. Everything else is
@@ -642,7 +626,9 @@ impl Daemon {
                   } else if info.caller == Caller::Agent && !agent_allowed(&req) {
                     self.forged_socket_op(&req);
                     Response::err("human-only op (agent caller)")
-                  } else if info.caller == Caller::Human && !self.human_tty_ok(&req, info.tty_nr) {
+                  } else if info.caller == Caller::Human
+                    && !self.human_tty_ok(&req, info.tty_nr, info.sid)
+                  {
                     // B6 phase 4: the human operator must hold the
                     // session's launch tty. An escaped process
                     // (systemd-run unit, migrated child) has no
@@ -680,7 +666,7 @@ impl Daemon {
   /// scoped human-only ops if its tty_nr matches the session's
   /// launcher tty (or the session was launched headless — launcher
   /// tty 0 = no requirement; headless is a documented residual).
-  fn human_tty_ok(&self, req: &Request, caller_tty: u64) -> bool {
+  fn human_tty_ok(&self, req: &Request, caller_tty: u64, caller_sid: u64) -> bool {
     let session = match req {
       // session-scoped human-only ops: launcher tty. BlessRequest is
       // deliberately absent — agents may ask (C32); only the approve
@@ -709,12 +695,13 @@ impl Daemon {
       // session-less human-only ops (thaw/kill/freeze ALL): require a
       // daemon-witnessed launcher tty (B7). tty!=0 alone was spoofable —
       // an escaped process can allocate a fresh pty. The caller's tty
-      // must be in the trusted registry AND its current inode must
-      // match the witnessed one (defeats recycling).
+      // must be in the trusted registry AND carry the witnessed session
+      // id (P20/F18: a recycled minor keeps tty_nr and devpts inode but
+      // always gets a fresh session id).
       Request::Thaw { session: None }
       | Request::Kill { session: None }
       | Request::Freeze { session: None } => {
-        return self.tty_is_witnessed(caller_tty);
+        return self.tty_is_witnessed(caller_tty, caller_sid);
       }
       // C32: approve must come from the LAUNCHER'S terminal, not just
       // any terminal. The nonce is fishable from the daemon journal
@@ -744,13 +731,19 @@ impl Daemon {
           full
             .and_then(|k| {
               let session = &b.get(&k).unwrap().session;
-              self.registry.lock().unwrap().get(session).map(|s| s.launcher_tty)
+              self.registry
+                .lock()
+                .unwrap()
+                .get(session)
+                .map(|s| (s.launcher_tty, s.launcher_sid))
             })
-            .unwrap_or(0)
+            .unwrap_or((0, 0))
         };
-        // P20/F14: inode-bound, not minor-only — a recycled pty minor
+        // P20/F14+F18: sid-bound, not minor-only — a recycled pty minor
         // must not inherit bless-approve rights (same class as F9).
-        return launcher != 0 && self.tty_matches_launcher(caller_tty, launcher);
+        // Headless (tty 0) stays denied here, as before P20.
+        let (l_tty, l_sid) = launcher;
+        return l_tty != 0 && self.tty_matches_launcher(caller_tty, caller_sid, l_tty, l_sid);
       }
       // everything else (Spawn, Status, agent-allowed reads, the
       // canary verb): no session tty requirement.
@@ -759,13 +752,13 @@ impl Daemon {
     let Some(session) = session else {
       return true;
     };
-    let launcher = self
+    let (l_tty, l_sid) = self
       .registry
       .lock()
       .unwrap()
       .get(session)
-      .map(|s| s.launcher_tty)
-      .unwrap_or(0);
+      .map(|s| (s.launcher_tty, s.launcher_sid))
+      .unwrap_or((0, 0));
     // B7: headless sessions (launcher tty 0) previously accepted ANY
     // tty for their human-only ops — an escaped process with a fresh
     // pty could keep/thaw a headless session. Now a headless session
@@ -773,53 +766,51 @@ impl Daemon {
     // launcher terminal — the human operating the fleet from a
     // terminal they launched from). tty-launched sessions keep the
     // exact-match rule.
-    // P20/F9: tty-launched sessions are now inode-BOUND too — minor
-    // equality alone let a recycled pty minor inherit launcher rights
-    // once the original terminal closed (B7 fixed this for the global
-    // ops only; session-scoped ops and bless-approve kept the hole).
-    self.tty_matches_launcher(caller_tty, launcher)
+    // P20/F9+F18: tty-launched sessions are sid-BOUND — minor equality
+    // alone let a recycled pty minor inherit launcher rights once the
+    // original terminal closed (B7's inode defense was inert: devpts
+    // inodes are stable per minor, measured on 7.1.8).
+    self.tty_matches_launcher(caller_tty, caller_sid, l_tty, l_sid)
   }
 
-  /// P20/F9: does the caller's terminal match the session's launcher
-  /// terminal, inode-bound?
+  /// P20/F9+F18: does the caller's terminal match the session's
+  /// launcher terminal, SESSION-ID-bound?
   ///
-  /// - launcher == 0 (headless or unknown session): B7 rule — the
+  /// - launcher_tty == 0 (headless or unknown session): B7 rule — the
   ///   caller must itself be a daemon-witnessed launcher tty;
-  /// - launcher != 0: exact tty_nr match AND the witnessed spawn-time
-  ///   inode for that tty must still match the live inode. A recycled
-  ///   minor gets a new inode → deny. No witness (legacy pre-P20 row,
-  ///   or a tty the daemon never saw spawn) → deny (fail-closed).
-  fn tty_matches_launcher(&self, caller_tty: u64, launcher: u64) -> bool {
-    if launcher == 0 {
-      return self.tty_is_witnessed(caller_tty);
+  /// - launcher_tty != 0: exact tty_nr match AND the caller's kernel
+  ///   session id must equal the witnessed spawn-time session id. A
+  ///   recycled minor keeps its tty_nr and its (stable) devpts inode
+  ///   but always carries a fresh session id → deny. No witness (legacy
+  ///   pre-P20 row, or a tty the daemon never saw spawn) → deny
+  ///   (fail-closed).
+  fn tty_matches_launcher(
+    &self,
+    caller_tty: u64,
+    caller_sid: u64,
+    launcher_tty: u64,
+    launcher_sid: u64,
+  ) -> bool {
+    if launcher_tty == 0 {
+      return self.tty_is_witnessed(caller_tty, caller_sid);
     }
-    if caller_tty != launcher {
+    if launcher_sid == 0 {
       return false;
     }
-    let Some(witnessed) = self.trusted_ttys.lock().unwrap().get(&launcher).copied() else {
-      return false;
-    };
-    match tty_inode(caller_tty) {
-      Some(ino) => ino == witnessed,
-      None => false,
-    }
+    caller_tty == launcher_tty && caller_sid == launcher_sid
   }
 
-  /// B7: is this caller's terminal a daemon-witnessed launcher tty?
-  /// False for: fresh ptys (never witnessed), headless (tty 0),
-  /// recycled minors (inode mismatch). This is the gate for global
-  /// ops (freeze-all etc.) — the panic button must not be reachable
-  /// from an attacker-allocated terminal.
-  fn tty_is_witnessed(&self, caller_tty: u64) -> bool {
-    if caller_tty == 0 {
+  /// B7/F18: is this caller's terminal a daemon-witnessed launcher
+  /// tty? False for: fresh ptys (never witnessed), headless (tty 0),
+  /// and recycled minors (witnessed session id ≠ caller session id).
+  /// This is the gate for global ops (freeze-all etc.) — the panic
+  /// button must not be reachable from an attacker-allocated terminal.
+  fn tty_is_witnessed(&self, caller_tty: u64, caller_sid: u64) -> bool {
+    if caller_tty == 0 || caller_sid == 0 {
       return false;
     }
-    let witnessed_ino = match self.trusted_ttys.lock().unwrap().get(&caller_tty) {
-      Some(ino) => *ino,
-      None => return false,
-    };
-    match tty_inode(caller_tty) {
-      Some(ino) => ino == witnessed_ino,
+    match self.trusted_ttys.lock().unwrap().get(&caller_tty) {
+      Some(witnessed_sid) => *witnessed_sid == caller_sid,
       None => false,
     }
   }
@@ -901,8 +892,8 @@ impl Daemon {
 
   fn dispatch(&self, req: Request) -> Response {
     match req {
-      Request::Spawn { harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty } => {
-        self.spawn(harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty)
+      Request::Spawn { harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty, launcher_sid } => {
+        self.spawn(harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty, launcher_sid)
       }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
       Request::JoinSession { session, pid } => self.join_session(&session, pid),
@@ -2783,6 +2774,7 @@ impl Daemon {
     allow_hosts: Vec<String>,
     grants: Vec<String>,
     launcher_tty: u64,
+    launcher_sid: u64,
   ) -> Response {
     // C7 (ninja review): refuse projects that contain the daemon's own
     // state/config (project = $HOME or an ancestor of $STATE/$CONFIG):
@@ -2981,22 +2973,21 @@ impl Daemon {
       }
     };
     // B7: witness the launcher's terminal at spawn. Only a tty the
-    // daemon has seen as a launcher tty (inode-bound) may later run
-    // session-less global ops (freeze-all/thaw-all/kill-all) — an
-    // escaped process allocating a fresh pty never enters this map.
-    // The inode defeats tty_nr recycling: a reused minor gets a new
-    // inode and fails the match.
-    // P20: the witnessed inode is also PERSISTED (persist_session) so a
-    // daemon restart can re-witness the same terminal from disk — with
-    // the spawn-time inode, never a freshly read one (a fresh read on a
-    // recycled minor would be exactly the forgery B7 closed).
-    let launcher_tty_ino = if launcher_tty != 0 {
-      tty_inode(launcher_tty)
-    } else {
-      None
-    };
-    if let Some(ino) = launcher_tty_ino {
-      self.trusted_ttys.lock().unwrap().insert(launcher_tty, ino);
+    // daemon has seen as a launcher tty may later run session-less
+    // global ops (freeze-all/thaw-all/kill-all) — an escaped process
+    // allocating a fresh pty never enters this map.
+    // P20/F18 correction: the witness value is the launcher's SESSION
+    // ID, not its tty inode. devpts assigns a stable inode per minor
+    // (measured on 7.1.8: /dev/pts/1 inode 4 across close/reopen), so
+    // the inode was identical for a recycled minor — inert against the
+    // recycling attack it was meant to defeat. A fresh pty invocation
+    // always carries a new session id; tty_nr still keys the map.
+    if launcher_tty != 0 && launcher_sid != 0 {
+      self
+        .trusted_ttys
+        .lock()
+        .unwrap()
+        .insert(launcher_tty, launcher_sid);
     }
     let started_at = castellan_core::now_unix();
     self.registry.lock().unwrap().insert(Session {
@@ -3007,6 +2998,7 @@ impl Daemon {
       started_at,
       hub_index_sha,
       launcher_tty,
+      launcher_sid,
     });
     // B6 P3: the undo-layer record used to arrive via a socket Note
     // from the launcher — a socket op with a legitimate caller, but
@@ -3046,7 +3038,7 @@ impl Daemon {
       undo,
       net,
       launcher_tty,
-      launcher_tty_ino,
+      launcher_sid,
       started_at,
     );
     let ca_cert = if proxy_port > 0 {
@@ -3093,7 +3085,7 @@ impl Daemon {
     undo: bool,
     net: bool,
     launcher_tty: u64,
-    launcher_tty_ino: Option<u64>,
+    launcher_sid: u64,
     started_at: u64,
   ) -> std::io::Result<()> {
     let dir = Self::state_dir().join("castellan/sessions");
@@ -3113,11 +3105,11 @@ impl Daemon {
         "net": net,
         // P20: control-plane survival across daemon restart. launcher_tty
         // lets human_tty_ok match the original terminal again;
-        // launcher_tty_ino is the SPAWN-TIME witnessed inode so restart
-        // re-witnessing cannot be fooled by a recycled pty minor;
-        // started_at keeps the N6 orphan census window stable.
+        // launcher_sid is the per-open identity (devpts inodes are stable
+        // per minor — F18); started_at keeps the N6 orphan census window
+        // stable.
         "launcher_tty": launcher_tty,
-        "launcher_tty_ino": launcher_tty_ino,
+        "launcher_sid": launcher_sid,
         "started_at": started_at,
       })
       .to_string(),
@@ -3136,10 +3128,10 @@ impl Daemon {
   ///   its filename — mismatch or corruption is skipped and COUNTED
   ///   (fail-closed; never panic — `panic=abort` would take the daemon
   ///   down on attacker- or entropy-controlled input);
-  /// - trusted_ttys re-witnesses with the SPAWN-TIME persisted inode,
-  ///   never `tty_inode(current)`: a fresh read on a recycled pty minor
-  ///   is exactly the forgery B7 closed;
-  /// - legacy rows (pre-P20) lack `launcher_tty_ino` — they enter the
+  /// - trusted_ttys re-witnesses the launcher tty with the persisted
+  ///   SESSION ID (P20/F18 — devpts inodes are stable per minor, so
+  ///   the session id is the only per-open identity);
+  /// - legacy rows (pre-P20) lack `launcher_sid` — they enter the
   ///   registry but are NOT re-witnessed, so tty-gated ops on them are
   ///   denied (fail-closed; relaunch to restore tty control);
   /// - the audit watcher restarts with a RESTART-TIME baseline: the
@@ -3179,20 +3171,19 @@ impl Daemon {
         .unwrap_or(0);
       // Validation lives in parse_session_row (unit-tested): corrupt,
       // mismatched and incomplete rows are skipped and counted.
-      let Some((session, launcher_tty_ino, undo)) = parse_session_row(&id, &raw, mtime_fallback)
-      else {
+      let Some((session, undo)) = parse_session_row(&id, &raw, mtime_fallback) else {
         skipped += 1;
         continue;
       };
-      // Re-witness the launcher tty with the SPAWN-TIME inode only.
-      if session.launcher_tty != 0 {
-        if let Some(ino) = launcher_tty_ino {
-          self
-            .trusted_ttys
-            .lock()
-            .unwrap()
-            .insert(session.launcher_tty, ino);
-        }
+      // Re-witness the launcher tty with the spawn-time session id
+      // (P20/F18 — devpts inodes are stable per minor, so sid is the
+      // only per-open identity worth persisting).
+      if session.launcher_tty != 0 && session.launcher_sid != 0 {
+        self
+          .trusted_ttys
+          .lock()
+          .unwrap()
+          .insert(session.launcher_tty, session.launcher_sid);
       }
       let sid = session.id.clone();
       let harness = session.harness.clone();
@@ -3678,16 +3669,16 @@ mod tests {
       "undo": true,
       "net": false,
       "launcher_tty": 259,
-      "launcher_tty_ino": 12345,
+      "launcher_sid": 12345,
       "started_at": 1700000000
     })
     .to_string();
-    let (s, ino, undo) = parse_session_row("sABC", &raw, 0).expect("valid row parses");
+    let (s, undo) = parse_session_row("sABC", &raw, 0).expect("valid row parses");
     assert_eq!(s.id, "sABC");
     assert_eq!(s.harness, "claude");
     assert_eq!(s.launcher_tty, 259);
+    assert_eq!(s.launcher_sid, 12345);
     assert_eq!(s.started_at, 1700000000);
-    assert_eq!(ino, Some(12345));
     assert!(undo);
   }
 
@@ -3714,15 +3705,15 @@ mod tests {
 
   #[test]
   fn rehydrate_row_legacy_uses_mtime_fallback() {
-    // pre-P20 row: no started_at, no launcher_tty, no inode. It must
-    // still parse (functionality preserved) with the mtime fallback and
-    // NOT invent a tty witness (launcher_tty 0, ino None → tty-gated ops
-    // stay denied — fail-closed).
+    // pre-P20 row: no started_at, no launcher_tty/sid. It must still
+    // parse (functionality preserved) with the mtime fallback and NOT
+    // invent a tty witness (launcher 0 → tty-gated ops stay denied,
+    // and tty_matches_launcher refuses sid==0 — fail-closed).
     let raw = r#"{"session":"sLEG","project":"/tmp/p","harness":"codex"}"#;
-    let (s, ino, undo) = parse_session_row("sLEG", raw, 1700000123).expect("legacy row parses");
+    let (s, undo) = parse_session_row("sLEG", raw, 1700000123).expect("legacy row parses");
     assert_eq!(s.started_at, 1700000123);
     assert_eq!(s.launcher_tty, 0);
-    assert_eq!(ino, None);
+    assert_eq!(s.launcher_sid, 0);
     assert!(!undo);
   }
 

@@ -66,3 +66,52 @@ that cannot go red is theatre and is removed, not weakened.
 - G11: measured daemon restart round-trip < watchdog grace
 
 Ratchet: bump floor for new tests. Clippy 0. Leak scan. Both-box suites green.
+
+## Amendment F18 (added after G5's first run failed — 2026-10-08)
+
+G5 (recycled pty minor must not inherit launcher rights) FAILED against
+the first P20 build: the inode-bound gate accepted both freezes from a
+recycled `/dev/pts/1`. Measurement: devpts assigns a **stable inode per
+minor** (`/dev/pts/1` inode 4 across close/reopen on 7.1.8, by
+construction) — so B7's "inode defeats tty recycling" premise (2026-09-01)
+was inert, and P20's first fix inherited it. The per-open identity that
+DOES change is the kernel session id (fresh per `script`/pty invocation;
+verified 2360319 vs 2360325).
+
+Fix: witness is now `(tty_nr, launcher_sid)` end to end — CLI sends
+`launcher_sid`, spawn persists it, rehydration re-witnesses from it,
+session-scoped ops + BlessApprove + global ops compare it,
+`caller_still_current` re-verifies it. `tty_inode` removed (dead, false
+premise). Post-fix: G5 green (denied), G1 green (original tty still
+controls — also proves the hop preserves the session id).
+
+## Execution record (final)
+
+| Gate | Result |
+|---|---|
+| G1 restart+original-tty control | PASS (p20) |
+| G1b no-panic battery | PASS (daemon start timestamp unchanged) |
+| G2 corrupt rows skipped+counted | PASS (skipped 2 in journal) |
+| G3 p19 ARM A+B ×2 | PASS (5/0, 5/0) |
+| G4 stop freezes / start thaws | PASS (ExecStopPost observed) |
+| G5 recycled minor denied | **FAIL first (found F18) → PASS after sid fix**; status control still works |
+| G6 install vs manual daemon refused | PASS |
+| G7 no-manager rollback | PASS (rc≠0, zero artifacts) |
+| G8 doctor stale-unit + drift + healthy | PASS |
+| G9 unknown signal nr denies | PASS (control: revert → 2 tests red) |
+| G10 live-session uninstall e2e | PASS (p18 27/0) |
+| G11 restart round-trip | PASS (222-253ms « 10s; note: unit restarts freeze deterministically via ExecStopPost anyway) |
+
+Suites on final binaries: p20 34/0, p18 27/0, p19 5/0 ×2 (.227);
+p0 15/0, p11 12/0, p3 5/0, p4 5/0, p6 6/0 (dev box). A/B against 4e504eb
+(pre-P20): p11's drive_low/K4 harness ran ON the recycled-minor spoof
+(baseline passed only because minor-equality allowed it) — both rewritten
+to single-pty invocation; p1/p2/p9 fail IDENTICALLY on baseline and
+current (pre-existing environment/harness issues, recorded not chased).
+Workspace 230 tests, clippy 0, doc-truth + verb gates green.
+
+Harness bugs found while gating (mine, not product): pkill -f self-match
+via ssh one-liner; `printf %s` without newline deadlocking `read` in the
+fifo driver; backgrounded fifo write holding the capture pipe (stdio
+detach + timeout); stale socket file making `-S` checks lie; session
+state accumulating across runs breaking exact-count journal asserts.

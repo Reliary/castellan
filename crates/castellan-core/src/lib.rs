@@ -39,8 +39,18 @@ pub struct Session {
   /// child) has no controlling tty (tty_nr=0) and is rejected. 0 means
   /// a headless launch: no tty requirement (documented residual — the
   /// C10xC25 identity flip stays for headless sessions).
+  /// B7 note: headless sessions require a witnessed tty, not any tty.
   #[serde(default)]
   pub launcher_tty: u64,
+  /// P20/F18: the launcher's kernel session id (field 5 of
+  /// /proc/<pid>/stat) at spawn — the per-open identity that a tty_nr
+  /// cannot provide. devpts assigns a STABLE inode per minor (measured
+  /// on 7.1.8: /dev/pts/1 inode 4 across close/reopen), so the earlier
+  /// inode-based witness was inert against pty recycling; a fresh
+  /// `script`/pty invocation always gets a new session id. 0 = legacy
+  /// row or headless (no witness, tty-gated ops denied — fail-closed).
+  #[serde(default)]
+  pub launcher_sid: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +146,11 @@ pub enum Request {
     /// only ops on the spawned session require this tty at dispatch.
     #[serde(default)]
     launcher_tty: u64,
+    /// P20/F18: the launcher's kernel session id — the per-open tty
+    /// identity (devpts inodes are stable per minor, so tty_nr alone
+    /// and tty_nr+inode are both spoofable by pty recycling).
+    #[serde(default)]
+    launcher_sid: u64,
   },
   Adopt {
     session: SessionId,

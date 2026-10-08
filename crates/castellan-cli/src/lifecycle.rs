@@ -233,6 +233,11 @@ fn unit_contents(daemon: &Path, cli: &Path, skip_preflight: bool) -> String {
      # directly via cgroupfs: no daemon, no registry, no tty gate. Pairs\n\
      # with daemon-side rehydration so thaw works after the restart.\n\
      ExecStopPost={} freeze --daemonless\n\
+     # A killed daemon leaves its socket file behind; a stale socket makes
+     # `-S` checks lie and clients report ECONNREFUSED against a path
+     # that exists. %t is the manager's XDG_RUNTIME_DIR (same dir the
+     # daemon binds). `-` = ignore failure (already gone).
+     ExecStopPost=-/bin/rm -f %t/castellan.sock\n\
      Restart=on-failure\n\
      RestartSec=2\n\
      # The agent runs in child scopes, not this unit; the daemon needs no\n\
@@ -339,8 +344,8 @@ fn cmd_service(args: &[String]) -> ! {
       if !visible {
         rollback(
           "the unit file was written but the user manager cannot see it\n\
-         (XDG_CONFIG_HOME mismatch between this shell and the manager).\n\
-         Re-run with XDG_CONFIG_HOME matching the manager's environment.",
+         (or the manager is unreachable) — XDG_RUNTIME_DIR/XDG_CONFIG_HOME\n\
+         in this shell must match the manager's environment. Unit rolled back.",
         );
       }
       if no_start {
@@ -818,11 +823,13 @@ mod tests {
   }
 
   // P20/C43: ExecStopPost must freeze the fleet on any stop, via the
-  // daemonless path (the daemon is gone when it runs).
+  // daemonless path (the daemon is gone when it runs), and must clean
+  // the stale socket so existence checks stay truthful.
   #[test]
   fn unit_contents_freezes_on_stop() {
     let u = unit_contents(Path::new("/x/d"), Path::new("/x/c"), false);
     assert!(u.contains("ExecStopPost=/x/c freeze --daemonless"));
     assert!(!u.contains("ExecStopPost=/x/d"), "freeze must not need the daemon");
+    assert!(u.contains("ExecStopPost=-/bin/rm -f %t/castellan.sock"));
   }
 }

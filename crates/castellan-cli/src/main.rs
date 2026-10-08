@@ -661,7 +661,8 @@ fn launch(args: &[String], sock: &str) -> ! {
     "net_restrict": net_restrict,
     "allow_hosts": allow_hosts,
     "grants": grants,
-    "launcher_tty": launcher_tty()
+    "launcher_tty": launcher_tty(),
+    "launcher_sid": launcher_sid()
   }));
   let session = extract_session(&resp).unwrap_or_else(|| {
     eprintln!("launch failed: {resp}");
@@ -1314,6 +1315,26 @@ fn launcher_tty() -> u64 {
     .1
     .split_whitespace()
     .nth(4)
+    .and_then(|f| f.parse().ok())
+    .unwrap_or(0)
+}
+
+/// P20/F18: the launcher's kernel session id (field index 3 after
+/// comm). Pairs with launcher_tty as the tty-gate identity: a recycled
+/// pty minor keeps its tty_nr AND its devpts inode (stable per minor,
+/// measured) but always carries a fresh session id. Read post-hop —
+/// systemd-run --scope forks client-side, so the session id is
+/// preserved through the hop.
+fn launcher_sid() -> u64 {
+  let stat = match std::fs::read_to_string("/proc/self/stat") {
+    Ok(s) => s,
+    Err(_) => return 0,
+  };
+  let Some(rest) = stat.rsplit_once(')') else { return 0 };
+  rest
+    .1
+    .split_whitespace()
+    .nth(3)
     .and_then(|f| f.parse().ok())
     .unwrap_or(0)
 }

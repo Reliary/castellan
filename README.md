@@ -72,7 +72,7 @@ Or from source (builds both binaries):
 ```sh
 cargo build --release --workspace
 ./target/release/castellan preflight
-./target/release/castellan-daemon &    # foreground server; unit guidance in Quickstart
+./target/release/castellan service install   # user service; daemon runs durable + fail-closed
 ```
 
 Then see Quickstart below.
@@ -82,7 +82,8 @@ Then see Quickstart below.
 ```sh
 cargo build --release --workspace          # or download the release binaries
 castellan preflight                        # check your kernel: all 6 checks must pass
-castellan-daemon &                         # foreground server; run under the user manager for durability
+castellan service install                  # install + start the user service (durable daemon)
+castellan init                             # scaffold keyring.toml + egress.toml (edit, then restart)
 castellan launch -- claude                 # enforced by default: workspace-only writes
 castellan status                           # see the session
 castellan freeze && castellan thaw         # the panic button
@@ -92,6 +93,8 @@ castellan diff <session>                    # what did it change?
 castellan keep <session>                   # commit it, or `undo` to throw it away
 castellan cert <session>                   # signed ProofCertificate (bounds, placebo, chain)
 castellan verify cert.json                 # re-check the signature + spine chain
+castellan gc --keep-last 20                # prune old session state (none before this)
+castellan uninstall --yes                   # remove service, sessions, state and keyring
 ```
 
 `--harness` is auto-detected from the command (claude, codex, pi, opencode, aider, cursor-agent, gemini, crush); unknown harnesses still get the envelope, just no harness-state protection. `--no-enforce` opts out loudly (audit mode) — for debugging only.

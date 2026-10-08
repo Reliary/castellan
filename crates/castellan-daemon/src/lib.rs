@@ -892,8 +892,8 @@ impl Daemon {
 
   fn dispatch(&self, req: Request) -> Response {
     match req {
-      Request::Spawn { harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty, launcher_sid } => {
-        self.spawn(harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, grants, launcher_tty, launcher_sid)
+      Request::Spawn { harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, derived_hosts, grants, launcher_tty, launcher_sid } => {
+        self.spawn(harness, project, pid, command, enforce, undo, net, net_restrict, allow_hosts, derived_hosts, grants, launcher_tty, launcher_sid)
       }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
       Request::JoinSession { session, pid } => self.join_session(&session, pid),
@@ -2772,6 +2772,7 @@ impl Daemon {
     net: bool,
     net_restrict: bool,
     allow_hosts: Vec<String>,
+    derived_hosts: Vec<(String, String)>,
     grants: Vec<String>,
     launcher_tty: u64,
     launcher_sid: u64,
@@ -2906,8 +2907,25 @@ impl Daemon {
     // records are the same list. A missing allowlist under a forced
     // restriction is deny-all: the honest fail-closed state, and the
     // CLI says so loudly.
+    //
+    // P21.1: when the operator declared nothing (no flags, no env, no
+    // egress.toml), the launcher's `derived_hosts` fill the gap so a
+    // fresh install can reach its own LLM provider without hand-editing
+    // config. Derivation is loud (recorded in the profile and on the
+    // spine) and only ever applies where the list would otherwise be
+    // empty — an explicit declaration always wins.
+    let mut derived_used: Vec<(String, String)> = Vec::new();
     let allow_hosts: Vec<String> = if net_restrict && !egress_grant {
-      resolve_allow_hosts(&allow_hosts)
+      let mut resolved = resolve_allow_hosts(&allow_hosts);
+      if resolved.is_empty() && !derived_hosts.is_empty() {
+        for (host, _source) in &derived_hosts {
+          if !resolved.contains(host) {
+            resolved.push(host.clone());
+          }
+        }
+        derived_used = derived_hosts.clone();
+      }
+      resolved
     } else if egress_grant {
       // a human-approved egress grant: unrestricted for this launch
       net_restrict = false;
@@ -2915,6 +2933,23 @@ impl Daemon {
     } else {
       allow_hosts
     };
+    if !derived_used.is_empty() {
+      eprintln!(
+        "castellan-daemon: no allowlist declared — derived {} destination(s) for {}: {}",
+        derived_used.len(),
+        harness,
+        derived_used
+          .iter()
+          .map(|(h, s)| format!("{h} ({s})"))
+          .collect::<Vec<_>>()
+          .join(", ")
+      );
+      if let Ok(sink) = EventSink::for_session(&Self::state_dir(), &id) {
+        for (host, source) in &derived_used {
+          let _ = sink.emit("egress_derived", host, source);
+        }
+      }
+    }
     if low_trust && granted.is_empty() {
       eprintln!(
         "castellan-daemon: tier floor active for {} — enforce+undo+egress-restrict (allowlist: {})",
@@ -3061,6 +3096,7 @@ impl Daemon {
           "net": net,
           "net_restrict": net_restrict,
           "allow_hosts": allow_hosts,
+          "derived_hosts": derived_used,
           "forced": low_trust && granted.is_empty(),
           "cold_forced_undo": cold_trust && granted.is_empty() && !low_trust,
           "tier": tier_str,

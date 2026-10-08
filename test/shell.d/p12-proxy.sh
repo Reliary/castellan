@@ -19,8 +19,9 @@
 #   K5  workspace-poisoned keyring.toml is never consulted: the
 #       session's keyring_sha equals the config-dir file's sha256 and
 #       the poison token appears nowhere in state
-#   K6  unbound host inside the allowlist is proxied with NO injection
-#       -> cargo test -p castellan-proxy
+#   K6  unbound host inside the allowlist is proxied with NO injection,
+#       and the agent's own auth headers pass through intact (P21.1
+#       conditional strip) -> cargo test -p castellan-proxy
 #   K7  session env carries HTTPS_PROXY + SSL_CERT_FILE, and the CA
 #       bundle parses (CERTIFICATE present)
 #   K8  two sessions get distinct per-session CA files

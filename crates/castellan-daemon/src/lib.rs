@@ -92,6 +92,43 @@ fn tty_inode(tty_nr: u64) -> Option<u64> {
   Some(meta.ino())
 }
 
+/// P20.1: validated parse of one durable session row (see
+/// `Daemon::rehydrate`). Returns `(session, spawn-time tty inode,
+/// undo)` or None — corrupt JSON, a `session` field that does not match
+/// the filename, or missing required fields are all None (fail-closed;
+/// rehydrate counts them). Never panics: `panic=abort` would take the
+/// daemon down on attacker- or entropy-controlled input.
+fn parse_session_row(id: &str, raw: &str, mtime_fallback: u64) -> Option<(Session, Option<u64>, bool)> {
+  let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+  if v.get("session").and_then(|s| s.as_str()) != Some(id) {
+    return None;
+  }
+  let project = PathBuf::from(v.get("project").and_then(|p| p.as_str())?);
+  let harness = v.get("harness").and_then(|h| h.as_str())?.to_string();
+  let launcher_tty = v.get("launcher_tty").and_then(|t| t.as_u64()).unwrap_or(0);
+  let launcher_tty_ino = v.get("launcher_tty_ino").and_then(|t| t.as_u64());
+  // Legacy rows predate started_at: caller supplies an mtime fallback
+  // (≈ spawn) rather than 0 — an epoch window would make the N6 orphan
+  // census claim every process on the box.
+  let started_at = v.get("started_at").and_then(|t| t.as_u64()).unwrap_or(mtime_fallback);
+  let undo = v.get("undo").and_then(|u| u.as_bool()).unwrap_or(false);
+  let config_sha = v.get("config_sha").and_then(|s| s.as_str()).map(String::from);
+  let hub_index_sha = v.get("hub_index_sha").and_then(|s| s.as_str()).map(String::from);
+  Some((
+    Session {
+      id: id.to_string(),
+      harness,
+      project,
+      config_sha,
+      started_at,
+      hub_index_sha,
+      launcher_tty,
+    },
+    launcher_tty_ino,
+    undo,
+  ))
+}
+
 fn probe_caller(stream: &UnixStream) -> Option<CallerInfo> {
   let pid = getsockopt(stream, PeerCredentials).ok()?.pid() as u32;
   let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
@@ -458,6 +495,10 @@ impl Daemon {
       },
       proxy_tls: castellan_proxy::native_tls_config(),
     };
+    // P20.1: control-plane survival across restart (F2). Spawn-only
+    // registration meant any daemon restart wiped status/freeze/kill/
+    // adopt for every live session while the agents kept running.
+    daemon.rehydrate();
     // P8: the live-fire scheduler. The daemon attacks itself on a
     // schedule and proves the defenses still work. Enabled by default;
     // opt out via [drill] enabled=false in the config (not yet read —
@@ -707,7 +748,9 @@ impl Daemon {
             })
             .unwrap_or(0)
         };
-        return launcher != 0 && caller_tty == launcher;
+        // P20/F14: inode-bound, not minor-only — a recycled pty minor
+        // must not inherit bless-approve rights (same class as F9).
+        return launcher != 0 && self.tty_matches_launcher(caller_tty, launcher);
       }
       // everything else (Spawn, Status, agent-allowed reads, the
       // canary verb): no session tty requirement.
@@ -730,10 +773,36 @@ impl Daemon {
     // launcher terminal — the human operating the fleet from a
     // terminal they launched from). tty-launched sessions keep the
     // exact-match rule.
+    // P20/F9: tty-launched sessions are now inode-BOUND too — minor
+    // equality alone let a recycled pty minor inherit launcher rights
+    // once the original terminal closed (B7 fixed this for the global
+    // ops only; session-scoped ops and bless-approve kept the hole).
+    self.tty_matches_launcher(caller_tty, launcher)
+  }
+
+  /// P20/F9: does the caller's terminal match the session's launcher
+  /// terminal, inode-bound?
+  ///
+  /// - launcher == 0 (headless or unknown session): B7 rule — the
+  ///   caller must itself be a daemon-witnessed launcher tty;
+  /// - launcher != 0: exact tty_nr match AND the witnessed spawn-time
+  ///   inode for that tty must still match the live inode. A recycled
+  ///   minor gets a new inode → deny. No witness (legacy pre-P20 row,
+  ///   or a tty the daemon never saw spawn) → deny (fail-closed).
+  fn tty_matches_launcher(&self, caller_tty: u64, launcher: u64) -> bool {
     if launcher == 0 {
       return self.tty_is_witnessed(caller_tty);
     }
-    caller_tty == launcher
+    if caller_tty != launcher {
+      return false;
+    }
+    let Some(witnessed) = self.trusted_ttys.lock().unwrap().get(&launcher).copied() else {
+      return false;
+    };
+    match tty_inode(caller_tty) {
+      Some(ino) => ino == witnessed,
+      None => false,
+    }
   }
 
   /// B7: is this caller's terminal a daemon-witnessed launcher tty?
@@ -2917,17 +2986,25 @@ impl Daemon {
     // escaped process allocating a fresh pty never enters this map.
     // The inode defeats tty_nr recycling: a reused minor gets a new
     // inode and fails the match.
-    if launcher_tty != 0 {
-      if let Some(ino) = tty_inode(launcher_tty) {
-        self.trusted_ttys.lock().unwrap().insert(launcher_tty, ino);
-      }
+    // P20: the witnessed inode is also PERSISTED (persist_session) so a
+    // daemon restart can re-witness the same terminal from disk — with
+    // the spawn-time inode, never a freshly read one (a fresh read on a
+    // recycled minor would be exactly the forgery B7 closed).
+    let launcher_tty_ino = if launcher_tty != 0 {
+      tty_inode(launcher_tty)
+    } else {
+      None
+    };
+    if let Some(ino) = launcher_tty_ino {
+      self.trusted_ttys.lock().unwrap().insert(launcher_tty, ino);
     }
+    let started_at = castellan_core::now_unix();
     self.registry.lock().unwrap().insert(Session {
       id: id.clone(),
       harness: harness.clone(),
       project: project.clone(),
       config_sha: pinned,
-      started_at: castellan_core::now_unix(),
+      started_at,
       hub_index_sha,
       launcher_tty,
     });
@@ -2968,6 +3045,9 @@ impl Daemon {
       enforce,
       undo,
       net,
+      launcher_tty,
+      launcher_tty_ino,
+      started_at,
     );
     let ca_cert = if proxy_port > 0 {
       Self::state_dir()
@@ -3012,6 +3092,9 @@ impl Daemon {
     enforce: bool,
     undo: bool,
     net: bool,
+    launcher_tty: u64,
+    launcher_tty_ino: Option<u64>,
+    started_at: u64,
   ) -> std::io::Result<()> {
     let dir = Self::state_dir().join("castellan/sessions");
     std::fs::create_dir_all(&dir)?;
@@ -3028,9 +3111,127 @@ impl Daemon {
         "enforce": enforce,
         "undo": undo,
         "net": net,
+        // P20: control-plane survival across daemon restart. launcher_tty
+        // lets human_tty_ok match the original terminal again;
+        // launcher_tty_ino is the SPAWN-TIME witnessed inode so restart
+        // re-witnessing cannot be fooled by a recycled pty minor;
+        // started_at keeps the N6 orphan census window stable.
+        "launcher_tty": launcher_tty,
+        "launcher_tty_ino": launcher_tty_ino,
+        "started_at": started_at,
       })
       .to_string(),
     )
+  }
+
+  /// P20.1: control-plane survival across daemon restart (F2).
+  ///
+  /// Registry, trusted_ttys and the audit watcher were spawn-only, so a
+  /// restart (systemd `Restart=on-failure`, `service stop/start`, an
+  /// upgrade) wiped status/freeze/thaw/kill/adopt for every live session
+  /// while the agents kept running Landlock-confined but unmanageable.
+  /// Rehydrate from the durable per-session JSON:
+  ///
+  /// - a row is used only if it parses AND its `session` field matches
+  ///   its filename — mismatch or corruption is skipped and COUNTED
+  ///   (fail-closed; never panic — `panic=abort` would take the daemon
+  ///   down on attacker- or entropy-controlled input);
+  /// - trusted_ttys re-witnesses with the SPAWN-TIME persisted inode,
+  ///   never `tty_inode(current)`: a fresh read on a recycled pty minor
+  ///   is exactly the forgery B7 closed;
+  /// - legacy rows (pre-P20) lack `launcher_tty_ino` — they enter the
+  ///   registry but are NOT re-witnessed, so tty-gated ops on them are
+  ///   denied (fail-closed; relaunch to restore tty control);
+  /// - the audit watcher restarts with a RESTART-TIME baseline: the
+  ///   window while the daemon was down is unobservable (documented).
+  ///
+  /// Accepted residual R-POISON (THREAT_MODEL): an unconfined same-uid
+  /// process able to write `sessions/*.json` can plant launcher_tty +
+  /// inode — but that process can already write `cgroup.freeze`
+  /// directly, so rehydration grants no capability it lacks (equal
+  /// power; hashing the row would imply integrity we cannot enforce).
+  fn rehydrate(&self) {
+    let dir = Self::state_dir().join("castellan/sessions");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+      return;
+    };
+    let mut ok = 0u32;
+    let mut skipped = 0u32;
+    for entry in rd.flatten() {
+      let fname = entry.file_name();
+      let fname = fname.to_string_lossy();
+      let Some(id) = fname.strip_suffix(".json").map(|s| s.to_string()) else {
+        continue;
+      };
+      let raw = match std::fs::read_to_string(entry.path()) {
+        Ok(s) => s,
+        Err(_) => {
+          skipped += 1;
+          continue;
+        }
+      };
+      let mtime_fallback = entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+      // Validation lives in parse_session_row (unit-tested): corrupt,
+      // mismatched and incomplete rows are skipped and counted.
+      let Some((session, launcher_tty_ino, undo)) = parse_session_row(&id, &raw, mtime_fallback)
+      else {
+        skipped += 1;
+        continue;
+      };
+      // Re-witness the launcher tty with the SPAWN-TIME inode only.
+      if session.launcher_tty != 0 {
+        if let Some(ino) = launcher_tty_ino {
+          self
+            .trusted_ttys
+            .lock()
+            .unwrap()
+            .insert(session.launcher_tty, ino);
+        }
+      }
+      let sid = session.id.clone();
+      let harness = session.harness.clone();
+      let project = session.project.clone();
+      self.registry.lock().unwrap().insert(session);
+      // Undo sessions need their notes entry back or keep/undo-* return
+      // "no undo layer recorded" after a restart (G1b: clean error, never
+      // a panic — the notes paths all use `let Some(n) = ... else`).
+      if undo {
+        let upper = Self::state_dir()
+          .join("castellan/sessions")
+          .join(&sid)
+          .join("overlay/upper");
+        if upper.exists() {
+          // With --undo the project dir itself is untouched (writes go
+          // to the upper layer), so a restart-time capture equals the
+          // spawn-time baseline for honest sessions.
+          let baseline = castellan_proof::BaselineManifest::capture(&project).ok();
+          self.notes.lock().unwrap().insert(
+            sid.clone(),
+            SessionNotes {
+              undo_upper: Some(upper),
+              baseline,
+            },
+          );
+        }
+      }
+      // Audit watcher only for sessions whose scope still exists —
+      // dead sessions self-prune from the registry on the next status().
+      if self.root.freeze_state(&sid).unwrap_or(FreezeState::Missing) != FreezeState::Missing {
+        self.start_audit(&sid, &harness, &project);
+      }
+      ok += 1;
+    }
+    if ok > 0 || skipped > 0 {
+      eprintln!(
+        "castellan-daemon: rehydrated {ok} session(s) from disk, skipped {skipped} unreadable/mismatched"
+      );
+    }
   }
 
   fn start_audit(&self, id: &SessionId, harness: &str, project: &Path) {
@@ -3459,6 +3660,70 @@ mod tests {
       ConfigVerdict::Drifted
     ));
     assert!(matches!(verify_config_pin(&pin, &None), ConfigVerdict::Drifted));
+  }
+
+  // P20.1: rehydration row validation (G2). Corrupt, mismatched and
+  // incomplete rows must be SKIPPED (None), never panicking — the daemon
+  // is panic=abort.
+  #[test]
+  fn rehydrate_row_valid_parses() {
+    let raw = serde_json::json!({
+      "session": "sABC",
+      "project": "/tmp/p",
+      "harness": "claude",
+      "config_sha": "sha",
+      "hub_index_sha": null,
+      "command": null,
+      "enforce": true,
+      "undo": true,
+      "net": false,
+      "launcher_tty": 259,
+      "launcher_tty_ino": 12345,
+      "started_at": 1700000000
+    })
+    .to_string();
+    let (s, ino, undo) = parse_session_row("sABC", &raw, 0).expect("valid row parses");
+    assert_eq!(s.id, "sABC");
+    assert_eq!(s.harness, "claude");
+    assert_eq!(s.launcher_tty, 259);
+    assert_eq!(s.started_at, 1700000000);
+    assert_eq!(ino, Some(12345));
+    assert!(undo);
+  }
+
+  #[test]
+  fn rehydrate_row_corrupt_is_skipped() {
+    assert!(parse_session_row("sABC", "not json {", 0).is_none());
+  }
+
+  #[test]
+  fn rehydrate_row_session_mismatch_is_skipped() {
+    // filename says sABC, row says sXYZ — fail closed, do not register
+    // under either identity.
+    let raw = r#"{"session":"sXYZ","project":"/tmp/p","harness":"claude"}"#;
+    assert!(parse_session_row("sABC", raw, 0).is_none());
+  }
+
+  #[test]
+  fn rehydrate_row_missing_required_field_is_skipped() {
+    let raw = r#"{"session":"sABC","harness":"claude"}"#;
+    assert!(parse_session_row("sABC", raw, 0).is_none());
+    let raw2 = r#"{"session":"sABC","project":"/tmp/p"}"#;
+    assert!(parse_session_row("sABC", raw2, 0).is_none());
+  }
+
+  #[test]
+  fn rehydrate_row_legacy_uses_mtime_fallback() {
+    // pre-P20 row: no started_at, no launcher_tty, no inode. It must
+    // still parse (functionality preserved) with the mtime fallback and
+    // NOT invent a tty witness (launcher_tty 0, ino None → tty-gated ops
+    // stay denied — fail-closed).
+    let raw = r#"{"session":"sLEG","project":"/tmp/p","harness":"codex"}"#;
+    let (s, ino, undo) = parse_session_row("sLEG", raw, 1700000123).expect("legacy row parses");
+    assert_eq!(s.started_at, 1700000123);
+    assert_eq!(s.launcher_tty, 0);
+    assert_eq!(ino, None);
+    assert!(!undo);
   }
 
   #[test]

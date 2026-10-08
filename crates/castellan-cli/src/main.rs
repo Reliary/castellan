@@ -38,6 +38,11 @@ fn main() {
       }
       serde_json::json!({"op": "status"})
     }
+    // P20: daemonless freeze — cgroupfs direct, no daemon, no tty gate.
+    // This is the unit's ExecStopPost path (the daemon is gone by then).
+    "freeze" if args.get(1).map(|a| a == "--daemonless").unwrap_or(false) => {
+      lifecycle::freeze_all_local()
+    }
     "freeze" => freeze_req(&args[1..], "freeze"),
     "thaw" => freeze_req(&args[1..], "thaw"),
     "kill" => freeze_req(&args[1..], "kill"),
@@ -1004,6 +1009,19 @@ fn launch(args: &[String], sock: &str) -> ! {
   let broker = castellan_broker::spawn_broker();
   match broker {
     Ok(castellan_broker::Spawn::Supervisor(mut sup)) => {
+      // P20/F3a: the watchdog must outlive the launcher's terminal. The
+      // supervisor previously died of SIGHUP the moment the pty closed
+      // (measured, p19 ARM B), taking the daemon-loss watchdog with it.
+      // SIGHUP is ignored here — AFTER spawn_broker forked, so the agent
+      // child keeps default SIGHUP (a normal agent still dies with its
+      // terminal). SIGTERM stays default so operators and systemd can
+      // stop the supervisor.
+      unsafe {
+        let _ = nix::sys::signal::signal(
+          nix::sys::signal::Signal::SIGHUP,
+          nix::sys::signal::SigHandler::SigIgn,
+        );
+      }
       // P11: the broker's IP allowlist is a separate mechanism from
       // Landlock's port-scoped rule. `--net` (or the floor) sets
       // restrict_ip; the operator's allowlist is the LLM provider plus
@@ -1040,6 +1058,30 @@ fn launch(args: &[String], sock: &str) -> ! {
       // process that can honestly record what the agent attempted. Denies
       // land on the session spine; the ProofCertificate's bounds proof
       // counts them as out-of-bounds attempts.
+      // P20/F3b: point supervisor stderr at a durable per-session log.
+      // On a closed pty every eprintln panics (EIO) and panic=abort
+      // kills the whole process — watchdog included — so SIGHUP immunity
+      // alone would just move the death from SIGHUP to the next print.
+      // Placement: the launch banner (trust/proxy/egress lines) prints
+      // BEFORE this point and still reaches the terminal (p11 and friends
+      // grep them); everything from here on — heartbeat, freeze record,
+      // broker error lines — lands in supervisor.log and survives the
+      // terminal. If the log cannot be opened we stay on the terminal
+      // (residual: unwritable state dir + dead pty = EIO panic).
+      let sup_log = state_dir
+        .join("castellan/sessions")
+        .join(&session)
+        .join("supervisor.log");
+      let logf = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sup_log)
+        .ok();
+      if let Some(f) = logf {
+        eprintln!("castellan: supervisor log -> {}", sup_log.display());
+        // dup2 keeps fd 2 open on the file after f is dropped.
+        let _ = nix::unistd::dup2_stderr(&f);
+      }
       let recorder_session = session.clone();
       let recorder = std::thread::spawn(move || {
         let sink = castellan_core::EventSink::for_session(&state_dir, &recorder_session);
@@ -1082,10 +1124,9 @@ fn launch(args: &[String], sock: &str) -> ! {
         loop {
           std::thread::sleep(std::time::Duration::from_secs(2));
           let alive = std::os::unix::net::UnixStream::connect(&watchdog_sock).is_ok();
-          // F3 follow-up 2: the supervisor inherits stdio from the
-          // launcher; eprintln here lands in the launch output (visible
-          // in hold3.log-style captures). Heartbeat marker every 30s so
-          // a silent watchdog is distinguishable from a dead one.
+          // P20/F3b: this thread's output goes to supervisor.log (stderr
+          // was redirected at supervisor entry), so a dead pty cannot
+          // panic us mid-freeze.
           if alive {
             dead_since = None;
             continue;
@@ -1095,7 +1136,11 @@ fn launch(args: &[String], sock: &str) -> ! {
             dead_since = Some(std::time::Instant::now());
           }
           if dead_since.map(|t| t.elapsed().as_secs() >= grace_secs).unwrap_or(false) {
-            eprintln!("castellan: daemon lost — freezing session {watchdog_session} (fail-closed)");
+            // P20/F3c: freeze BEFORE any further logging. With
+            // panic=abort a failing log write (disk full) between "we are
+            // about to freeze" and the freeze itself would abort the
+            // process with the session still running — the log must never
+            // be able to preempt the action it describes.
             // F3 follow-up 10: freeze via the pre-opened scope fd (opened
             // in the host mount ns before overlay setup; fds transcend
             // mount namespaces). Path resolution (CgroupRoot::detect) is
@@ -1103,6 +1148,7 @@ fn launch(args: &[String], sock: &str) -> ! {
             // fd is scope-specific: worst case the agent holds it too and
             // can only freeze ITSELF (self-DoS, harmless).
             let mut froze = false;
+            let mut how = String::new();
             if let Some(fd) = freeze_fd {
               // openat(cgroup.freeze, O_WRONLY) relative to the scope fd,
               // then write "1". Borrow the fd without closing (forget the
@@ -1110,26 +1156,28 @@ fn launch(args: &[String], sock: &str) -> ! {
               let path = format!("/proc/self/fd/{fd}/cgroup.freeze");
               match std::fs::write(&path, b"1\n") {
                 Ok(()) => {
-                  eprintln!("castellan: watchdog froze {watchdog_session} (via scope fd)");
+                  how = "scope-fd".into();
                   froze = true;
                 }
-                Err(e) => eprintln!("castellan: watchdog fd-freeze failed: {e}"),
+                Err(e) => how = format!("scope-fd failed: {e}"),
               }
             }
             if !froze {
               match castellan_freezer::CgroupRoot::detect() {
-                Ok(root) => {
-                  match root.set_freeze(&watchdog_session, true) {
-                    Ok(_) => {
-                      eprintln!("castellan: watchdog froze {watchdog_session}");
-                      froze = true;
-                    }
-                    Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+                Ok(root) => match root.set_freeze(&watchdog_session, true) {
+                  Ok(_) => {
+                    how = "cgroup-path".into();
+                    froze = true;
                   }
-                }
-                Err(e) => eprintln!("castellan: watchdog freeze failed: {e}"),
+                  Err(e) => how = format!("freeze failed: {e}"),
+                },
+                Err(e) => how = format!("freeze failed: {e}"),
               }
             }
+            eprintln!(
+              "castellan: daemon lost — session {watchdog_session} frozen={} ({how}) (fail-closed)",
+              if froze { "yes" } else { "NO" }
+            );
             // F3 follow-up 11: eprintln to a pipe can sit in Rust's
             // stdio buffer; process::exit does not flush it (the 'froze'
             // confirmation was lost live on .227 while the freeze itself
@@ -1784,7 +1832,8 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan proxy [status|off [session]]   egress proxy control (P12)");
-  eprintln!("  castellan service [install|uninstall|stop|status|logs [-f]]   user service lifecycle");
+  eprintln!("  castellan freeze --daemonless          freeze every scope via cgroupfs (no daemon; unit ExecStopPost)");
+  eprintln!("  castellan service [install [--skip-preflight|--no-start]|uninstall|stop|status|logs [-f]]");
   eprintln!("  castellan uninstall [--yes] [--keep-data] [--keep-config]   remove service, sessions, state, keyring");
   eprintln!("  castellan gc [--yes] [--keep-last N] [--older-than DAYS]    prune old session state");
   eprintln!("  castellan init [--force]         scaffold keyring.toml + egress.toml");

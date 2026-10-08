@@ -7,9 +7,9 @@ The Landlock + seccomp ruleset applied to a session at spawn. Defines what the a
 At spawn, `castellan-daemon` (via the `castellan-envelope` crate) builds two rulesets and applies them to the agent process before exec:
 
 ### Landlock ruleset
-- **Read:** broad — `$HOME`, `/usr`, `/etc`, `/opt`, system libs. Reading is cheap to allow and denials here are the false-block killer.
+- **Read:** broad: `$HOME`, `/usr`, `/etc`, `/opt`, system libs. Reading is cheap to allow and denials here are the false-block killer.
 - **Write:** allow-set = project dir + harness state dirs (`~/.claude`, `~/.codex`, `~/.pi/agent`, `~/.gemini`, `~/.local/state/claude` etc.) + session scratch at `~/.local/state/castellan/sessions/<uuid>/`. Everything else denied.
-- **Hard deny (always-on, regardless of trust tier — commitment #6):** `~/.ssh`, `~/.gnupg`, `~/.config/omarchy`, `~/.config/systemd`, `~/.local/share/systemd`, `~/.config/hypr` (unless expanded via bless broker), `.desktop` files anywhere, shell rc files (`~/.bashrc`, `~/.zshrc`, `~/.profile`).
+- **Hard deny (always-on, regardless of trust tier, commitment #6):** `~/.ssh`, `~/.gnupg`, `~/.config/omarchy`, `~/.config/systemd`, `~/.local/share/systemd`, `~/.config/hypr` (unless expanded via bless broker), `.desktop` files anywhere, shell rc files (`~/.bashrc`, `~/.zshrc`, `~/.profile`).
 - **Network (Landlock ABI v4+, Arch kernels have it):** phase v0 = no network restriction (filesystem-only envelope). Phase v1 = TCP bind/connect restricted to loopback + 443. Phase v2 = egress proxy (see egress-proxy.md) replaces direct network entirely.
 
 ### seccomp BPF filter (commitment #8)
@@ -17,11 +17,11 @@ At spawn, `castellan-daemon` (via the `castellan-envelope` crate) builds two rul
 - **Blocked syscalls:** `chmod`, `fchmod`, `chown`, `fchown`, `lchown`, `utime`, `utimes`, `utimensat`, `futimesat` (Landlock ABI gap), `io_uring_setup`, `io_uring_enter`, `io_uring_register` (GhostClaw bypass), `ptrace`, `process_vm_readv`, `process_vm_writev` (namespace-escape primitives), `mount`, `umount2`, `pivot_root` (filesystem topology), `keyctl`, `bpf` (privilege escalation).
 - **PR_SET_NO_NEW_PRIVS** set before restrict_self.
 
-## Degrade tiers (documented honestly)
+## Degrade tiers (availability cliff)
 
 1. **Full capability:** Landlock ABI v4+ (network) + seccomp + user namespaces + overlayfs. Arch kernels ≥ 6.12 ship this. This is the assumed baseline on Omarchy.
 2. **Filesystem-only envelope:** Landlock ABI v3 (no network restrictions). seccomp still applies. Egress enforced by the proxy, not Landlock.
-3. **seccomp-only:** Landlock unavailable or ABI < v3. Filesystem writes are NOT kernel-restricted — this is "audit mode at the kernel level." Daemon logs all writes via inotify; trust heavily penalizes any session run in this tier.
+3. **seccomp-only:** Landlock unavailable or ABI < v3. Filesystem writes are NOT kernel-restricted: this is "audit mode at the kernel level." Daemon logs all writes via inotify; trust heavily penalizes any session run in this tier.
 4. **Fail-closed:** Landlock unavailable AND user configured `enforce` mode → refuse to launch the agent. Configurable to `audit` (launch with inotify-only observation).
 
 Detection: `castellan-envelope detect-abi` returns the available tier; the daemon uses the highest tier present.
@@ -33,19 +33,19 @@ Detection: `castellan-envelope detect-abi` returns the available tier; the daemo
 - **tier 4 (80-99):** + egress broader allowlist; config-dir writes auto-approved (still kernel-logged).
 - **tier 5 (100):** + system config writes via bless biometric. Still cannot touch the always-on deny-list (commitment #6).
 
-Profiles are minted at spawn from trust.db. Mid-session expansion is impossible (Landlock irreversible) — expansion happens via bless broker, which restarts the session in a new wider domain (with the human's approval). This is a real UX cost; document it.
+Profiles are minted at spawn from trust.db. Mid-session expansion is impossible (Landlock irreversible), so expansion happens via bless broker, which restarts the session in a new wider domain (with the human's approval). This is a real UX cost; document it.
 
 ## Antagonism survivors
 
-- A1 (raw exec bypass): closed — Landlock inherits.
-- A2 (write wrapper/daemon): closed — outside allow-set.
-- A4 (chmod/chown/utime): closed — seccomp blocks.
-- C1 (compromised harness): closed — confinement is OS-level, harness code irrelevant.
-- C2 (malicious MCP): closed — MCP servers are children, inherit envelope.
+- A1 (raw exec bypass): closed: Landlock inherits.
+- A2 (write wrapper/daemon): closed: outside allow-set.
+- A4 (chmod/chown/utime): closed: seccomp blocks.
+- C1 (compromised harness): closed: confinement is OS-level, harness code irrelevant.
+- C2 (malicious MCP): closed: MCP servers are children, inherit envelope.
 
 ## Open questions
 
-- Does the harness state dir allow-set create a persistence hole (a malicious skill written to `~/.claude/skills/`)? Yes — closed by harness-state-watcher, not by the envelope alone. See harness-state-watcher.md.
+- Does the harness state dir allow-set create a persistence hole (a malicious skill written to `~/.claude/skills/`)? Yes: closed by harness-state-watcher, not by the envelope alone. See harness-state-watcher.md.
 - How does `omarchy agent crash <pid>` (the coredump-diagnosis path) get wrapped? With a diagnosis-only profile: read-only fs, no egress except the LLM provider, no writes. See Threat C5.
 - What about agents that need `~/.config/hypr` edits (that IS Omarchy customization)? Via bless broker expansion to a config-writer profile, minted fresh. Default agents don't get it.
 
@@ -54,11 +54,11 @@ Profiles are minted at spawn from trust.db. Mid-session expansion is impossible 
 - `castellan-core` (SessionId, EnvelopeProfile, TrustTier)
 - `castellan-trust` (tier → profile)
 - `nix` crate (Landlock, seccomp syscalls)
-- Owned primitive: `quale` for sizing hints (advisory — quale's hub-risk can suggest which paths a task class typically touches; NOT load-bearing, NOT a claim).
+- Owned primitive: `quale` for sizing hints (advisory; quale's hub-risk can suggest which paths a task class typically touches; NOT load-bearing, NOT a claim).
 
 ## Status
 
-**Built (P1).** `crates/castellan-policy` (pure classification, unit-tested) + `crates/castellan-envelope` (Landlock ruleset via raw syscalls, seccomp BPF, audit watcher). Verified live on kernel 7.0.3 / Landlock ABI 8: workspace write allowed, home write denied with EACCES, git workflow functional under enforce, ptrace returns EPERM under seccomp. Enforce attaches at launch (`castellan launch --enforce -- cmd`) — adopted sessions cannot be enforced (Landlock is self-applied only). Audit mode (default) classifies inotify-observed writes into events.jsonl for the false-block kill metric.
+**Built (P1).** `crates/castellan-policy` (pure classification, unit-tested) + `crates/castellan-envelope` (Landlock ruleset via raw syscalls, seccomp BPF, audit watcher). Verified live on kernel 7.0.3 / Landlock ABI 8: workspace write allowed, home write denied with EACCES, git workflow functional under enforce, ptrace returns EPERM under seccomp. Enforce attaches at launch (the default since B6; `--no-enforce` opts out). Adopted sessions cannot be enforced (Landlock is self-applied only). Audit mode classifies inotify-observed writes into events.jsonl for the false-block kill metric.
 
 Kernel findings recorded during build:
 - `landlock_path_beneath_attr` must be `#[repr(packed)]` (12 bytes) — aligned layout gives EINVAL on add_rule.

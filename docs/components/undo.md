@@ -7,16 +7,16 @@ Surgical, per-session reversal of agent writes. No reboot, no whole-disk snapsho
 The agent runs inside a user namespace with an overlayfs mount over the project directory:
 
 - **lowerdir:** the real project directory, bind-mounted read-only.
-- **upperdir:** `~/.local/state/castellan/sessions/<uuid>/upper/` — where the agent's writes land.
-- **workdir:** `~/.local/state/castellan/sessions/<uuid>/work/` — kernel work dir for overlayfs.
+- **upperdir:** `~/.local/state/castellan/sessions/<uuid>/upper/`: where the agent's writes land.
+- **workdir:** `~/.local/state/castellan/sessions/<uuid>/work/`: kernel work dir for overlayfs.
 
 The agent sees a writable filesystem that looks like the project; every write goes to the upper layer. The lower layer is immutable (read-only mount), so the agent cannot corrupt pre-session state.
 
-**Undo = discard the upper layer.** The project directory reverts to the lower layer = pre-session state. Atomic at the filesystem level, no race (this is why overlayfs won over inotify — see D9).
+**Undo = discard the upper layer.** The project directory reverts to the lower layer = pre-session state. Atomic at the filesystem level, no race (this is why overlayfs won over inotify, see D9).
 
 ## The ledger falls out for free
 
-Enumerating the upper layer gives the complete set of files the session created or modified. For each file, the lower layer has the pre-session version (or "did not exist"). This IS the kernel-witnessed ledger — no separate inotify watcher needed when overlayfs is available. inotify is the fallback substrate when user namespaces / overlayfs are unavailable (degrade tier 3).
+Enumerating the upper layer gives the complete set of files the session created or modified. For each file, the lower layer has the pre-session version (or "did not exist"). This IS the kernel-witnessed ledger; no separate inotify watcher needed when overlayfs is available. inotify is the fallback substrate when user namespaces / overlayfs are unavailable (degrade tier 3).
 
 Before-images are content-addressed (blake3) and stored in a shared dedup blob store at `~/.local/state/castellan/blobs/` so multiple sessions that touch the same file don't re-snapshot. GC with pinning (a session can be pinned to prevent blob eviction).
 
@@ -36,7 +36,7 @@ Undoing a running session is a race. Protocol:
 
 1. Freeze the session (cgroup.freeze).
 2. Snapshot the upper layer state for diff.
-3. Apply the 3-way merge to the lower layer (now writable by the daemon, NOT by the agent — the agent is frozen).
+3. Apply the 3-way merge to the lower layer (now writable by the daemon, NOT by the agent; the agent is frozen).
 4. Kill the session (SIGKILL all PIDs).
 5. Clean up the scope.
 
@@ -64,8 +64,8 @@ The agent is frozen throughout; it cannot interfere with its own undo.
 
 ## Antagonism survivors
 
-- A10 (corrupt the ledger): closed — lower layer is read-only mount; blob store is outside the envelope.
-- D9 (inotify race): closed — overlayfs is atomic.
+- A10 (corrupt the ledger): closed: lower layer is read-only mount; blob store is outside the envelope.
+- D9 (inotify race): closed: overlayfs is atomic.
 - B2 (agent lies about what it touched): closed — ledger is kernel-witnessed (upper layer enumeration), not agent-reported.
 
 ## Residual risks

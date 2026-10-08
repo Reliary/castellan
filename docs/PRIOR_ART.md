@@ -1,6 +1,6 @@
 # Prior art — what already exists (surveyed Aug 2026)
 
-This doc exists to keep claims honest. Every piece of castellan was checked
+This doc exists to keep claims checkable. Every piece of castellan was checked
 against the current landscape before being called a contribution. The
 verdict: **the individual primitives are all crowded; the composition is
 not.** Cite this doc before making any "novel" or "first" claim.
@@ -47,7 +47,7 @@ inline block/redact. **None does OS-kernel containment.**
 
 - NIST AI Agent Standards Initiative (Feb 2026); CAISI RFI on agent
   security; NCCoE agent identity/authorization concept paper. Focus:
-  identity, authorization, posture — not OS sandboxing.
+  identity, authorization, posture, not OS sandboxing.
 - Benchmarks: AgentDojo, InjecAgent, AgentShield, ASB, AgentDefense-Bench.
 - **Placebo-controlled evaluation of agent fixes: not found anywhere.**
   Nearest analogues are matched benign/attack suites (AgentDojo's
@@ -63,33 +63,33 @@ overlayfs undo, canary credentials, trust tiers, approval gates,
 proof-carrying agent actions. All exist in some form.
 
 **Genuinely unbuilt as of Aug 2026 (claimable, with dated proof):**
-1. **The composition** — one OS-owned daemon applying envelope + freeze +
+1. **The composition**: one OS-owned daemon applying envelope + freeze +
    undo + canaries + trust + approval + certificates across ALL harnesses
    simultaneously. Closest partials: RewindBPF (envelope+undo, no
    freeze/trust/canaries), AWS graduated autonomy (trust+approval, no OS
    envelope), AgentCgroup (freeze only).
-2. **Placebo-controlled proof as the only positive trust signal** — no
+2. **Placebo-controlled proof as the only positive trust signal**: no
    prior art found.
-3. **Desktop-native, unprivileged** — everything above is CLI/cloud;
+3. **Desktop-native, unprivileged**: everything above is CLI/cloud;
    castellan's verified unprivileged cgroup freeze (no systemd
    delegation, kernel 7.0.3) and panic-button UX are desktop-native.
-4. **ProofCertificate as a shipped artifact** — PCAA is research;
+4. **ProofCertificate as a shipped artifact**: PCAA is research;
    `castellan cert` ships.
 
 ## Corrections owed
 
 - Earlier internal surveys missed **AWS graduated autonomy** and
-  **Thinkst's agent canaries** — the two closest things to P3/P4. This
+  **Thinkst's agent canaries**: the two closest things to P3/P4. This
   doc supersedes those surveys.
-- "OpenAI Linux distro" is **unverified rumor** — no such distro exists
+- "OpenAI Linux distro" is **unverified rumor**: no such distro exists
   per this survey. Do not cite it.
 - **Sept 2026 addendum:** `nolabs-ai/nono` (4.2k★, Rust, Sigstore team)
-  now ships a same-story product — zero-setup cross-platform sandbox
+  now ships a same-story product: zero-setup cross-platform sandbox
   (macOS/Linux/Windows), credential proxy **with L7 per-method/per-path
   endpoint policy**, per-command sandboxes, profile registry, enterprise
   adoption. Claude Code ships a SOCKS5 domain-allowlist proxy
   harness-level. The §"Genuinely unbuilt" composition claim above is
   therefore narrowed: what remains plausibly unique is the
   canary-tripwire-with-freeze, the placebo-controlled trust signal, and
-  the unprivileged desktop-native form — each verifiable in-repo. No
+  the unprivileged desktop-native form, each verifiable in-repo. No
   "first" language.

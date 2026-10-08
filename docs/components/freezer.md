@@ -1,10 +1,10 @@
 # Freezer
 
-The panic button. Freezes every running agent session at the kernel level via cgroup v2 freezer. Frozen processes cannot run, cannot handle signals, cannot make progress — until thawed.
+The panic button. Freezes every running agent session at the kernel level via cgroup v2 freezer. Frozen processes cannot run, cannot handle signals, cannot make progress until thawed.
 
 ## Mechanism
 
-cgroup v2 exposes a `cgroup.freeze` file per cgroup. Writing `1` freezes all processes in the cgroup. Writing `0` thaws. The freeze is kernel-instant — frozen processes are descheduled and cannot run even to handle a signal. This is stronger than SIGSTOP (which can race with signal handlers).
+cgroup v2 exposes a `cgroup.freeze` file per cgroup. Writing `1` freezes all processes in the cgroup. Writing `0` thaws. The freeze is kernel-instant: frozen processes are descheduled and cannot run even to handle a signal. This is stronger than SIGSTOP (which can race with signal handlers).
 
 Each castellan session runs in a systemd user scope `castellan-<uuid>.scope`. The freezer file lives at `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/castellan-<uuid>.scope/cgroup.freeze`.
 
@@ -47,8 +47,8 @@ Thawing requires fp-toggle biometric if a fingerprint reader is present. `castel
 ## Antagonism survivors
 
 - A3 (self-thaw): closed by commitment #1 (daemon owns freezer).
-- A11 (event flooding DoS): closed — freezer is a single file write, not event-driven.
-- C7 (daemon crash): closed by commitment #7 — freeze persists without daemon (kernel-enforced), watchdog restarts daemon and re-freezes on heartbeat loss.
+- A11 (event flooding DoS): closed: freezer is a single file write, not event-driven.
+- C7 (daemon crash): closed by commitment #7: freeze persists without daemon (kernel-enforced), watchdog restarts daemon and re-freezes on heartbeat loss.
 
 ## Dependencies
 

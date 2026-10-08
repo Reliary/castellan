@@ -4,9 +4,9 @@ One static Rust binary, `castellan-daemon`. Owns the single-writer-per-session c
 
 ## Why a daemon (and not spawn-time + timers)
 
-Concurrent sessions writing to `trust.db`, sentinel-vs-undo races, tier-change-mid-session hazards, fleet sync state, the egress proxy's persistent keyring, the honeypot listener's persistent socket — all need a single-writer-per-session and a long-lived process. Spawn-time-only can't do this correctly. The daemon justifies itself on correctness grounds, not convenience.
+Concurrent sessions writing to `trust.db`, sentinel-vs-undo races, tier-change-mid-session hazards, fleet sync state, the egress proxy's persistent keyring, the honeypot listener's persistent socket: all need a single-writer-per-session and a long-lived process. Spawn-time-only can't do this correctly. The daemon justifies itself on correctness grounds, not convenience.
 
-This mirrors the reliary-agent daemon pattern (TCP line protocol, lock-protected DaemonState) — a proven design in our repos. Castellan uses a unix socket instead of TCP (no network surface) and a richer protocol (newline-delimited JSON, not line commands).
+This mirrors the reliary-agent daemon pattern (TCP line protocol, lock-protected DaemonState), a proven design in our repos. Castellan uses a unix socket instead of TCP (no network surface) and a richer protocol (newline-delimited JSON, not line commands).
 
 ## Responsibilities
 
@@ -59,10 +59,10 @@ not in the daemon (`crates/castellan-cli/src/main.rs`): a detached thread probes
 daemon socket every 2s and, after a 5s grace with the daemon unreachable, freezes the
 session through the pre-opened scope fd (`openat`→`/proc/self/fd/<n>/cgroup.freeze`;
 fds survive the mount-ns switch), falling back to `CgroupRoot::detect()`. This is the
-mechanism behind "agents are frozen on daemon loss, not freed" — **for sessions started
+mechanism behind "agents are frozen on daemon loss, not freed" (**for sessions started
 with `castellan launch`**.
 
-Honest limits, measured against the code rather than the design:
+Limits, measured against the code rather than the design:
 
 - **Only `castellan launch` sessions get a watchdog.** `castellan spawn` and `castellan
   adopt` create a session with no supervisor, so a daemon loss leaves them un-frozen.
@@ -72,7 +72,7 @@ Honest limits, measured against the code rather than the design:
   then `eprintln` to the dead pty would panic it anyway (`panic=abort`
   would have taken the watchdog down mid-freeze). The fix has three
   parts, all in the supervisor branch: SIGHUP is ignored **after**
-  `spawn_broker` forked (the agent child keeps default SIGHUP — a normal
+  `spawn_broker` forked (the agent child keeps default SIGHUP, so a normal
   agent still dies with its terminal), stderr is redirected to
   `sessions/<id>/supervisor.log` right after the launch banner (a closed
   pty can no longer panic the process; the freeze record now survives
@@ -81,11 +81,11 @@ Honest limits, measured against the code rather than the design:
   Verified live on .227 by `test/shell.d/p19-watchdog-survival.sh`,
   run twice: ARM A (terminal intact, daemon killed) and ARM B
   (SIGHUP-ignoring agent, terminal closed, orphaned, daemon killed)
-  both freeze — 5/0, 5/0. Residual: if the state dir is unwritable AND
+  both freeze (5/0, 5/0). Residual: if the state dir is unwritable AND
   the pty is dead, the log redirect fails and a later print can still
   panic (documented at the redirect site).
 - Landlock + cgroup membership persist without the daemon (kernel-enforced), so
-  *enforcement* survives daemon death regardless — only the active freeze action needs
+  *enforcement* survives daemon death regardless; only the active freeze action needs
   the watchdog.
 
 Design target, **not built**: daemon-side `Type=notify` + `WatchdogSec=10s` with

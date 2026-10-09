@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const UNIT_NAME: &str = "castellan.service";
+/// P21.5: desktop-control oneshot units installed alongside the daemon.
+const FREEZE_UNIT: &str = "castellan-freeze.service";
+const THAW_UNIT: &str = "castellan-thaw.service";
 
 fn home() -> PathBuf {
   std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
@@ -209,6 +212,51 @@ fn stop_daemon_processes() -> usize {
   pids.len()
 }
 
+/// P21.5: the desktop-control oneshot units. `systemctl --user start
+/// castellan-freeze.service` (a Hyprland keybind, a Quickshell panel button)
+/// freezes every session scope via cgroupfs directly — no daemon round
+/// trip, no tty gate, no trust state to update. Equal power to the
+/// `freeze --daemonless` verb an operator can already run: an enveloped
+/// agent cannot write cgroup.freeze (F12, EPERM live) and an unconfined
+/// same-uid process needs no unit to do it. Not security components;
+/// convenience wrappers, removed by uninstall like the watcher unit.
+fn oneshot_unit(desc: &str, cli: &Path, verb: &str) -> String {
+  format!(
+    "[Unit]\n\
+     Description={desc}\n\
+     \n\
+     [Service]\n\
+     Type=oneshot\n\
+     ExecStart={} {verb} --daemonless\n\
+     NoNewPrivileges=yes\n",
+    cli.display()
+  )
+}
+
+fn write_oneshot_units(cli: &Path) {
+  let dir = unit_dir();
+  let freeze = dir.join(FREEZE_UNIT);
+  let thaw = dir.join(THAW_UNIT);
+  let mut wrote = Vec::new();
+  match std::fs::write(
+    &freeze,
+    oneshot_unit("castellan: freeze all sessions (desktop control)", cli, "freeze"),
+  ) {
+    Ok(()) => wrote.push(FREEZE_UNIT.to_string()),
+    Err(e) => eprintln!("service install: cannot write {}: {e}", freeze.display()),
+  }
+  match std::fs::write(
+    &thaw,
+    oneshot_unit("castellan: thaw all sessions (desktop control)", cli, "thaw"),
+  ) {
+    Ok(()) => wrote.push(THAW_UNIT.to_string()),
+    Err(e) => eprintln!("service install: cannot write {}: {e}", thaw.display()),
+  }
+  for name in &wrote {
+    println!("wrote {}", dir.join(name).display());
+  }
+}
+
 fn unit_contents(daemon: &Path, cli: &Path, skip_preflight: bool) -> String {
   let pre = if skip_preflight {
     String::new()
@@ -290,6 +338,40 @@ pub fn freeze_all_local() -> ! {
   std::process::exit(if failed > 0 { 1 } else { 0 });
 }
 
+/// P21.5: thaw every session scope via cgroupfs — the desktop keybind
+/// counterpart to `freeze --daemonless` (the `castellan-thaw` oneshot
+/// unit). Equal-power in both directions, same as freeze: an enveloped
+/// agent cannot write cgroup.freeze (F12, live-verified EPERM); an
+/// unconfined same-uid process can already do it without this verb.
+pub fn thaw_all_local() -> ! {
+  let scopes = live_scopes();
+  if scopes.is_empty() {
+    println!("no session scopes to thaw");
+    std::process::exit(0);
+  }
+  let root = match castellan_freezer::CgroupRoot::detect() {
+    Ok(r) => r,
+    Err(e) => {
+      eprintln!("thaw --daemonless: cgroup root unavailable: {e}");
+      std::process::exit(1);
+    }
+  };
+  let mut thawed = 0u32;
+  let mut failed = 0u32;
+  for path in &scopes {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    let scope = name.trim_end_matches(".scope").to_string();
+    match root.set_freeze(&scope, false) {
+      Ok(_) => thawed += 1,
+      Err(_) => failed += 1,
+    }
+  }
+  println!("thawed {thawed} session scope(s), {failed} failed");
+  std::process::exit(if failed > 0 { 1 } else { 0 });
+}
+
 fn cmd_service(args: &[String]) -> ! {
   let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
   let skip_preflight = args.iter().any(|a| a == "--skip-preflight");
@@ -331,6 +413,9 @@ fn cmd_service(args: &[String]) -> ! {
         std::process::exit(1);
       }
       println!("wrote {}", unit_path().display());
+      // P21.5: desktop-control oneshots. They are not security components
+      // and need no [Install] section (started, never enabled).
+      write_oneshot_units(&cli);
       let _ = systemctl(&["daemon-reload"]);
       // P20/F7: systemctl --user is a singleton bound to the MANAGER's
       // config env. A unit written under a shell-set XDG_CONFIG_HOME the
@@ -360,6 +445,7 @@ fn cmd_service(args: &[String]) -> ! {
       println!("service installed and started");
       println!("next: `castellan init` to scaffold keyring.toml + egress.toml, then `castellan launch -- claude`");
       println!("tips: `castellan watch` follows freeze/expansion events; `castellan bless show` lists pending expansions");
+      println!("desktop: SUPER+Escape freeze keybind or a panel button → `systemctl --user start castellan-freeze.service` / `castellan-thaw.service` (see contrib/omarchy/)");
       std::process::exit(0);
     }
     "uninstall" => uninstall(&args[1..]),
@@ -451,6 +537,16 @@ fn uninstall(args: &[String]) -> ! {
     let _ = systemctl(&["disable", "castellan-watch.service"]);
     let _ = std::fs::remove_file(&watch_unit);
     println!("removed {}", watch_unit.display());
+  }
+  // P21.5: the desktop-control oneshot units (not enabled, stop for safety
+  // in case one is mid-run, then remove).
+  for name in [FREEZE_UNIT, THAW_UNIT] {
+    let p = unit_path().with_file_name(name);
+    if p.exists() {
+      let _ = systemctl(&["stop", name]);
+      let _ = std::fs::remove_file(&p);
+      println!("removed {}", p.display());
+    }
   }
   let _ = systemctl(&["daemon-reload"]);
 

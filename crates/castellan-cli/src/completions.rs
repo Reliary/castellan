@@ -11,6 +11,7 @@ use std::io::Write;
 /// and `-V` are flags; included in suggestions for completeness.
 pub const VERBS: &[&str] = &[
     "status",
+    "preflight",
     "watch",
     "freeze",
     "thaw",
@@ -18,8 +19,15 @@ pub const VERBS: &[&str] = &[
     "spawn",
     "launch",
     "audit",
+    "diff",
+    "undo",
+    "keep",
     "adopt",
     "bless",
+    "siblings",
+    "campaign",
+    "canary",
+    "trust",
     "cert",
     "verify",
     "replay",

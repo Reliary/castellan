@@ -30,12 +30,16 @@ daemon-side.
   CONNECT-only HTTP/1.1 MITM: a per-session CA (key in daemon memory
   only, cert in the session scratch) mints a leaf per target host;
   rustls terminates the agent's TLS and re-encrypts upstream with
-  system roots. Strips any agent-supplied `Authorization` /
-  `Proxy-Authorization` / `X-API-Key` / `api-key`, injects the bound
-  credential's header, forces `Connection: close` (one exchange per
-  connection, v0 model, documented below). Allowlist = the session's
-  resolved destination policy (same list the B8 broker gets), so proxy
-  and kernel never disagree.
+  system roots. **Conditional strip (P21.1):** when the keyring holds a
+  binding for the host, agent-supplied `Authorization` /
+  `Proxy-Authorization` / `X-API-Key` / `api-key` are stripped and the
+  bound credential's header injected; with no binding, the agent's own
+  headers pass through unchanged, so OAuth-first harnesses (Claude
+  Code, Codex, Cursor) work on a fresh install with an empty keyring.
+  Forces `Connection: close` (one exchange per connection, v0 model,
+  documented below). Allowlist = the session's resolved destination
+  policy (same list the B8 broker gets), so proxy and kernel never
+  disagree.
 - **Launcher env at spawn** — `HTTP(S)_PROXY`, `NO_PROXY` (keeps the
   canary honeypot on the direct path: a proxied canary probe would
   never trip the wire, C5), and `SSL_CERT_FILE` /
@@ -65,10 +69,14 @@ daemon-side.
   `Connection: close`; responses pipe until EOF, `close_notify` sent
   on both hops (rustls0.23 treats FIN-without-notify as an error —
   found by the integration test, affects real rustls clients).
-- **Stripped always**: agent-supplied auth headers are dropped even
-  for unbound hosts — an unbound allowlisted host gets NO
-  credential (K6), and a canary value never leaves toward a real
-  host through the proxy path.
+- **Conditional strip (P21.1)**: with a keyring binding for the host,
+  the agent's auth headers are replaced by the real credential. With no
+  binding, they pass through — the agent's own OAuth token reaches the
+  provider, and an unbound allowlisted host gets the agent's identity
+  rather than a 401. A canary value headed for a bound host is still
+  replaced (the binding wins); a canary sent to an unbound host is
+  observable by the honeypot only on the direct path, not through the
+  proxy (documented residual, same class as before).
 - **Leaf certs** carry `CN=<host>`, AKI, EKU serverAuth, KU
   digitalSignature; the CA carries KU keyCertSign — python/OpenSSL3
   rejects certs missing any of these (three failures found live by
@@ -128,8 +136,9 @@ intact under concurrent proxy + audit emission.
 
 ~1–5ms per request for the proxy hop (plan estimate; no benchmark
 claim — not separately measured). Every session pays a listener thread
-+ one thread per active connection. Empty keyring degrades to
-proxy-without-injection (B8 + canaries posture, fallback).
++ one thread per active connection. Empty keyring: the proxy passes the
+agent's own auth through (P21.1 conditional strip), so cold-start
+sessions work without any keyring entry.
 
 ## Status
 

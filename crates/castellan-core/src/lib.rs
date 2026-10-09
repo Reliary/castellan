@@ -78,6 +78,10 @@ pub struct SessionReport {
   pub project: String,
   pub state: FreezeState,
   pub pids: usize,
+  /// P21.4: unix ts when a `freeze --kill-after-m` deadline SIGKILLs
+  /// this session. None = frozen indefinitely (the default) or thawed.
+  #[serde(default)]
+  pub kill_at: Option<u64>,
 }
 
 /// N2: two-tier response routing. Low-confidence signals (radar drift,
@@ -173,6 +177,12 @@ pub enum Request {
   },
   Freeze {
     session: Option<SessionId>,
+    /// P21.4: optional auto-kill deadline. `Some(n)` schedules a
+    /// SIGKILL of the frozen scope n minutes after the freeze (daemon
+    /// clock); the default None freezes indefinitely — a countdown to
+    /// kill is surprise data loss unless the operator asked for it.
+    #[serde(default)]
+    kill_after_m: Option<u64>,
   },
   Thaw {
     session: Option<SessionId>,

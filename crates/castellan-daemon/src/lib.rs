@@ -341,6 +341,11 @@ pub struct Daemon {
   keyring: Arc<castellan_keyring::Keyring>,
   /// P12: upstream TLS trust for the proxy (system roots).
   proxy_tls: Arc<rustls::ClientConfig>,
+  /// P21.4: auto-kill deadlines, session -> unix ts when a frozen scope
+  /// is SIGKILLed. Populated only when `freeze --kill-after-m` asked
+  /// for it; thaw removes the entry. Persisted on the session row as an
+  /// ABSOLUTE ts, so a daemon restart does not extend a deadline.
+  freeze_deadlines: Arc<Mutex<FxHashMap<SessionId, u64>>>,
 }
 
 impl Daemon {
@@ -478,6 +483,7 @@ impl Daemon {
         Arc::new(k)
       },
       proxy_tls: castellan_proxy::native_tls_config(),
+      freeze_deadlines: Arc::new(Mutex::new(FxHashMap::default())),
     };
     // P20.1: control-plane survival across restart (F2). Spawn-only
     // registration meant any daemon restart wiped status/freeze/kill/
@@ -511,6 +517,16 @@ impl Daemon {
         sweep_daemon.run_sweep();
       });
     }
+    // P21.4: auto-kill timer. Only sessions frozen with an explicit
+    // `--kill-after-m` carry a deadline; the default freeze has none.
+    // The thread is cheap (one lock + a clock read every 2s) and is the
+    // single place SIGKILL-on-deadline happens, so the behavior is
+    // testable and the spine row is written exactly once per kill.
+    let kill_daemon = daemon.clone();
+    let _ = std::thread::Builder::new().name("freeze-killer".into()).spawn(move || loop {
+      std::thread::sleep(std::time::Duration::from_secs(2));
+      kill_daemon.run_freeze_deadlines();
+    });
     Ok(daemon)
   }
 
@@ -673,7 +689,7 @@ impl Daemon {
       // is human-only (see BlessApprove below).
       Request::UndoCommit { session }
       | Request::UndoDiscard { session }
-      | Request::Freeze { session: Some(session) }
+      | Request::Freeze { session: Some(session), .. }
       | Request::Thaw { session: Some(session) }
       | Request::Kill { session: Some(session) }
       | Request::Adopt { session, .. }
@@ -700,7 +716,7 @@ impl Daemon {
       // always gets a fresh session id).
       Request::Thaw { session: None }
       | Request::Kill { session: None }
-      | Request::Freeze { session: None } => {
+      | Request::Freeze { session: None, .. } => {
         return self.tty_is_witnessed(caller_tty, caller_sid);
       }
       // C32: approve must come from the LAUNCHER'S terminal, not just
@@ -897,8 +913,10 @@ impl Daemon {
       }
       Request::Adopt { session, pids } => self.adopt(&session, pids),
       Request::JoinSession { session, pid } => self.join_session(&session, pid),
-      Request::Freeze { session } => self.freeze(session.as_ref(), true),
-      Request::Thaw { session } => self.freeze(session.as_ref(), false),
+      Request::Freeze { session, kill_after_m } => {
+        self.freeze(session.as_ref(), true, kill_after_m)
+      }
+      Request::Thaw { session } => self.freeze(session.as_ref(), false, None),
       Request::Kill { session } => self.kill(session.as_ref()),
       Request::Status => self.status(),
       Request::UndoDiff { session } => self.undo_diff(&session),
@@ -2240,7 +2258,7 @@ impl Daemon {
       }
     };
     // freeze first so nothing writes while we wipe
-    if !self.freeze(Some(&session.to_string()), true).ok {
+    if !self.freeze(Some(&session.to_string()), true, None).ok {
       eprintln!("freeze-before-undo failed");
     }
     let project = {
@@ -2291,7 +2309,7 @@ impl Daemon {
         None => return Response::err("unknown session"),
       }
     };
-    if !self.freeze(Some(&session.to_string()), true).ok {
+    if !self.freeze(Some(&session.to_string()), true, None).ok {
       eprintln!("freeze-before-commit failed");
     }
     let _ = self.kill(Some(&session.to_string()));
@@ -3224,6 +3242,18 @@ impl Daemon {
       let sid = session.id.clone();
       let harness = session.harness.clone();
       let project = session.project.clone();
+      // P21.4: the auto-kill deadline is an ABSOLUTE unix ts, preserved
+      // across restart (not restarted from restart time): a deadline is
+      // a deadline. If it passed while the daemon was down, the timer
+      // thread fires it on its next tick (2s). The timer only kills a
+      // session that is still frozen, so a pre-restart thaw cannot be
+      // undone by a stale deadline.
+      if let Some(at) = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("kill_at").and_then(|k| k.as_u64()))
+      {
+        self.freeze_deadlines.lock().unwrap().insert(sid.clone(), at);
+      }
       self.registry.lock().unwrap().insert(session);
       // Undo sessions need their notes entry back or keep/undo-* return
       // "no undo layer recorded" after a restart (G1b: clean error, never
@@ -3328,20 +3358,192 @@ impl Daemon {
     }
   }
 
-  fn freeze(&self, session: Option<&SessionId>, freeze: bool) -> Response {
+  fn freeze(&self, session: Option<&SessionId>, freeze: bool, kill_after_m: Option<u64>) -> Response {
     let targets = self.resolve_targets(session);
     if targets.is_empty() {
       return Response::ok()
         .with_message(if freeze { "no sessions to freeze" } else { "no sessions to thaw" });
     }
+    // P21.4: record or clear the auto-kill deadline. Only a real freeze
+    // with an explicit flag sets one; a thaw clears it. `--kill-after-m
+    // 0` is treated as "no deadline" (a zero-minute window is a footgun,
+    // not a feature).
+    if freeze {
+      if let Some(mins) = kill_after_m.filter(|m| *m > 0) {
+        // P21.4: minutes, except under the test override. The override
+        // (CASTELLAN_KILL_AFTER_TEST_SECS) can only SHORTEN a deadline —
+        // it cannot disable the timer — so it is not a defense-off
+        // switch; the p21-freeze-ux suite uses it to exercise the timer
+        // without waiting a real minute.
+        let secs_per_min: u64 = std::env::var("CASTELLAN_KILL_AFTER_TEST_SECS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .filter(|v| *v > 0)
+          .unwrap_or(60);
+        let deadline = castellan_core::now_unix() + mins.saturating_mul(secs_per_min);
+        let mut d = self.freeze_deadlines.lock().unwrap();
+        for id in &targets {
+          d.insert(id.clone(), deadline);
+          self.persist_kill_deadline(id, Some(deadline));
+        }
+      } else if kill_after_m.is_some() {
+        // explicit 0: clear any existing deadline
+        let mut d = self.freeze_deadlines.lock().unwrap();
+        for id in &targets {
+          d.remove(id);
+          self.persist_kill_deadline(id, None);
+        }
+      }
+    } else {
+      let mut d = self.freeze_deadlines.lock().unwrap();
+      for id in &targets {
+        d.remove(id);
+        self.persist_kill_deadline(id, None);
+      }
+    }
     let msgs: Vec<String> = targets
       .iter()
-      .map(|id| match self.root.set_freeze(id, freeze) {
-        Ok(state) => format!("{id}: {}", state.as_str()),
-        Err(e) => format!("{id}: error {e}"),
+      .map(|id| {
+        let prev = self.root.freeze_state(id).unwrap_or(FreezeState::Missing);
+        match self.root.set_freeze(id, freeze) {
+          Ok(state) => {
+            // P21.4: banner on the session's terminal, written daemon-side.
+            // An in-scope process (the supervisor) is descheduled while
+            // frozen — proven live on .227: only the daemon, outside the
+            // frozen scope, can put text on the terminal (wall-style).
+            if prev != state {
+              let line = if freeze {
+                match self.freeze_deadlines.lock().unwrap().get(id).copied() {
+                  Some(at) => {
+                    let left = at.saturating_sub(castellan_core::now_unix());
+                    format!("FROZEN — thaw with `castellan thaw {id}` (auto-kill in {}:{:02})", left / 60, left % 60)
+                  }
+                  None => format!("FROZEN — thaw with `castellan thaw {id}`"),
+                }
+              } else {
+                format!("session {id} resumed")
+              };
+              self.banner(id, &line);
+            }
+            format!("{id}: {}", state.as_str())
+          }
+          Err(e) => format!("{id}: error {e}"),
+        }
       })
       .collect();
     Response::ok().with_message(msgs.join(", ")).with_sessions(self.reports())
+  }
+
+  /// P21.4: persist (or clear) the auto-kill deadline on the session row.
+  /// Read-modify-write of a single field; called from the freeze/thaw
+  /// dispatch path only (the timer thread never writes rows), so it does
+  /// not race the spawn-time write. Failure is non-fatal: the in-memory
+  /// deadline still applies this boot; the row just won't survive a
+  /// restart.
+  fn persist_kill_deadline(&self, id: &str, kill_at: Option<u64>) {
+    let path = Self::state_dir()
+      .join("castellan/sessions")
+      .join(format!("{id}.json"));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+      return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+      return;
+    };
+    match kill_at {
+      Some(at) => v["kill_at"] = serde_json::json!(at),
+      None => {
+        if let Some(obj) = v.as_object_mut() {
+          obj.remove("kill_at");
+        }
+      }
+    }
+    let _ = std::fs::write(&path, v.to_string());
+  }
+
+  /// P21.4: write a line to the session's terminal. The daemon is outside
+  /// the frozen scope, so it can write while the session is descheduled;
+  /// the supervisor cannot (a frozen cgroup stops every member). The tty
+  /// comes from the session's recorded launcher_tty (kernel tty_nr); the
+  /// minor is `tty_nr & 0xff` on Linux (major in bits 8..11), so the pty
+  /// slave is `/dev/pts/<minor>`. Opened O_WRONLY|O_NOCTTY: O_NOCTTY so
+  /// the daemon never acquires a controlling terminal, O_NONBLOCK so a
+  /// full/absent reader cannot block the freeze path. Best-effort: any
+  /// failure is silent (the spine row and `status` remain the record).
+  fn banner(&self, id: &SessionId, line: &str) {
+    let tty_nr = {
+      let reg = self.registry.lock().unwrap();
+      reg.get(id).map(|s| s.launcher_tty).unwrap_or(0)
+    };
+    if tty_nr == 0 {
+      return;
+    }
+    // kernel new_encode_dev: minor low byte in bits 0..7, minor high bits
+    // in bits 12..23 (a plain `& 0xff` breaks at /dev/pts/256).
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+    let path = format!("/dev/pts/{minor}");
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+      .write(true)
+      .custom_flags(nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK)
+      .open(&path)
+    else {
+      return;
+    };
+    use std::io::Write as _;
+    let _ = f.write_all(format!("\r\n{line}\r\n").as_bytes());
+    let _ = f.flush();
+  }
+
+  /// P21.4: the auto-kill timer tick. A session whose deadline passed
+  /// while still frozen is SIGKILLed (scope + egress proxy torn down
+  /// like `kill`), an `auto_kill` spine row records it, and the deadline
+  /// is removed. A session that was thawed already lost its deadline at
+  /// thaw time, so this never races a deliberate thaw into a kill: the
+  /// last decision wins. Restart note: deadlines are daemon-memory, so a
+  /// restart mid-count restarts the window (documented).
+  fn run_freeze_deadlines(&self) {
+    let now = castellan_core::now_unix();
+    let due: Vec<SessionId> = {
+      let mut d = self.freeze_deadlines.lock().unwrap();
+      let due: Vec<SessionId> = d
+        .iter()
+        .filter(|(_, deadline)| **deadline <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+      for id in &due {
+        d.remove(id);
+      }
+      due
+    };
+    for id in due {
+      // only kill what is still frozen — a concurrent thaw means the
+      // operator returned; the deadline is already gone, this is belt
+      // and braces against a stale snapshot.
+      if self.root.freeze_state(&id).unwrap_or(FreezeState::Missing) != FreezeState::Frozen {
+        continue;
+      }
+      if let Some(h) = self.proxies.lock().unwrap().remove(&id) {
+        drop(h);
+      }
+      let harness = {
+        let reg = self.registry.lock().unwrap();
+        reg.get(&id).map(|s| s.harness.clone())
+      };
+      if let Some(h) = harness {
+        self.end_audit(&id, &h);
+      }
+      let _ = self.root.set_freeze(&id, false);
+      let killed = self.root.kill_all(&id).unwrap_or(0);
+      if let Ok(sink) = EventSink::for_session(&Self::state_dir(), &id) {
+        let _ = sink.emit("auto_kill", &format!("frozen past kill-after deadline, {killed} pid(s) killed"), "deny");
+      }
+      // tear the scope down and drop the registration exactly like
+      // `kill` does, so `status` does not keep listing a dead session.
+      let _ = self.root.destroy_session(&id);
+      self.registry.lock().unwrap().remove(&id);
+      eprintln!("castellan-daemon: auto-kill: session {id} frozen past its --kill-after deadline — {killed} pid(s) killed");
+    }
   }
 
   fn kill(&self, session: Option<&SessionId>) -> Response {
@@ -3434,6 +3636,7 @@ impl Daemon {
   }
 
   fn reports(&self) -> Vec<SessionReport> {
+    let deadlines = self.freeze_deadlines.lock().unwrap().clone();
     self
       .registry
       .lock()
@@ -3445,6 +3648,7 @@ impl Daemon {
         project: s.project.display().to_string(),
         state: self.root.freeze_state(&s.id).unwrap_or(FreezeState::Missing),
         pids: self.root.populate_count(&s.id),
+        kill_at: deadlines.get(&s.id).copied(),
       })
       .collect()
   }

@@ -4,14 +4,16 @@ Six phases. Each phase has a **kill criterion**: if the criterion fails, the pha
 
 ## Phase 0 — Substrate + freeze + QML toggle
 
-**Scope:** session identity (systemd user scope + env tag), cgroup.freeze wiring with daemon-owned freezer (commitment #1), Hyprland global keybind Super+Escape, top-bar toggle in the Omarchy agents panel, terminal-cooperative "FROZEN" status line, time-bounded freeze (auto-escalate to kill at 5min), fp-toggle biometric thaw.
+**Status: BUILT (core), 2026-10-09.** The daemon (unix socket, scope creation, freezer ownership), `castellan freeze|thaw|kill` verbs, the daemonless cgroupfs paths, the daemon unit with `ExecStopPost` freeze-all, the launcher watchdog, the freeze banner, opt-in `--kill-after-m`, and the desktop oneshot units are built and acceptance-tested (p18 27/0, p19 5/0, p20 34/0, p21-freeze-ux 8/0, p21-desktop 18/0 on kernel 7.1.8). Contrib: the Hyprland keybind snippet and Quickshell panel (`contrib/omarchy/`). Designed, not built: fp-toggle biometric thaw, thaw double-confirm, lock-screen freeze.
+
+**Scope:** session identity (systemd user scope + env tag), cgroup.freeze wiring with daemon-owned freezer (commitment #1), Hyprland global keybind Super+Escape, top-bar toggle in the Omarchy agents panel, terminal-cooperative "FROZEN" status line, opt-in auto-kill (`--kill-after-m`), fp-toggle biometric thaw.
 
 **Deliverables:**
-- `castellan-daemon` skeleton (unix socket, scope creation via zbus/dbus, freezer ownership)
-- `castellan-freeze` CLI shim (toggle/all/status)
-- Quickshell QML plugin for the agents panel
-- Hyprland keybind config
-- fp-toggle integration for thaw
+- `castellan-daemon` (unix socket, scope creation, freezer ownership) ✅
+- freeze/thaw/kill CLI verbs + daemonless cgroupfs paths ✅
+- Quickshell QML panel (contrib) ✅
+- Hyprland keybind config (contrib) ✅
+- fp-toggle integration for thaw (designed)
 
 **Kill criterion:** freeze + thaw works on 5 concurrent sessions across 3 harness brands (claude, codex, pi) with zero self-thaw attempts succeeding. Latency < 50ms. No daemon crash on session exit.
 

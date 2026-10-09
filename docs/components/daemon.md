@@ -114,6 +114,25 @@ tree. If it is built, it complements the launcher watchdog; it does not replace 
 - The CLI connects to the daemon's unix socket; a missing daemon is a hard error
   (`castellan daemon not reachable ...`), not auto-started.
 
+## Egress allowlist sources (precedence)
+
+The per-session destination allowlist is resolved at launch, in order (P21.1):
+
+1. `--allow-host` flags on `launch`
+2. `CASTELLAN_EGRESS_ALLOW_HOSTS` (comma-separated launcher-shell env list)
+3. `egress.toml` `allow_hosts` entries
+4. derived: the launcher shell's `*_BASE_URL` / `OLLAMA_HOST` values, else a
+   tight per-harness default (exact canonical API hosts: `api.anthropic.com`,
+   `api.openai.com` + `auth.openai.com`, the Google APIs). Every derived entry
+   is named in the launch banner and recorded as an `egress_derived` spine row
+   with its source; `CASTELLAN_EGRESS_DEFAULTS=0` turns the derived tier off.
+   Project-local files (`settings.json` and friends) are never consulted: the
+   project is a write root for the agent, so a project-supplied host list
+   would be agent-controlled policy.
+
+The same resolved list feeds the B8 broker and the egress proxy, so kernel
+and proxy never disagree.
+
 ## Degrade modes
 
 - Daemon absent: the CLI prints "castellan daemon not reachable at <socket>: ..." then "start it with: castellan-daemon". No crash.

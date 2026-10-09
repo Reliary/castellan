@@ -237,9 +237,9 @@ jobs:
           echo "error-severity findings: $n"
           [ "$n" -eq 0 ]
 
-  # Test-count ratchet (reliary8 pattern). 241 measured 2026-10-08
-  # (+5 P21.3 watch diff/bless/notification unit tests over the P21.1
-  # count; 236 at P21.1, 230 with the P20 family pins).
+  # Test-count ratchet (reliary8 pattern). 243 measured 2026-10-09
+  # (+2 P21.5 completion-table unit tests over the P21.4 count; 241 at
+  # P21.4, 236 at P21.1, 230 with the P20 family pins).
   # A drop means suites/tests disappeared — bump the floor deliberately
   # in the same PR that removes a test, never silently.
   test-ratchet:
@@ -254,7 +254,7 @@ jobs:
           grep -E 'test result:' test.log || true
       - name: Assert count >= floor
         run: |
-          FLOOR=241
+          FLOOR=243
           total=$(awk '/test result:/{for(i=1;i<=NF;i++) if($i ~ /^passed/) s+=$(i-1)} END{print s+0}' test.log)
           echo "workspace tests: $total (floor $FLOOR)"
           [ "$total" -ge "$FLOOR" ]

@@ -1,5 +1,6 @@
 use std::io::Write;
 
+mod completions;
 mod lifecycle;
 mod watch;
 
@@ -25,6 +26,7 @@ fn main() {
     "init" => lifecycle::run_init(&args[1..]),
     "doctor" => lifecycle::run_doctor(),
     "watch" => watch::run_watch(&path, &args[1..]),
+    "completions" => completions::run_completions(&args[1..]),
     "version" | "--version" | "-V" => lifecycle::version(),
     _ => {}
   }
@@ -44,6 +46,13 @@ fn main() {
     // This is the unit's ExecStopPost path (the daemon is gone by then).
     "freeze" if args.get(1).map(|a| a == "--daemonless").unwrap_or(false) => {
       lifecycle::freeze_all_local()
+    }
+    // P21.5: daemonless thaw — the desktop keybind path (`castellan-thaw`
+    // oneshot unit). Same equal-power argument as freeze --daemonless: an
+    // enveloped agent cannot write cgroup.freeze (F12, EPERM live), and an
+    // unconfined same-uid process needs no CLI to do it either.
+    "thaw" if args.get(1).map(|a| a == "--daemonless").unwrap_or(false) => {
+      lifecycle::thaw_all_local()
     }
     "freeze" => freeze_req(&args[1..], "freeze"),
     "thaw" => freeze_req(&args[1..], "thaw"),
@@ -1968,6 +1977,8 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
   eprintln!("  castellan proxy [status|off [session]]   egress proxy control (P12)");
   eprintln!("  castellan freeze --daemonless          freeze every scope via cgroupfs (no daemon; unit ExecStopPost)");
+  eprintln!("  castellan thaw --daemonless            thaw every scope via cgroupfs (no daemon; desktop keybind path)");
+  eprintln!("  castellan completions <bash|zsh|fish>  print shell completions");
   eprintln!("  castellan service [install [--skip-preflight|--no-start]|uninstall|stop|status|logs [-f]]");
   eprintln!("  castellan uninstall [--yes] [--keep-data] [--keep-config]   remove service, sessions, state, keyring");
   eprintln!("  castellan gc [--yes] [--keep-last N] [--older-than DAYS]    prune old session state");

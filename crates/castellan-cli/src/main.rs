@@ -1,6 +1,7 @@
 use std::io::Write;
 
 mod lifecycle;
+mod watch;
 
 fn main() {
   let path = match std::env::var("XDG_RUNTIME_DIR") {
@@ -23,6 +24,7 @@ fn main() {
     "gc" => lifecycle::run_gc(&args[1..]),
     "init" => lifecycle::run_init(&args[1..]),
     "doctor" => lifecycle::run_doctor(),
+    "watch" => watch::run_watch(&path, &args[1..]),
     "version" | "--version" | "-V" => lifecycle::version(),
     _ => {}
   }
@@ -96,19 +98,25 @@ fn main() {
     Ok(_) => {
       // P21.2: `cert --json` emits the raw certificate object so the
       // documented flow (`cert <session> --json > cert.json` then
-      // `verify cert.json`) works. Everything else renders for humans.
-      let as_json = args[0] == "cert" && args.iter().any(|a| a == "--json");
+      // `verify cert.json`) works. P21.3: `status --json` emits the raw
+      // status response for scripts and desktop panels. Everything else
+      // renders for humans.
+      let as_json = (args[0] == "cert" || args[0] == "status")
+        && args.iter().any(|a| a == "--json");
       if as_json {
-        let out = serde_json::from_str::<serde_json::Value>(&line)
-          .ok()
-          .and_then(|v| v.get("extra").and_then(|e| e.get("cert")).cloned());
+        let v = serde_json::from_str::<serde_json::Value>(&line).ok();
+        let out = if args[0] == "cert" {
+          v.and_then(|v| v.get("extra").and_then(|e| e.get("cert")).cloned())
+        } else {
+          v
+        };
         match out {
-          Some(cert) => println!(
+          Some(obj) => println!(
             "{}",
-            serde_json::to_string_pretty(&cert).unwrap_or_else(|_| "{}".into())
+            serde_json::to_string_pretty(&obj).unwrap_or_else(|_| "{}".into())
           ),
           None => {
-            eprintln!("cert: daemon returned no certificate");
+            eprintln!("{}: daemon returned no data", args[0]);
             std::process::exit(1);
           }
         }
@@ -1663,11 +1671,24 @@ fn render(line: &str) -> String {
             out.push_str(&format!("attempts_left: {attempts}\n"));
           }
           if let Some(pending) = bless.get("pending").and_then(|p| p.as_array()) {
+            if pending.is_empty() {
+              out.push_str("no expansion requests pending\n");
+            } else {
+              out.push_str(&format!(
+                "{:<9} {:<16} {:<38} {}\n",
+                "HINT", "WANT", "SESSION", "APPROVE WITH"
+              ));
+            }
             for p in pending {
               let hint = p.get("nonce_hint").and_then(|x| x.as_str()).unwrap_or("?");
               let want = p.get("want").and_then(|x| x.as_str()).unwrap_or("?");
               let sess = p.get("session").and_then(|x| x.as_str()).unwrap_or("?");
-              out.push_str(&format!("  pending {want} for {sess} (hint {hint}) — nonce in daemon journal\n"));
+              out.push_str(&format!(
+                "{hint:<9} {want:<16} {sess:<38} castellan bless approve {hint}\n"
+              ));
+            }
+            if !pending.is_empty() {
+              out.push_str("  (the full nonce is in the launcher's terminal / daemon journal)\n");
             }
           }
         }
@@ -1897,6 +1918,8 @@ fn print_usage_and_exit() -> ! {
   eprintln!();
   eprintln!("usage:");
   eprintln!("  castellan status                 list sessions and freeze states");
+  eprintln!("  castellan status --json          raw status response for scripts/panels");
+  eprintln!("  castellan watch                  follow freeze + bless transitions (desktop notifications when available)");
   eprintln!("  castellan freeze [session]       freeze all sessions or one");
   eprintln!("  castellan thaw   [session]       thaw all sessions or one");
   eprintln!("  castellan kill   [session]       kill all sessions or one");

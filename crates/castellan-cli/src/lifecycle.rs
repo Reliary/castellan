@@ -358,6 +358,8 @@ fn cmd_service(args: &[String]) -> ! {
       }
       print!("{}", exec_stdout(&["is-active", UNIT_NAME]));
       println!("service installed and started");
+      println!("next: `castellan init` to scaffold keyring.toml + egress.toml, then `castellan launch -- claude`");
+      println!("tips: `castellan watch` follows freeze/expansion events; `castellan bless show` lists pending expansions");
       std::process::exit(0);
     }
     "uninstall" => uninstall(&args[1..]),
@@ -441,6 +443,14 @@ fn uninstall(args: &[String]) -> ! {
   if unit_path().exists() {
     let _ = std::fs::remove_file(unit_path());
     println!("removed {}", unit_path().display());
+  }
+  // P21.3: the optional watcher unit (installed by `watch --user-unit`)
+  let watch_unit = unit_path().with_file_name("castellan-watch.service");
+  if watch_unit.exists() {
+    let _ = systemctl(&["stop", "castellan-watch.service"]);
+    let _ = systemctl(&["disable", "castellan-watch.service"]);
+    let _ = std::fs::remove_file(&watch_unit);
+    println!("removed {}", watch_unit.display());
   }
   let _ = systemctl(&["daemon-reload"]);
 

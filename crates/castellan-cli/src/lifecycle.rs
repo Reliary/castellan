@@ -312,7 +312,7 @@ fn unit_contents(daemon: &Path, cli: &Path, skip_preflight: bool) -> String {
 pub fn freeze_all_local() -> ! {
   let scopes = live_scopes();
   if scopes.is_empty() {
-    println!("no session scopes to freeze");
+    println!("no running sessions to freeze");
     std::process::exit(0);
   }
   let root = match castellan_freezer::CgroupRoot::detect() {
@@ -334,7 +334,7 @@ pub fn freeze_all_local() -> ! {
       Err(_) => failed += 1,
     }
   }
-  println!("froze {froze} session scope(s), {failed} failed");
+  println!("froze {froze} sessions, {failed} failed");
   std::process::exit(if failed > 0 { 1 } else { 0 });
 }
 
@@ -346,7 +346,7 @@ pub fn freeze_all_local() -> ! {
 pub fn thaw_all_local() -> ! {
   let scopes = live_scopes();
   if scopes.is_empty() {
-    println!("no session scopes to thaw");
+    println!("no running sessions to thaw");
     std::process::exit(0);
   }
   let root = match castellan_freezer::CgroupRoot::detect() {
@@ -368,7 +368,7 @@ pub fn thaw_all_local() -> ! {
       Err(_) => failed += 1,
     }
   }
-  println!("thawed {thawed} session scope(s), {failed} failed");
+  println!("thawed {thawed} sessions, {failed} failed");
   std::process::exit(if failed > 0 { 1 } else { 0 });
 }
 

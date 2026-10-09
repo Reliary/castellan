@@ -233,7 +233,7 @@ impl EgressPolicy {
   }
 
   /// P13 ninja F12: audit posture — `--no-enforce`'s banner promises
-  /// "observation only, no containment", so EVERY default deny is off
+  /// "writes are logged, nothing is blocked", so EVERY default deny is off
   /// (escape ports, systemd, buses, deputies, stub pairs). The daemon's
   /// AuditWatcher is what records WOULD-DENY (daemon-side, no broker
   /// needed); with an allow-everything policy the broker would record

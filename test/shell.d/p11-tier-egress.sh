@@ -143,8 +143,8 @@ U="$XDG_STATE_HOME/castellan/sessions/${SID1}/overlay/upper"
 if [ -f "$U/out.txt" ]; then ok "K1: session ran under the floor (allowlist honored, not bricked)"
 elif [ -f "$P0/out.txt" ]; then ok "K1: session ran under the floor (allowlist honored, not bricked)"
 else bad "K1: the session produced no work (sid=${SID1:-none}); the floor may still be bricking the agent"; fi
-grep -q "egress restricted" "$W/k1.out" && ok "K1b: the launcher announced the egress restriction" \
-  || grep -q "tier floor active" "$W/d.log" && ok "K1b: the daemon logged the tier floor firing" \
+grep -q "network: only these hosts are reachable" "$W/k1.out" && ok "K1b: the launcher announced the egress restriction" \
+  || grep -q "strict profile active" "$W/d.log" && ok "K1b: the daemon logged the tier floor firing" \
   || bad "K1b: no egress-restriction notice anywhere (floor did not fire?)"
 
 echo
@@ -163,8 +163,8 @@ PW="$W/warm"; mkproj "$PW"
 SIDW=$(SHELL=/bin/sh script -qec "$RL
   rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$PW' -- bash -c 'echo hi > $PW/w.txt'
 " /dev/null 2>"$W/k3.err" | tr -d '\r' | grep -o 's[0-9a-f]\{12,\}' | head -1)
-if grep -q "trust tier <= 1" "$W/k3.err"; then bad "K3: the floor fired on a cold/warm project"; else ok "K3: the floor did not fire on a non-low project"; fi
-if grep -q "egress restricted" "$W/k3.err"; then bad "K3b: egress was restricted on a non-low project"; else ok "K3b: egress unrestricted on a non-low project"; fi
+if grep -q "this project is untrusted" "$W/k3.err"; then bad "K3: the floor fired on a cold/warm project"; else ok "K3: the floor did not fire on a non-low project"; fi
+if grep -q "network: only these hosts are reachable" "$W/k3.err"; then bad "K3b: egress was restricted on a non-low project"; else ok "K3b: egress unrestricted on a non-low project"; fi
 
 echo
 echo "== K5a: the census distinguishes the two postures =="
@@ -228,12 +228,12 @@ fi
 if grep -q K4-INNER-DONE "$W/k4-inner.log" 2>/dev/null; then
   mkproj "$P0"
   SHELL=/bin/sh script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' --grant egress -- bash -c 'echo H > out.txt'" /dev/null >"$W/k4c.out" 2>&1
-  grep -q "consumed expansion grant" "$W/k4c.out" && ok "K4b: the launcher consumed the egress grant" \
+  grep -q "one-shot approval: network access" "$W/k4c.out" && ok "K4b: the launcher consumed the egress grant" \
     || bad "K4b: the grant was not consumed: $(grep -i 'grant\|tier' "$W/k4c.out" | tr '\n' ' ')"
   # and the one after it is floored again — the grant is one-shot
   mkproj "$P0"
   SHELL=/bin/sh script -qec "$RL rl XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$P0' -- bash -c 'true'" /dev/null >"$W/k4d.out" 2>&1
-  grep -q "trust tier <= 1" "$W/k4d.out" && ok "K4c: the floor returns after the one-shot grant is spent" \
+  grep -q "this project is untrusted" "$W/k4d.out" && ok "K4c: the floor returns after the one-shot grant is spent" \
     || bad "K4c: the grant did not expire (floor still lifted): $(grep -i 'tier\|grant' "$W/k4d.out" | tr '\n' ' ')"
 else
   bad "K4: inner pty did not complete (see $W/k4-inner.log)"

@@ -64,12 +64,12 @@ pub fn run_watch(sock: &str, args: &[String]) -> ! {
     match &prev {
       None => {
         println!(
-          "watching {} session(s){}",
+          "watching {} sessions{}",
           snap.sessions.len(),
           if snap.pending_bless.is_empty() {
             String::new()
           } else {
-            format!(", {} bless request(s) pending", snap.pending_bless.len())
+            format!(" — {} approval request(s) pending", snap.pending_bless.len())
           }
         );
       }

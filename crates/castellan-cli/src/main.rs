@@ -224,10 +224,30 @@ fn userns_probe() -> bool {
 }
 
 fn freeze_req(args: &[String], op: &str) -> serde_json::Value {
-  match args.first() {
+  // P21.4: freeze carries an optional auto-kill deadline
+  // (`--kill-after-m=N`). Default (absent): freeze indefinitely.
+  let kill_after_m = args
+    .iter()
+    .position(|a| a == "--kill-after-m" || a.starts_with("--kill-after-m="))
+    .and_then(|i| {
+      let a = &args[i];
+      if let Some(v) = a.strip_prefix("--kill-after-m=") {
+        v.parse::<u64>().ok()
+      } else {
+        args.get(i + 1).and_then(|v| v.parse().ok())
+      }
+    });
+  let session = args.iter().find(|a| !a.starts_with("--"));
+  let mut req = match session {
     Some(id) => serde_json::json!({"op": op, "session": id}),
     None => serde_json::json!({"op": op}),
+  };
+  if op == "freeze" {
+    if let Some(m) = kill_after_m {
+      req["kill_after_m"] = serde_json::json!(m);
+    }
   }
+  req
 }
 fn undo_req(args: &[String], verb: &str) -> serde_json::Value {
   let Some(id) = args.first() else {
@@ -1182,6 +1202,12 @@ fn launch(args: &[String], sock: &str) -> ! {
       let watchdog_session = session.clone();
       let watchdog_sock = sock.to_string();
       eprintln!("castellan: watchdog armed (grace 5s)");
+      // P21.4 design note (found live on .227): the freeze banner is NOT
+      // printed here. The supervisor (and these threads) live in the
+      // session scope, so a frozen cgroup deschedules every process in
+      // it — nothing in-scope can run while frozen. The banner is written
+      // by the DAEMON (outside the scope) to the session's pty slave, the
+      // same mechanism `wall` uses. See Daemon::banner.
       // F3 follow-up 5: daemon singleton (see daemon main.rs) is the
       // structural fix for stacked listeners; the watchdog covers the
       // true single-daemon death.
@@ -1920,7 +1946,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan status                 list sessions and freeze states");
   eprintln!("  castellan status --json          raw status response for scripts/panels");
   eprintln!("  castellan watch                  follow freeze + bless transitions (desktop notifications when available)");
-  eprintln!("  castellan freeze [session]       freeze all sessions or one");
+  eprintln!("  castellan freeze [session] [--kill-after-m N]   freeze all sessions or one (opt-in auto-kill after N minutes)");
   eprintln!("  castellan thaw   [session]       thaw all sessions or one");
   eprintln!("  castellan kill   [session]       kill all sessions or one");
   eprintln!("  castellan spawn --harness H [--project P] [--pid PID]");

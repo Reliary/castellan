@@ -227,6 +227,17 @@ else
 fi
 
 echo
+echo "== J1: the launch message names the real keyring state =="
+# Bound direction: this daemon loaded 1 credential, so the line must
+# say "injecting", not "no saved credentials". (The empty-keyring
+# direction is asserted at the end, after a daemon restart.)
+if tr -d '\r' < "$W/env1.launch" | grep -q "injecting 1 saved credential(s) for their hosts; other auth passes through"; then
+  ok "J1a: bound keyring message names injection and pass-through"
+else
+  bad "J1a: bound message wrong: $(tr -d '\r' < "$W/env1.launch" | grep -m1 'network proxy' | head -c 160)"
+fi
+
+echo
 echo "== K3c/K12: in-session CONNECT through the proxy =="
 # Session binds its own loopback listener (the upstream), CONNECTs the
 # proxy to it, completes TLS against the session CA, sends a request.
@@ -450,6 +461,30 @@ except OSError as e: print(f'post:E{e.errno}')" "$K4PORT")
   echo "$INSIDE" | grep -q "direct=E1" && ok "K4c: direct egress still EPERM for the session (kernel path independent)" \
     || bad "K4c: direct path from inside: $(echo "$INSIDE" | tr '\n' ' ' | head -c 200)"
 fi
+
+echo
+echo "== J1: empty keyring says so (fresh-install direction) =="
+kill "$DPID" 2>/dev/null
+wait "$DPID" 2>/dev/null
+EMPTYCFG="$W/emptycfg/castellan"
+mkdir -p "$EMPTYCFG"
+rm -f "$SOCK"
+XDG_CONFIG_HOME="$W/emptycfg" XDG_STATE_HOME="$XDG_STATE_HOME" \
+  "$BIN_DIR/castellan-daemon" > "$W/d-empty.log" 2>&1 &
+DPID=$!
+for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done
+PE="$W/pw-empty"; mkproj "$PE"
+script -qec "
+  XDG_CONFIG_HOME='$W/emptycfg' XDG_STATE_HOME='$XDG_STATE_HOME' '$BIN' launch --harness claude --project '$PE' -- true
+" /dev/null >"$W/empty.launch" 2>&1
+if tr -d '\r' < "$W/empty.launch" | grep -q "no saved credentials; your agent's own auth passes through"; then
+  ok "J1b: empty keyring message names pass-through"
+else
+  bad "J1b: empty message wrong: $(tr -d '\r' < "$W/empty.launch" | grep -m1 'network proxy' | head -c 160)"
+fi
+grep -q "sessions use their own auth" "$W/d-empty.log" \
+  && ok "J1c: daemon log names the empty-keyring posture" \
+  || bad "J1c: daemon log line missing: $(grep -m1 keyring "$W/d-empty.log" | head -c 140)"
 
 echo
 kill "$DPID" 2>/dev/null

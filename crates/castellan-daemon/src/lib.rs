@@ -472,7 +472,7 @@ impl Daemon {
         let path = cfgdir.join("castellan/keyring.toml");
         let k = castellan_keyring::Keyring::load(&path);
         if k.is_empty() {
-          eprintln!("castellan-daemon: no keyring at {} — proxy runs without injection", path.display());
+          eprintln!("castellan-daemon: no keyring at {} — sessions use their own auth", path.display());
         } else {
           eprintln!(
             "castellan-daemon: keyring loaded ({} credential(s), sha={})",
@@ -3122,6 +3122,7 @@ impl Daemon {
           "proxy_port": proxy_port,
           "ca_cert": ca_cert,
           "keyring_sha": self.keyring.sha(),
+          "keyring_entries": self.keyring.len(),
         }),
       )
   }

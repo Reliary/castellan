@@ -69,7 +69,7 @@ _castellan() {{
       return 0
       ;;
     service)
-      COMPREPLY=( $(compgen -W "install uninstall stop status logs" -- "$cur") )
+      COMPREPLY=( $(compgen -W "install restart uninstall stop status logs" -- "$cur") )
       return 0
       ;;
   esac
@@ -104,7 +104,7 @@ _castellan() {{
   fi
   case "$words[2]" in
     completions) _values 'shell' bash zsh fish ;;
-    service) _values 'subcommand' install uninstall stop status logs ;;
+    service) _values 'subcommand' install restart uninstall stop status logs ;;
     bless) _values 'subcommand' request approve reject show ;;
     freeze|thaw|kill|adopt|audit|cert|replay|radar|trace) _values 'flag' --kill-after-m ;;
   esac
@@ -121,7 +121,7 @@ fn fish_script() -> String {
         lines.push_str(&format!("complete -c castellan -n '__fish_use_subcommand' -a '{v}'\n"));
     }
     lines.push_str("complete -c castellan -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'\n");
-    lines.push_str("complete -c castellan -n '__fish_seen_subcommand_from service' -a 'install uninstall stop status logs'\n");
+    lines.push_str("complete -c castellan -n '__fish_seen_subcommand_from service' -a 'install restart uninstall stop status logs'\n");
     lines.push_str("complete -c castellan -n '__fish_seen_subcommand_from bless' -a 'request approve reject show'\n");
     lines.push_str("complete -c castellan -n '__fish_seen_subcommand_from freeze thaw kill adopt audit cert replay radar trace' -l kill-after-m -r\n");
     lines

@@ -1999,7 +1999,7 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan freeze --daemonless          freeze every scope via cgroupfs (no daemon; unit ExecStopPost)");
   eprintln!("  castellan thaw --daemonless            thaw every scope via cgroupfs (no daemon; desktop keybind path)");
   eprintln!("  castellan completions <bash|zsh|fish>  print shell completions");
-  eprintln!("  castellan service [install [--skip-preflight|--no-start]|uninstall|stop|status|logs [-f]]");
+  eprintln!("  castellan service [install [--skip-preflight|--no-start]|restart|uninstall|stop|status|logs [-f]]");
   eprintln!("  castellan uninstall [--yes] [--keep-data] [--keep-config]   remove service, sessions, state, keyring");
   eprintln!("  castellan gc [--yes] [--keep-last N] [--older-than DAYS]    prune old session state");
   eprintln!("  castellan init [--force]         scaffold keyring.toml + egress.toml");

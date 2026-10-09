@@ -55,15 +55,18 @@ This is a small project maintained by one person. There is no backport queue.
 
 ## How to report
 
-**Use private vulnerability reporting.** On this repository, go to
-**Security → Report a vulnerability**. That opens a private advisory thread visible only
-to you and the maintainer, and it becomes the public record if and when you agree to
-disclose.
+**Use private vulnerability reporting.** Open
+**https://github.com/Reliary/castellan/security/advisories/new** (or go to
+**Security → Report a vulnerability** on the repository page). That opens a private
+advisory thread visible only to you and the maintainer, and it becomes the public record
+if and when you agree to disclose. The repository's security overview lives at
+**https://github.com/Reliary/castellan/security**.
 
 Please do not open a public issue for a working bypass. That is the one request here.
 
-If private reporting is unavailable to you for any reason, open an issue that says only
-"security report available on request" with no detail, and it will be picked up.
+If private reporting is unavailable to you for any reason, open an issue at
+**https://github.com/Reliary/castellan/issues** that says only "security report
+available on request" with no detail, and it will be picked up.
 
 I aim to acknowledge within a week. **There is no fix-time promise.** One maintainer, no
 triage rota, no SLA. If a report needs work I cannot get to promptly, I will say so

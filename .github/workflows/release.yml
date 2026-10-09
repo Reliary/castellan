@@ -4,15 +4,20 @@ on:
   push:
     tags: ['v*']
 
-# id-token: write — keyless cosign (OIDC → Fulcio). Signing is blocking:
-# a release that cannot be signed must not publish unsigned.
+# Top level stays read-only; the writes belong to the release job
+# (Scorecard Token-Permissions #7).
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    # id-token: write — keyless cosign (OIDC → Fulcio). contents: write —
+    # release assets + tags. Signing is blocking: a release that cannot
+    # be signed must not publish unsigned.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Privilege-bearing job (id-token: write + contents: write): every

@@ -65,7 +65,7 @@ SHELL=/bin/sh script -qec "
   cd '$P'
   '$BIN/castellan' launch --project '$P' -- sleep 300 > '$W/launch.out' 2>&1 &
   for _ in \$(seq 1 50); do
-    grep -q 'launched' '$W/launch.out' && break
+    grep -q 'started' '$W/launch.out' && break
     sleep 0.1
   done
   sleep 0.5
@@ -98,7 +98,7 @@ echo
 echo "== K18: the daemonless verbs cannot freeze from inside the envelope =="
 # The property is "cannot freeze", not "nonzero exit": measured live, the
 # enveloped verb cannot even SEE the scopes (Landlock read rules hide
-# cgroupfs), so it exits 0 with "no session scopes to freeze" — and the
+# cgroupfs), so it exits 0 with "no running sessions to freeze" — and the
 # scope stays unfrozen. Assert the property, and the negative control.
 P18="$W/env"; mkdir -p "$P18"
 SHELL=/bin/sh script -qec "
@@ -111,7 +111,7 @@ STATE18=$(cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).servi
 if [ -z "$SID18" ]; then
   bad "K18: envelope session never launched: $(tail -2 "$W/env-launch.out" | tr '\n' ' ')"
 elif [ "$STATE18" = "0" ]; then
-  ok "K18: enveloped session $SID18 still unfrozen after freeze --daemonless ($(grep -m1 'scopes to freeze' "$W/env-launch.out" || echo 'verb output: see log'))"
+  ok "K18: enveloped session $SID18 still unfrozen after freeze --daemonless ($(grep -m1 'running sessions to freeze' "$W/env-launch.out" || echo 'verb output: see log'))"
 else
   bad "K18: ENVELOPED freeze --daemonless FROZE the scope (cgroup.freeze=$STATE18) — escape"
 fi

@@ -2970,9 +2970,9 @@ impl Daemon {
     }
     if low_trust && granted.is_empty() {
       eprintln!(
-        "castellan-daemon: tier floor active for {} — enforce+undo+egress-restrict (allowlist: {})",
+        "castellan-daemon: strict profile active for {} — writes confined, undo on, network limited (allowlist: {})",
         project.display(),
-        if allow_hosts.is_empty() { "none (deny-all egress)".into() } else { allow_hosts.join(", ") }
+        if allow_hosts.is_empty() { "none (all egress denied)".into() } else { allow_hosts.join(", ") }
       );
     }
     let config_sha = project_config_sha(&project);

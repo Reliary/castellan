@@ -782,7 +782,7 @@ fn launch(args: &[String], sock: &str) -> ! {
     .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
     .unwrap_or_default();
   if forced {
-    eprintln!("castellan: trust tier <= 1 — forcing enforce+undo+net-restrict (fail-closed)");
+    eprintln!("castellan: this project is untrusted — strict profile on: writes confined, undo on, network limited");
     enforce = true;
     undo = true;
     // P11: destination-scoped egress is forced (the broker allowlist
@@ -792,11 +792,11 @@ fn launch(args: &[String], sock: &str) -> ! {
     // itself — the tier-0 deadlock found live on 2026-09-16.
     net_restrict = true;
   } else if cold_forced_undo {
-    eprintln!("castellan: no trust history — forcing undo for this first session (keep or undo to earn the default)");
+    eprintln!("castellan: first session here — undo is on; keep or undo once to earn your own default");
     undo = true;
   }
   if profile_net_restrict && !net_restrict {
-    eprintln!("castellan: daemon set the destination policy (net-restrict)");
+    eprintln!("castellan: the daemon enabled network limits for this session");
   }
   net_restrict = profile_net_restrict;
   let allow_hosts = if profile_allow_hosts.is_empty() {
@@ -805,7 +805,16 @@ fn launch(args: &[String], sock: &str) -> ! {
     profile_allow_hosts
   };
   if !consumed.is_empty() {
-    eprintln!("castellan: consumed expansion grant(s): {}", consumed.join(", "));
+    let labels: Vec<&str> = consumed
+      .iter()
+      .map(|g| match g.as_str() {
+        "egress" => "network access",
+        "config-dir" => "config writes",
+        "system-config" => "system config writes",
+        other => other,
+      })
+      .collect();
+    eprintln!("castellan: using your one-shot approval: {}", labels.join(", "));
   }
   // P13 E-h/E-e advisories: the envelope cannot fix either (host-config
   // facts, not kernel gaps), so they surface where the other forced-
@@ -821,8 +830,7 @@ fn launch(args: &[String], sock: &str) -> ! {
       // tooling runs them next.
       if home.starts_with(&proj) {
         eprintln!(
-          "castellan: WARNING: project {} contains $HOME — agent writes reach shell rc/.ssh/.git-hooks (P13 E-h)",
-          proj.display()
+          "castellan: WARNING: the project is your home directory — agent writes can reach shell startup files and .ssh keys"
         );
       }
     }
@@ -833,7 +841,7 @@ fn launch(args: &[String], sock: &str) -> ! {
     // required host logs one sudo line per day, not per launch.
     if sudo_nopasswd_cached() {
       eprintln!(
-        "castellan: WARNING: `sudo -n` succeeds (NOPASSWD) — session uid boundary does not imply unprivileged (P13 E-e)"
+        "castellan: WARNING: sudo runs without a password — an agent here can become root, which defeats the sandbox"
       );
     }
   }
@@ -1064,12 +1072,12 @@ fn launch(args: &[String], sock: &str) -> ! {
     }
   }
   if !enforce {
-    eprintln!("castellan: AUDIT MODE — observation only, no containment (--no-enforce)");
+    eprintln!("castellan: DEBUG MODE — writes are logged, nothing is blocked (--no-enforce)");
   }
   eprintln!(
-    "castellan session {session}{}{} launched",
-    if enforce { ", enforced" } else { "" },
-    if undo { ", undoable" } else { "" }
+    "castellan session {session} started{}{}",
+    if enforce { " — confined" } else { "" },
+    if undo { ", undo on" } else { "" }
   );
   // B8.2: install the seccomp user-notification broker. It closes the
   // T4 escape (unix sockaddr_un paths no filesystem rule covers) and,
@@ -1080,7 +1088,7 @@ fn launch(args: &[String], sock: &str) -> ! {
   //
   // P13 ninja F12: PLAIN audit mode (--no-enforce without an explicit
   // destination policy) must not install the filter at all — the banner
-  // above promises "observation only, no containment", and every broker
+  // above promises nothing is blocked, and every broker
   // deny (escape ports, systemd, buses, deputies) is containment.
   // WOULD-DENY writes are recorded daemon-side by the AuditWatcher,
   // which never needed the broker; with a permissive policy the broker
@@ -1130,20 +1138,19 @@ fn launch(args: &[String], sock: &str) -> ! {
       .unwrap_or_default();
     if !allow_hosts.is_empty() {
       eprintln!(
-        "castellan: egress restricted to loopback + {} host(s): {}",
-        allow_hosts.len(),
+        "castellan: network: only these hosts are reachable: {}",
         allow_hosts.join(", ")
       );
       if !derived.is_empty() {
         eprintln!(
-          "castellan: {} of these were derived for harness `{}` (no allowlist declared) — pin them with --allow-host or egress.toml to silence this",
+          "castellan: {} came from {}'s default endpoint — make it permanent with --allow-host",
           derived.len(),
           harness
         );
       }
     } else {
-      eprintln!("castellan: egress restricted to loopback only — the agent will not reach its LLM API");
-      eprintln!("castellan: declare one with --allow-host HOST, CASTELLAN_EGRESS_ALLOW_HOSTS, or egress.toml [llm] hosts");
+      eprintln!("castellan: network: nothing off this machine is reachable — the agent cannot reach its LLM API");
+      eprintln!("castellan: add it with --allow-host HOST or in egress.toml");
     }
   }
   let broker = castellan_broker::spawn_broker();
@@ -1221,7 +1228,7 @@ fn launch(args: &[String], sock: &str) -> ! {
       // stalls run() harmlessly (no more notifications arrive).
       let watchdog_session = session.clone();
       let watchdog_sock = sock.to_string();
-      eprintln!("castellan: watchdog armed (grace 5s)");
+      eprintln!("castellan: daemon-loss watchdog on");
       // P21.4 design note (found live on .227): the freeze banner is NOT
       // printed here. The supervisor (and these threads) live in the
       // session scope, so a frozen cgroup deschedules every process in
@@ -1405,7 +1412,7 @@ fn sudo_nopasswd_cached() -> bool {
           if std::time::Instant::now() >= deadline {
             let _ = c.kill();
             let _ = c.wait();
-            eprintln!("castellan: sudo probe timed out after 1s — NOPASSWD check skipped");
+            eprintln!("castellan: sudo probe timed out after 1s — passwordless-sudo check skipped");
             break;
           }
           std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1722,7 +1729,7 @@ fn render(line: &str) -> String {
             } else {
               out.push_str(&format!(
                 "{:<9} {:<16} {:<38} {}\n",
-                "HINT", "WANT", "SESSION", "APPROVE WITH"
+                "CODE", "WANT", "SESSION", "APPROVE WITH"
               ));
             }
             for p in pending {
@@ -1948,9 +1955,10 @@ fn render(line: &str) -> String {
           .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
           .unwrap_or_default();
         out.push_str(&format!(
-          "profile: tier {tier}, enforce={enforce} undo={undo} net={net}{}{}\n",
-          if forced { " (FORCED fail-closed)" } else { "" },
-          if grants.is_empty() { String::new() } else { format!(" grants={}", grants.join(",")) }
+          "profile: tier {tier}, writes={} undo={undo} network={net}{}{}\n",
+          if enforce { "confined" } else { "logged only" },
+          if forced { " (strict profile forced)" } else { "" },
+          if grants.is_empty() { String::new() } else { format!(" one-shot approval: {}", grants.join(",")) }
         ));
       }
       out
@@ -1985,19 +1993,19 @@ fn print_usage_and_exit() -> ! {
   eprintln!("  castellan campaign <project>     slow-drip campaign signals (report only)");
   eprintln!("  castellan canary <session>     show the session's planted decoy credentials");
   eprintln!("  castellan trust [project]      show the project's trust score and tier");
-  eprintln!("  castellan cert <session>          assemble a ProofCertificate (signed when the daemon has a key)");
+  eprintln!("  castellan cert <session>          issue a signed proof certificate (bounds, tests, chain)");
   eprintln!("  castellan verify <cert.json|-> [--key <hex>]   verify a certificate's signature + chain");
-  eprintln!("  castellan replay <session> [narrower-project]   permissive-case delta");
-  eprintln!("  castellan radar <session> [project]   HV fingerprint + anomaly flag (opt-in)");
-  eprintln!("  castellan drill [run|status]           live-fire self-test suite (P8)");
-  eprintln!("  castellan channels [run|status]        exfil channel census (P9.1, report-only)");
-  eprintln!("  castellan trace <session>              contact tracing (P9.3, exposure scored)");
-  eprintln!("  castellan policycheck <proj> <cand>    policy regression replay (P9.6, advisory)");
-  eprintln!("  castellan memory [recall <session>|status]   immune memory (P8.1, advisory)");
-  eprintln!("  castellan voice approve <session> <utterance>   acoustic channel (P8.3)");
-  eprintln!("  castellan proxy [status|off [session]]   egress proxy control (P12)");
-  eprintln!("  castellan freeze --daemonless          freeze every scope via cgroupfs (no daemon; unit ExecStopPost)");
-  eprintln!("  castellan thaw --daemonless            thaw every scope via cgroupfs (no daemon; desktop keybind path)");
+  eprintln!("  castellan replay <session> [narrower-project]   what a stricter sandbox would have blocked");
+  eprintln!("  castellan radar <session> [project]   project fingerprint + anomaly warning (experimental, advisory)");
+  eprintln!("  castellan drill [run|status]           self-test: attacks this machine, reports what held");
+  eprintln!("  castellan channels [run|status]        what could leave a session (report only)");
+  eprintln!("  castellan trace <session>              which sessions read files a compromised session touched");
+  eprintln!("  castellan policycheck <proj> <cand>    compare sandbox policy between two projects (advisory)");
+  eprintln!("  castellan memory [recall <session>|status]   lessons from past incidents (advisory)");
+  eprintln!("  castellan voice approve <session> <utterance>   approve by spoken phrase (experimental)");
+  eprintln!("  castellan proxy [status|off [session]]   network proxy: status / turn off");
+  eprintln!("  castellan freeze --daemonless          freeze every session via cgroupfs (no daemon; used by the unit on stop)");
+  eprintln!("  castellan thaw --daemonless            thaw every session via cgroupfs (no daemon; desktop keybind)");
   eprintln!("  castellan completions <bash|zsh|fish>  print shell completions");
   eprintln!("  castellan service [install [--skip-preflight|--no-start]|restart|uninstall|stop|status|logs [-f]]");
   eprintln!("  castellan uninstall [--yes] [--keep-data] [--keep-config]   remove service, sessions, state, keyring");

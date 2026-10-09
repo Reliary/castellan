@@ -88,11 +88,16 @@ OUT=$(script -qec "
 " /dev/null)
 echo "$OUT" > "$WORK/floor.out"
 grep -q "RAN_OK" "$WORK/floor.out" && ok "session ran under the floor (no net deadlock)" || bad "session did not run"
-grep -q "forcing enforce+undo+net-restrict" "$WORK/floor.out" && ok "enforce+undo+net-restrict forced (banner)" || bad "floor banner missing the expected shape"
+grep -q "strict profile on: writes confined, undo on, network limited" "$WORK/floor.out" && ok "enforce+undo+net-restrict forced (banner)" || bad "floor banner missing the expected shape"
+# The port-scoped-net deadlock is discriminated by RAN_OK above (the
+# API is reachable under the destination policy; port-scoped net would
+# deny it too and the session would fail). This grep is only a guard
+# that the old banner shape — which could not distinguish the two — does
+# not come back.
 if grep -q "forcing enforce+undo+net$\|forcing enforce+undo+net " "$WORK/floor.out"; then
-  bad "port-scoped net is forced again — the tier-0 API deadlock is back"
+  bad "the old ambiguous floor banner shape is back"
 else
-  ok "port-scoped net NOT forced (the deadlock regression)"
+  ok "the old ambiguous floor banner shape is gone"
 fi
 
 # ---- B. --net applies when requested (port parse) -------------------

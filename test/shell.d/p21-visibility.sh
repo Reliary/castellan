@@ -105,7 +105,7 @@ SID2=$(rpc "{\"op\":\"spawn\",\"harness\":\"claude\",\"project\":\"$P2\",\"pid\"
   | python3 -c 'import json,sys,re; m=json.load(sys.stdin).get("message",""); s=re.search(r"session (\S+)",m); print(s.group(1) if s else "")')
 rpc "{\"op\":\"bless_request\",\"session\":\"$SID2\",\"want\":\"egress\",\"reason\":\"watch-suite\"}" >/dev/null
 BSHOW=$(PATH="$W/mockbin:$PATH" "$BIN/castellan" bless show 2>&1)
-if echo "$BSHOW" | grep -q "HINT" && echo "$BSHOW" | grep -q "egress"; then
+if echo "$BSHOW" | grep -q "CODE" && echo "$BSHOW" | grep -q "egress"; then
   ok "K10a: bless show lists the request (pretty)"
 else bad "K10a: bless show did not list it: $(echo "$BSHOW" | head -3 | tr '\n' ' ')"; fi
 if echo "$BSHOW" | grep -q "castellan bless approve"; then

@@ -449,6 +449,39 @@ fn cmd_service(args: &[String]) -> ! {
       std::process::exit(0);
     }
     "uninstall" => uninstall(&args[1..]),
+    "restart" => {
+      // The keyring loads once at daemon start (P12 K5: config sha pinned
+      // per session), so editing keyring.toml requires a restart, not a
+      // reload. systemctl restart when the unit is installed; otherwise
+      // stop the manual daemon and let the caller start it again.
+      let unit_known = systemctl_ok(&["cat", UNIT_NAME]);
+      if unit_known {
+        if !systemctl_ok(&["restart", UNIT_NAME]) {
+          eprintln!("service restart: `systemctl --user restart {UNIT_NAME}` failed");
+          eprintln!("see: journalctl --user -u {UNIT_NAME}");
+          std::process::exit(1);
+        }
+        let mut up = false;
+        for _ in 0..50 {
+          if std::os::unix::net::UnixStream::connect(sock_path()).is_ok() {
+            up = true;
+            break;
+          }
+          std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if up {
+          println!("service restarted — new keyring loaded");
+        } else {
+          println!("service restarted, but the socket is not answering yet");
+          println!("see: journalctl --user -u {UNIT_NAME}");
+        }
+      } else {
+        let n = stop_daemon_processes();
+        let _ = std::fs::remove_file(sock_path());
+        println!("stopped {n} daemon process(es) — start one with `castellan-daemon`");
+      }
+      std::process::exit(0);
+    }
     "stop" => {
       let _ = systemctl(&["stop", UNIT_NAME]);
       stop_daemon_processes();
@@ -498,7 +531,7 @@ fn cmd_service(args: &[String]) -> ! {
       }
     }
     other => {
-      eprintln!("usage: castellan service [install [--skip-preflight]|[--no-start]|uninstall|status|stop|logs [-f]]");
+      eprintln!("usage: castellan service [install [--skip-preflight]|[--no-start]|restart|uninstall|status|stop|logs [-f]]");
       eprintln!("  (unknown subcommand: {other})");
       std::process::exit(2);
     }
@@ -708,7 +741,7 @@ fn cmd_init(args: &[String]) -> ! {
     }
     println!("wrote {}", egress.display());
   }
-  println!("edit these, then: castellan service install");
+  println!("edit these, then: castellan service restart");
   std::process::exit(0);
 }
 

@@ -141,6 +141,32 @@ n=$("$BIN/castellan" service logs 2>/dev/null | wc -l)
 [[ "$n" -gt 0 ]] && ok "service logs produced $n lines" || bad "service logs empty"
 
 echo
+echo "===== J3: service restart reloads the keyring ====="
+# The keyring loads once at daemon start (P12 K5 pins the config sha), so
+# editing keyring.toml needs a restart. Write a credential, restart, and
+# assert the daemon journal shows it loaded one.
+mkdir -p "$CONF_DIR"
+cat > "$CONF_DIR/keyring.toml" <<'KEYRING'
+[[credential]]
+name = "j3"
+scheme = "bearer"
+token = "J3-RESTART-TOKEN-not-a-secret"
+hosts = ["api.example.com"]
+KEYRING
+restart_out=$("$BIN/castellan" service restart 2>&1)
+echo "  $restart_out"
+if echo "$restart_out" | grep -q "service restarted"; then
+  ok "J3a: service restart exits reporting a restart"
+else
+  bad "J3a: restart output: $(echo "$restart_out" | head -2 | tr '\n' ' ')"
+fi
+for _ in $(seq 1 50); do "$BIN/castellan" status >/dev/null 2>&1 && break; sleep 0.2; done
+journalctl --user -u "$UNIT" --no-pager -n 40 2>/dev/null | grep -q "keyring loaded (1 credential" \
+  && ok "J3b: daemon loaded the edited keyring after restart" \
+  || bad "J3b: journal does not show keyring loaded (1 credential): $(journalctl --user -u "$UNIT" --no-pager -n 5 2>/dev/null | tr '\n' ' ' | head -c 200)"
+rm -f "$CONF_DIR/keyring.toml"
+
+echo
 echo "===== service stop drops the socket ====="
 "$BIN/castellan" service stop >/dev/null 2>&1 || note "service stop returned nonzero"
 sleep 0.5

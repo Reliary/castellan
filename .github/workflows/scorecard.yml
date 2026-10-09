@@ -5,6 +5,9 @@ on:
     - cron: '30 7 * * 1'
   push:
     branches: [main, quattro, diff-trust]
+  # Manual trigger so a re-score can be forced after a protection or
+  # pinning change, without waiting for Monday.
+  workflow_dispatch:
 
 # Top level stays read-only: scorecard's webapp verifies permission
 # PLACEMENT and rejects the publish with 400 "global perm is set to

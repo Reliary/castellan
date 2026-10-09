@@ -8,14 +8,20 @@ on:
   schedule:
     - cron: '30 8 * * 1'
 
+# Top level stays read-only: writes belong to the job that needs them
+# (Scorecard Token-Permissions #6; same placement rule as scorecard.yml).
 permissions:
   actions: read
   contents: read
-  security-events: write
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      # SARIF upload to code scanning.
+      security-events: write
     strategy:
       fail-fast: false
       matrix:

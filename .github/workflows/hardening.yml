@@ -15,22 +15,30 @@ permissions:
 # the copies diverge silently).
 jobs:
   # Privilege-bearing pin lint (review F-1): release.yml holds
-  # id-token: write + contents: write — a mutable action ref there can
-  # mint a valid keyless cosign signature for forged artifacts. Every
-  # `uses:` in release.yml must be a full 40-hex SHA. The grep is
-  # written so a SHA-with-comment matches and anything else fails.
+  # action-pins: every `uses:` in every workflow must be a full 40-hex
+  # commit SHA. Started as release.yml-only (that job holds
+  # id-token: write + contents: write, where a mutable ref can mint a
+  # valid keyless cosign signature for forged artifacts). Extended to
+  # all workflows because the repo enables sha_pinning_required at the
+  # organization-adjacent setting, and a tag-moving action is a
+  # supply-chain risk anywhere it runs. The grep is written so a
+  # SHA-with-comment matches and anything else fails.
   action-pins:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: release.yml action refs must be SHA-pinned
+      - name: every workflow's action refs must be SHA-pinned
         run: |
           rc=0
-          for ref in $(grep -ohE 'uses: *[^ ]+' .github/workflows/release.yml | sed 's/.*@//'); do
+          # Only step lines of the form `uses: owner/repo@ref` (with or
+          # without a leading `- `) are action refs. The `@` requirement
+          # skips local actions (`./path`, no ref) and the grep skips
+          # this script's own pattern text.
+          for ref in $(grep -ohE '^\s*(- )?uses: [^ @]+@[^ ]+' .github/workflows/*.yml | sed 's/.*@//' | sort -u); do
             if echo "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
               echo "  pinned ok: $ref"
             else
-              echo "  MUTABLE action ref in release.yml: $ref"
+              echo "  MUTABLE action ref: $ref"
               rc=1
             fi
           done
@@ -47,8 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable@2026-10-03
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build release binaries
         run: cargo build --release -p castellan-cli -p castellan-daemon
       - name: Assert PIE / NX / Full RELRO (both binaries)

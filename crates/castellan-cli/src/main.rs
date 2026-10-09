@@ -854,6 +854,11 @@ fn launch(args: &[String], sock: &str) -> ! {
     .and_then(|v| v.as_str())
     .unwrap_or("")
     .to_string();
+  let keyring_entries: usize = profile
+    .as_ref()
+    .and_then(|p| p.get("keyring_entries"))
+    .and_then(|v| v.as_u64())
+    .unwrap_or(0) as usize;
   if proxy_port > 0 && !ca_cert.is_empty() {
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
     unsafe {
@@ -869,9 +874,15 @@ fn launch(args: &[String], sock: &str) -> ! {
       std::env::set_var("CARGO_HTTP_CAINFO", &ca_cert);
       std::env::set_var("CURL_CA_BUNDLE", &ca_cert);
     }
-    eprintln!(
-      "castellan: egress via session proxy 127.0.0.1:{proxy_port} (real credentials injected daemon-side)"
-    );
+    if keyring_entries == 0 {
+      eprintln!(
+        "castellan: network proxy on 127.0.0.1:{proxy_port} — no saved credentials; your agent's own auth passes through"
+      );
+    } else {
+      eprintln!(
+        "castellan: network proxy on 127.0.0.1:{proxy_port} — injecting {keyring_entries} saved credential(s) for their hosts; other auth passes through"
+      );
+    }
   }
   let _ = &session;
   // F3 follow-up 10 (2026-09-27, .227 breakout): the watchdog needs a

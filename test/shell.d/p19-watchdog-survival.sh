@@ -31,7 +31,7 @@ DAPID=""
 cleanup() {
   [[ -n "$DAPID" ]] && kill "$DAPID" 2>/dev/null
   pkill -9 -f "castellan-daemon" 2>/dev/null
-  pkill -9 -f "castellan launch --project /tmp/cast-p19" 2>/dev/null
+  pkill -9 -f "castellan launch --project /tmp/cast-p19-$(id -u)" 2>/dev/null
   pkill -9 -f "cast-p19.*time.sleep" 2>/dev/null
   pkill -9 -f "time.sleep" 2>/dev/null
   rm -f "$SOCK"
@@ -73,18 +73,18 @@ start_daemon() {
 echo
 echo "===== ARM A: daemon loss with terminal intact (the built property) ====="
 start_daemon || { bad "daemon failed to start"; exit 1; }
-mkdir -p /tmp/cast-p19
+mkdir -p /tmp/cast-p19-$(id -u)
 # launch a long-lived session under its own pty; keep it attached.
-setsid script -qec "$BIN/castellan launch --project /tmp/cast-p19 -- sleep 300" /dev/null \
-  >/tmp/cast-p19/armA.log 2>&1 &
+setsid script -qec "$BIN/castellan launch --project /tmp/cast-p19-$(id -u) -- sleep 300" /dev/null \
+  >/tmp/cast-p19-$(id -u)/armA.log 2>&1 &
 SCRIPT_A=$!
 sleep 3
-SID_A=$(grep -oE 's[0-9a-f]{16,24}' /tmp/cast-p19/armA.log | head -1)
-SUP_A=$(pgrep -f "castellan launch --project /tmp/cast-p19" | head -1)
+SID_A=$(grep -oE 's[0-9a-f]{16,24}' /tmp/cast-p19-$(id -u)/armA.log | head -1)
+SUP_A=$(pgrep -f "castellan launch --project /tmp/cast-p19-$(id -u)" | head -1)
 if [[ -n "$SID_A" && -n "$SUP_A" ]]; then
   ok "launch session active (sid=$SID_A sup=$SUP_A)"
 else
-  bad "could not establish launch session (sid=$SID_A sup=$SUP_A)"; cat /tmp/cast-p19/armA.log
+  bad "could not establish launch session (sid=$SID_A sup=$SUP_A)"; cat /tmp/cast-p19-$(id -u)/armA.log
 fi
 frozen "$SID_A" && bad "session frozen before daemon death (unexpected)" || ok "session not frozen with daemon alive"
 
@@ -104,16 +104,16 @@ echo "===== ARM B: agent survives its terminal, THEN daemon loss (the open quest
 # launcher supervisor, which dies with the terminal — so the orphaned agent
 # has no guard left. This arm proves or disproves that.
 start_daemon || { bad "daemon (B) failed to start"; exit 1; }
-setsid script -qec "$BIN/castellan launch --project /tmp/cast-p19 -- python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(300)'" \
-  /dev/null >/tmp/cast-p19/armB.log 2>&1 &
+setsid script -qec "$BIN/castellan launch --project /tmp/cast-p19-$(id -u) -- python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(300)'" \
+  /dev/null >/tmp/cast-p19-$(id -u)/armB.log 2>&1 &
 sleep 3
-SID_B=$(grep -oE 's[0-9a-f]{16,24}' /tmp/cast-p19/armB.log | head -1)
+SID_B=$(grep -oE 's[0-9a-f]{16,24}' /tmp/cast-p19-$(id -u)/armB.log | head -1)
 AGENT_B=$(pgrep -f 'time.sleep' | tail -1)
 # Match the pty wrapper for THIS project only: a bare 'script -qec'
 # also matches the suite's own wrapper when nested inside one.
 SCRIPT_B=$(pgrep -f 'script -qec.*cast-p19.*time.sleep' | head -1)
 [[ -n "$SID_B" && -n "$AGENT_B" ]] && ok "launch session active (sid=$SID_B agent=$AGENT_B)" \
-  || { bad "could not establish session B"; cat /tmp/cast-p19/armB.log; }
+  || { bad "could not establish session B"; cat /tmp/cast-p19-$(id -u)/armB.log; }
 
 echo "  -- closing the launcher's terminal (SIGKILL the pty wrapper) --"
 kill -9 "$SCRIPT_B" 2>/dev/null

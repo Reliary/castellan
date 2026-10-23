@@ -51,7 +51,7 @@ rm -rf "$XDG_STATE_HOME"
 mkdir -p "$XDG_STATE_HOME"
 start_daemon() {
   stop_daemon
-  "$BIN/castellan-daemon" > /tmp/castellan-p9stack-daemon.log 2>&1 &
+  "$BIN/castellan-daemon" > /tmp/castellan-p9stack-daemon-$(id -u).log 2>&1 &
   DAPID=$!
   # wait for the socket, not a fixed sleep (startup can exceed 1s)
   for _ in $(seq 1 50); do
@@ -63,7 +63,7 @@ start_daemon() {
 
 start_daemon
 
-mkdir -p /tmp/cast-p9-witness
+mkdir -p /tmp/cast-p9-witness-$(id -u)
 witness_keep() { # witness_keep <sid> — keep from the session's launcher tty.
   # R7 made every session tty-launched (headless JoinSession is gated),
   # and human_tty_ok for session-scoped ops is now an EXACT match on
@@ -100,10 +100,10 @@ EVID=$(sqlite3 $XDG_STATE_HOME/castellan/trust.db "SELECT evidence_json FROM eve
 echo "$EVID" | grep -q "blast-radius weight" && ok "hub weight reported ($EVID)" || bad "no hub weight: $EVID"
 
 # artifact scan: baseline at spawn, delta at keep (clean here)
-grep -q "artifact scan" /tmp/castellan-p9stack-daemon.log && ok "artifact scan ran" || bad "no artifact scan in log"
+grep -q "artifact scan" /tmp/castellan-p9stack-daemon-$(id -u).log && ok "artifact scan ran" || bad "no artifact scan in log"
 
 # decoys untouched -> no signal
-grep -q "decoy" /tmp/castellan-p9stack-daemon.log && bad "decoy signal on clean session" || ok "decoys untouched (no signal)"
+grep -q "decoy" /tmp/castellan-p9stack-daemon-$(id -u).log && bad "decoy signal on clean session" || ok "decoys untouched (no signal)"
 
 # cert carries the factors
 OUT=$("$BIN/castellan" cert "$SID_A" 2>&1)
@@ -121,7 +121,7 @@ DECOY_DIR=$XDG_STATE_HOME/castellan/sessions/$SID_B/decoy
 printf 'int handle(struct item *it) {\n  return *it;\n}\n' > "$DECOY_DIR/decoy_validate.c"
 OUT=$(witness_keep "$SID_B")
 sleep 2
-grep -q "DECOY TRIP" /tmp/castellan-p9stack-daemon.log && ok "decoy weaponized -> DECOY TRIP" || bad "no decoy trip: $(tail -3 /tmp/castellan-p9stack-daemon.log)"
+grep -q "DECOY TRIP" /tmp/castellan-p9stack-daemon-$(id -u).log && ok "decoy weaponized -> DECOY TRIP" || bad "no decoy trip: $(tail -3 /tmp/castellan-p9stack-daemon-$(id -u).log)"
 
 echo "== Trace: B exposed (wrote A's file after A) =="
 OUT=$("$BIN/castellan" trace "$SID_A" 2>&1)

@@ -34,7 +34,7 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/castellan"
 SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID_}/castellan.sock"
 SLICE="/sys/fs/cgroup/user.slice/user-$UID_.slice/user@$UID_.service/castellan.slice"
 SNAP="${TMPDIR:-/tmp}/castellan-p18-snapshot-$(date +%s).txt"
-W=/tmp/cast-p18-work
+W=/tmp/cast-p18-work-$(id -u)
 mkdir -p "$W"
 PASS=0; FAIL=0; NOTE=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -104,14 +104,14 @@ echo
 echo "===== a confined session is visible in status (stays live for the run) ====="
 LIVE_PID=""
 if [[ -S "$SOCK" ]]; then
-  mkdir -p /tmp/cast-p18
+  mkdir -p /tmp/cast-p18-$(id -u)
   # Long-lived agent: kept alive so later steps exercise stop/uninstall
   # against a REAL live session (P20 G10) instead of planted files.
   # SHELL=/bin/sh: `script -qec` uses $SHELL; on fish boxes (e.g. .227)
   # a POSIX body fails.
   ( SHELL=/bin/sh script -qec "
       BIN=$BIN/castellan
-      \$BIN launch --project /tmp/cast-p18 -- sleep 120
+      \$BIN launch --project /tmp/cast-p18-$(id -u) -- sleep 120
     " /dev/null >"$W/p18-live.log" 2>&1 & )
   for _ in $(seq 1 50); do
     grep -qE 's[0-9a-f]{16,24}' "$W/p18-live.log" 2>/dev/null && break

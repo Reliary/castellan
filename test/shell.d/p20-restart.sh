@@ -31,7 +31,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/castellan"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/castellan"
 SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID_}/castellan.sock"
 SLICE="/sys/fs/cgroup/user.slice/user-$UID_.slice/user@$UID_.service/castellan.slice"
-W=/tmp/cast-p20
+W=/tmp/cast-p20-$(id -u)
 PASS=0; FAIL=0; NOTE=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -48,7 +48,7 @@ cleanup() {
   # left, opening the fifo blocks forever, and a blocked child holding
   # this script's stdout would keep the invoking session open.
   ( exec >/dev/null 2>&1; timeout 2 sh -c "printf 'quit\n' > \"\$1\"" sh "$W/cmdfifo" ) &
-  pkill -9 -f 'castellan launch --project /tmp/cast-p20' 2>/dev/null
+  pkill -9 -f "castellan launch --project /tmp/cast-p20-$(id -u)" 2>/dev/null
   pkill -9 -x castellan-daemo 2>/dev/null
   systemctl --user stop "$UNIT" 2>/dev/null
   systemctl --user disable "$UNIT" 2>/dev/null

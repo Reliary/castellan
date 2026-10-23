@@ -52,7 +52,7 @@ start_daemon() {
   local envs="$1"
   stop_daemon
   # shellcheck disable=SC2086
-  env $envs "$BIN/castellan-daemon" > /tmp/castellan-drill-daemon.log 2>&1 &
+  env $envs "$BIN/castellan-daemon" > /tmp/castellan-drill-daemon-$(id -u).log 2>&1 &
   DAPID=$!
   # wait for the socket, not a fixed sleep (bind can exceed 1s)
   for _ in $(seq 1 50); do

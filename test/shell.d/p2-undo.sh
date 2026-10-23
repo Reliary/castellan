@@ -7,7 +7,7 @@
 set -u
 BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}/castellan"
 DAEMON="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}/castellan-daemon"
-export XDG_STATE_HOME=/tmp/cast-p2/state
+export XDG_STATE_HOME=/tmp/cast-p2-$(id -u)/state
 PASS=0; FAIL=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -15,12 +15,12 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2' got '$3')
 
 echo "== pre-clean stale state =="
 pkill -x castellan-daemon 2>/dev/null; sleep 0.3
-rm -rf /tmp/cast-p2/state /run/user/$(id -u)/castellan.sock
+rm -rf /tmp/cast-p2-$(id -u)/state /run/user/$(id -u)/castellan.sock
 mkdir -p "$XDG_STATE_HOME"
 ok "stale state cleaned"
 
 echo "== start daemon =="
-"$DAEMON" >/tmp/cast-p2/daemon.log 2>&1 &
+"$DAEMON" >/tmp/cast-p2-$(id -u)/daemon.log 2>&1 &
 DPID=$!
 # wait for the socket, not a fixed sleep (startup >1s on real state dir)
 for _ in $(seq 1 50); do
@@ -29,7 +29,7 @@ for _ in $(seq 1 50); do
 done
 "$BIN" status >/dev/null 2>&1 && ok "daemon started" || { bad "daemon not responding"; exit 1; }
 
-W=$(mktemp -d /tmp/cast-p2/proj.XXXX)
+W=$(mktemp -d /tmp/cast-p2-$(id -u)/proj.XXXX)
 echo original > "$W/keep.txt"
 echo v1 > "$W/edit.txt"
 

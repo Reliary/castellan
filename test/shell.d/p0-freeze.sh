@@ -80,10 +80,10 @@ echo "== freeze one session (S2) =="
 # daemon-witnessed tty. The witness launch uses a trivial child
 # (fast: launch is synchronous) and kills its own session afterwards
 # (same pty) so the registry stays clean.
-mkdir -p /tmp/cast-p0-op
+mkdir -p /tmp/cast-p0-op-$(id -u)
 out=$(script -qec '
   BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
-  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  OUT=$($BIN launch --project /tmp/cast-p0-op-$(id -u) -- true 2>&1)
   WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
   $BIN freeze '"$S2"' 2>&1
   $BIN kill $WSID >/dev/null 2>&1
@@ -118,7 +118,7 @@ t=$(echo "$out" | grep ' pids  ' | grep -c thawed || true)
 echo "== thaw is a no-op on the killed session, others unaffected =="
 script -qec '
   BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
-  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  OUT=$($BIN launch --project /tmp/cast-p0-op-$(id -u) -- true 2>&1)
   WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
   $BIN kill '"$S2"' >/dev/null 2>&1
   $BIN kill $WSID >/dev/null 2>&1
@@ -133,7 +133,7 @@ echo "== freeze all / thaw all =="
 # it) and then running freeze/thaw in that same pty.
 script -qec '
   BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
-  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  OUT=$($BIN launch --project /tmp/cast-p0-op-$(id -u) -- true 2>&1)
   WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
   $BIN freeze >/dev/null 2>&1
   $BIN kill $WSID >/dev/null 2>&1
@@ -143,7 +143,7 @@ f=$(timeout 5 "$BIN/castellan" status 2>/dev/null | grep ' pids  ' | grep -c fro
 [[ "$f" -ge 2 ]] && ok "freeze-all froze remaining 2 (witnessed-tty gate passed)" || bad "freeze-all failed (got $f frozen)"
 script -qec '
   BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
-  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  OUT=$($BIN launch --project /tmp/cast-p0-op-$(id -u) -- true 2>&1)
   WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
   $BIN thaw >/dev/null 2>&1
   $BIN kill $WSID >/dev/null 2>&1
@@ -166,7 +166,7 @@ while time.time()<end: pass
 # B7: burner session spawned headlessly — freeze/kill from a witnessed pty
 script -qec '
   BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
-  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  OUT=$($BIN launch --project /tmp/cast-p0-op-$(id -u) -- true 2>&1)
   WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
   $BIN freeze '"$SB"' >/dev/null 2>&1
   $BIN kill $WSID >/dev/null 2>&1
@@ -178,7 +178,7 @@ u2=$(awk '{print $1}' "$CG/cpu.stat" | head -1)
 [[ "$u1" == "$u2" ]] && ok "cpu.stat unchanged while frozen ($u1)" || bad "frozen process consumed CPU ($u1 -> $u2)"
 script -qec '
   BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
-  OUT=$($BIN launch --project /tmp/cast-p0-op -- true 2>&1)
+  OUT=$($BIN launch --project /tmp/cast-p0-op-$(id -u) -- true 2>&1)
   WSID=$(echo "$OUT" | grep -oE "s[0-9a-f]{16,24}" | head -1)
   $BIN kill '"$SB"' >/dev/null 2>&1
   $BIN kill $WSID >/dev/null 2>&1

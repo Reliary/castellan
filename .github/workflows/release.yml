@@ -31,8 +31,11 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Privilege-bearing job (id-token: write + contents: write): every
       # action is SHA-pinned (review F-1 — the repo's own pinning rule).
       # rust-toolchain: pin is the stable BRANCH head (the action infers
@@ -61,6 +64,11 @@ jobs:
           fi
           if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${VERSION}"
+            exit 1
+          fi
+          if [ ! -s "release-notes/${GITHUB_REF_NAME}.md" ]; then
+            echo "release-notes/${GITHUB_REF_NAME}.md is missing or empty"
+            echo "write the release notes, commit them, then re-run"
             exit 1
           fi
       # Ordering convention made mechanical: a tag must not be cut from a

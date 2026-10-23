@@ -63,7 +63,9 @@ only, not read or egress blocking.
 ## Install
 
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified
-kernels: 7.0.3, 7.1.8 and 7.2.11 (x86_64). `preflight` runs 6 checks; all 6 must pass.
+kernels: 7.0.3, 7.1.8, 7.2.5 and 7.2.11 (x86_64). `preflight` runs 6 checks; all 6 must pass.
+The published tarball's documented install is exercised end to end on each
+release candidate, including inside an Omarchy 4.0.4 VM.
 
 Download the tarball for your architecture from the
 [latest release](https://github.com/Reliary/castellan/releases/latest) (MIT).

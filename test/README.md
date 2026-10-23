@@ -6,7 +6,8 @@ are separate and run in CI.
 
 ```sh
 cargo build --release --workspace
-test/run-all.sh              # green bar: 23 suites
+test/run-all.sh              # refuses unless the account has nothing to lose
+CASTELLAN_ALLOW_DESTRUCTIVE=1 test/run-all.sh   # green bar: 23 suites
 test/run-all.sh --local      # plus machine-local suites
 test/run-all.sh --only p1,p2 # subset by name prefix
 test/run-all.sh --list       # manifest with contexts
@@ -15,6 +16,11 @@ test/run-all.sh --list       # manifest with contexts
 `CASTELLAN_BIN_DIR` points the suite at any directory holding `castellan` and
 `castellan-daemon` (for example an extracted release tarball), so the battery
 can test shipped artifacts instead of a local build.
+
+The battery is destructive by design: suites kill this uid's daemons, freeze
+every session scope in its cgroup slice, install and remove real user units,
+and run `castellan uninstall --yes`. `CASTELLAN_ALLOW_DESTRUCTIVE=1` is the
+acknowledgement; CI sets it because it runs on a dedicated account.
 
 ## Contexts
 
@@ -70,7 +76,12 @@ passing when they are skipped.
 
 ## Last measured
 
-Green bar 23/23 on 2026-10-09 on both boxes, from an extracted artifact
+Green bar 23/23 on 2026-10-23 on both boxes, from an extracted artifact
 directory with `CASTELLAN_BIN_DIR` (no cargo): kernel 7.0.3 (dev box) and
-7.2.11 (exercise box, over ssh). The battery is not yet in CI: it needs a
-self-hosted runner with a real user session.
+7.2.11 (exercise box, over ssh).
+
+The battery runs on every push to `quattro` via `.github/workflows/battery.yml`
+on a self-hosted runner; `.github/workflows/battery-watch.yml` fails loudly if
+that runner goes offline or the newest mainline commit has no green run. The
+runner is documented in [docs/RUNNER.md](../docs/RUNNER.md). Local-only suites
+still need a box with their data; nothing in CI runs them.

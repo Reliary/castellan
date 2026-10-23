@@ -378,14 +378,36 @@ pub fn default_state_home() -> PathBuf {
 mod tests {
   use super::*;
 
-  fn tmp_db() -> TrustDb {
+  /// A scratch state dir that removes itself. The previous version keyed
+  /// the directory on a timestamp and never cleaned up, so every `cargo
+  /// test` run left one dir per test behind (112 in one measured run).
+  struct TestState(std::path::PathBuf);
+
+  impl Drop for TestState {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_dir_all(&self.0);
+    }
+  }
+
+  fn tmp_state() -> TestState {
     let ts = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
       .map(|d| d.as_nanos())
       .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("castellan-trust-test-{ts}"));
+    let dir = std::env::temp_dir().join(format!(
+      "castellan-trust-test-{}-{ts}",
+      std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
-    TrustDb::open(&dir).unwrap()
+    TestState(dir)
+  }
+
+  /// Returns the guard with the DB: bind both (`let (_state, db) = tmp_db()`)
+  /// so the directory is removed when the test ends.
+  fn tmp_db() -> (TestState, TrustDb) {
+    let state = tmp_state();
+    let db = TrustDb::open(&state.0).unwrap();
+    (state, db)
   }
 
   fn ev(session: &str, signal: Signal) -> TrustEvent {
@@ -402,7 +424,7 @@ mod tests {
 
   #[test]
   fn cold_start_is_tier_two() {
-    let db = tmp_db();
+    let (_state, db) = tmp_db();
     let t = db.score(Path::new("/tmp/foo")).unwrap();
     assert_eq!(t.score, COLD_START_SCORE);
     assert_eq!(t.tier, Tier::Two);
@@ -410,7 +432,7 @@ mod tests {
 
   #[test]
   fn revert_drops_to_tier_one() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let t = db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::UserRevert)).unwrap();
     assert_eq!(t.score, 20.0);
     assert_eq!(t.tier, Tier::One);
@@ -440,7 +462,7 @@ mod tests {
 
   #[test]
   fn canary_hit_floor_is_zero() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let t = db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::CanaryHit)).unwrap();
     assert_eq!(t.score, 0.0);
     assert_eq!(t.tier, Tier::Zero);
@@ -448,7 +470,7 @@ mod tests {
 
   #[test]
   fn forged_nonce_floor_is_zero() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let t = db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::ForgedNonce)).unwrap();
     assert_eq!(t.score, 0.0);
     assert_eq!(t.tier, Tier::Zero);
@@ -456,7 +478,7 @@ mod tests {
 
   #[test]
   fn clean_sessions_accumulate() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let mut t = db.score(Path::new("/tmp/foo")).unwrap();
     for i in 0..5 {
       t = db.apply(Path::new("/tmp/foo"), &ev(&format!("s{i}"), Signal::CleanSession)).unwrap();
@@ -467,7 +489,7 @@ mod tests {
 
   #[test]
   fn tier_ceiling_blocks_jump() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     // 5 clean sessions = 55, then a proof = 65 — still tier 2, no jump.
     for i in 0..5 {
       db.apply(Path::new("/tmp/foo"), &ev(&format!("s{i}"), Signal::CleanSession)).unwrap();
@@ -490,7 +512,7 @@ mod tests {
     // position. Fixed iteration count (no `while score < 80` — the
     // held tier no longer stops score growth, but fixed counts
     // terminate regardless).
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let p = Path::new("/tmp/c14window");
     db.apply(p, &ev_at(1_000_000, "s0", Signal::UserRevert)).unwrap();
     db.apply(p, &ev_at(1_000_001, "s1", Signal::ProofPassed)).unwrap();
@@ -506,7 +528,7 @@ mod tests {
   fn c14_window_opens_after_24h() {
     // C14a, second half: once TIER_CEILING_WINDOW_SECS have passed
     // since the last tier-up, the tier follows the score.
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let p = Path::new("/tmp/c14open");
     db.apply(p, &ev_at(1_000_000, "s0", Signal::UserRevert)).unwrap();
     db.apply(p, &ev_at(1_000_001, "s1", Signal::ProofPassed)).unwrap();
@@ -535,7 +557,7 @@ mod tests {
     // C14b: 30 farmed keeps (R3-lite shape) buy score but NOT tier 3
     // without a proof_passed row in the ledger. Score is unclamped
     // (honest position 80.0); only the tier is held.
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let p = Path::new("/tmp/c14farm");
     // spread applies over 3 windows so C14a never binds; only C14b can.
     let mut t = db.score(p).unwrap();
@@ -553,7 +575,7 @@ mod tests {
   fn c14_tier3_opens_with_proof() {
     // C14b, second half: the same farm WITH a proof row enters tier 3
     // once the window is open.
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let p = Path::new("/tmp/c14proof");
     db.apply(p, &ev_at(1_000_000, "p0", Signal::ProofPassed)).unwrap();
     let mut t = db.score(p).unwrap();
@@ -568,7 +590,7 @@ mod tests {
 
   #[test]
   fn events_ledger_is_reconstructible() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::UserRevert)).unwrap();
     db.apply(Path::new("/tmp/foo"), &ev("s2", Signal::CleanSession)).unwrap();
     let events = db.events(Path::new("/tmp/foo")).unwrap();
@@ -579,7 +601,7 @@ mod tests {
 
   #[test]
   fn projects_are_isolated() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     db.apply(Path::new("/tmp/foo"), &ev("s1", Signal::UserRevert)).unwrap();
     let t = db.score(Path::new("/tmp/bar")).unwrap();
     assert_eq!(t.score, COLD_START_SCORE);
@@ -587,7 +609,7 @@ mod tests {
 
   #[test]
   fn poisoned_future_ts_is_a_loud_error_not_a_wrap() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     let huge = ev_at(u64::MAX, "s", Signal::CleanSession);
     let err = db.apply(Path::new("/tmp/poison-ts"), &huge).unwrap_err();
     assert!(
@@ -598,7 +620,7 @@ mod tests {
 
   #[test]
   fn negative_stored_ts_is_a_loud_error_on_read() {
-    let mut db = tmp_db();
+    let (_state, mut db) = tmp_db();
     db.apply(Path::new("/tmp/poison-read"), &ev_at(1_000, "s", Signal::CleanSession)).unwrap();
     db.conn
       .execute("UPDATE projects SET last_event_ts = -1", [])

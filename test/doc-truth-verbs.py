@@ -114,6 +114,35 @@ def main() -> int:
         print(f"FAIL: help advertises {missing_comp} but completions.rs omits them")
         return 1
     print(f"completions table covers all {len(adv)} advertised verbs")
+
+    # README install fence: one version, and it must be the version in the
+    # tree. A mixed line (`...v0.5.2... ...v0.5.0...`) shipped on the README
+    # once and the copy-paste command failed with "No such file".
+    readme = open("README.md").read()
+    m = re.search(r"## Install\b.*?```sh\n(.*?)```", readme, re.S)
+    if not m:
+        print("FAIL: README has no Install sh fence")
+        return 1
+    block = m.group(1)
+    literals = set(re.findall(r"castellan(?:-daemon)?-v(\d+\.\d+\.\d+)-linux-", block))
+    assigns = set(re.findall(r"^VERSION=(\d+\.\d+\.\d+)\s", block, re.M))
+    versions = literals | assigns
+    if len(versions) > 1:
+        print(f"FAIL: README Install block names several versions: {sorted(versions)}")
+        return 1
+    if not versions:
+        print("FAIL: README Install block names no version")
+        return 1
+    cargo = open("Cargo.toml").read()
+    vm = re.search(r'^version = "(\d+\.\d+\.\d+)"', cargo, re.M)
+    want = vm.group(1) if vm else "?"
+    if versions != {want}:
+        print(f"FAIL: README Install block ({sorted(versions)}) does not match Cargo.toml ({want})")
+        return 1
+    if "${VERSION}" not in block and not literals:
+        print("FAIL: README Install block does not name a versioned tarball")
+        return 1
+    print(f"README Install block is single-version and matches Cargo.toml ({want})")
     return 0
 
 

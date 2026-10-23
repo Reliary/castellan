@@ -48,23 +48,38 @@ jobs:
       - name: Run the battery
         env:
           CASTELLAN_BIN_DIR: ${{ runner.temp }}/bin
+          CASTELLAN_LOG_DIR: ${{ runner.temp }}/battery-logs
+          CASTELLAN_ALLOW_DESTRUCTIVE: "1"
           SHELL: /bin/sh
         run: ./test/run-all.sh
 
-      - name: Upload battery logs on failure
+      # The suites' logs name host paths, user units and journal excerpts.
+      # This repository is public, so a run artifact is world-readable: upload
+      # only the failure summary the runner already prints to stdout, never
+      # the per-suite logs. The full logs remain on the runner under the
+      # printed path, reachable by anyone who can log into that box.
+      - name: Upload the failure summary
         if: failure()
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: battery-logs
-          path: /tmp/castellan-run-all.*
+          name: battery-failure-summary
+          path: ${{ runner.temp }}/battery-logs/**/rows
           if-no-files-found: ignore
           retention-days: 7
 
       - name: Clean up session state
         if: always()
         run: |
-          # The battery creates scopes and a daemon; leave the runner box
-          # the way we found it even when a suite dies mid-run.
+          # The battery creates scopes, a daemon and (via p18/p20) real user
+          # units. Leave the runner box the way we found it even when a suite
+          # dies mid-run or the job is cancelled.
+          systemctl --user disable --now castellan.service 2>/dev/null || true
+          rm -f ~/.config/systemd/user/castellan.service                 ~/.config/systemd/user/castellan-freeze.service                 ~/.config/systemd/user/castellan-thaw.service 2>/dev/null || true
+          systemctl --user daemon-reload 2>/dev/null || true
+          systemctl --user reset-failed 2>/dev/null || true
           pkill -9 -f castellan-daemon 2>/dev/null || true
           rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/castellan.sock" 2>/dev/null || true
+          # p18 runs uninstall against the ci user's own state; make sure a
+          # cancelled run does not leave half of it behind.
+          rm -rf ~/.local/state/castellan ~/.config/castellan 2>/dev/null || true

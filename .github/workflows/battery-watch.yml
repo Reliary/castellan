@@ -1,0 +1,58 @@
+name: battery-watch
+
+# The battery runs on a single self-hosted machine, and the branch ruleset
+# has no required status checks (a solo maintainer cannot review their own
+# PR). So a runner that is offline, wedged or out of disk makes every
+# mainline push silently untested: the Battery run stays queued, hosted CI
+# stays green, and a release can be cut from an unverified commit.
+#
+# This watchdog runs on a GitHub-hosted runner and fails loudly when either
+# (a) the runner is not online, or (b) the newest quattro commit has no green
+# Battery run. It never blocks a PR or a merge.
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: The battery runner is online
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          st=$(gh api "repos/$GITHUB_REPOSITORY/actions/runners" \
+               --jq '[.runners[] | select(.name == "cachyos-ci") | .status] | join(",")')
+          echo "cachyos-ci status: ${st:-MISSING}"
+          if [ "$st" != "online" ]; then
+            echo "::error::the battery runner is ${st:-missing}; pushed commits are not being tested"
+            exit 1
+          fi
+
+      - name: The newest mainline commit has a green battery
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/quattro" --jq .sha)
+          row=$(gh run list -R "$GITHUB_REPOSITORY" --workflow battery.yml \
+                  --branch quattro --limit 1 \
+                  --json headSha,conclusion,createdAt \
+                  --jq '.[0] | "\(.headSha) \(.conclusion // "running") \(.createdAt)"')
+          set -- ${row:-none none none}
+          echo "head=$head battery_sha=$1 conclusion=$2 at=$3"
+          if [ "$1" != "$head" ]; then
+            echo "::error::newest quattro commit $head has no battery run (newest run: $1)"
+            exit 1
+          fi
+          if [ "$2" != "success" ]; then
+            echo "::error::battery for $head is '$2'"
+            exit 1
+          fi

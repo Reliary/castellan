@@ -95,6 +95,20 @@ if [ ! -x "$BIN_DIR/castellan" ] || [ ! -x "$BIN_DIR/castellan-daemon" ]; then
   exit 2
 fi
 
+# Several suites kill every castellan-daemon of this uid, freeze every session
+# scope in the user slice, install real systemd units and run
+# `castellan uninstall --yes` against the real state. That is correct on a
+# dedicated CI account and destructive on a desktop with live agents.
+# Require an explicit opt-in: losing a running agent session to a test run is
+# not a mistake worth making silently.
+if [ "${CASTELLAN_ALLOW_DESTRUCTIVE:-0}" != "1" ]; then
+  echo "refusing: the battery kills this uid's daemons, freezes every session"
+  echo "scope, and runs uninstall against real state."
+  echo "run it on a dedicated CI account, or set CASTELLAN_ALLOW_DESTRUCTIVE=1"
+  echo "if this account has no live sessions to lose."
+  exit 3
+fi
+
 matches() {
   [ -z "$ONLY" ] && return 0
   local name=$1 want
@@ -103,7 +117,13 @@ matches() {
   return 1
 }
 
-W=$(mktemp -d "${TMPDIR:-/tmp}/castellan-run-all.XXXXXX")
+# Log directory. CI passes the path it will upload; local runs get a temp
+# dir under the caller's TMPDIR. Removed on success, kept on failure (and
+# the path is always printed), so a red run is diagnosable and a green run
+# leaves nothing behind.
+LOG_BASE="${CASTELLAN_LOG_DIR:-${TMPDIR:-/tmp}}"
+mkdir -p "$LOG_BASE"
+W=$(mktemp -d "$LOG_BASE/castellan-run-all.XXXXXX")
 ROWS="$W/rows"
 : > "$ROWS"
 PASS=0; FAIL=0; SKIP=0
@@ -142,8 +162,8 @@ done
 
 echo
 echo "battery: $PASS passed, $FAIL failed, $SKIP skipped  (bin: $BIN_DIR)"
+echo "logs: $W"
 if [ "$FAIL" -gt 0 ]; then
-  echo "logs: $W"
   echo "first failing assertions:"
   for name in $(awk -F: '$2=="fail"{print $1}' "$ROWS"); do
     echo "--- $name"
@@ -151,3 +171,6 @@ if [ "$FAIL" -gt 0 ]; then
   done
   exit 1
 fi
+
+# Green: the logs are noise. Red: they stay, and the path above says where.
+rm -rf "$W"

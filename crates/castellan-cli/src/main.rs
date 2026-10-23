@@ -197,13 +197,27 @@ fn preflight() -> ! {
   // effect: at most one empty `castellan-preflight` dir persists between
   // runs (it was previously the deny-file too, and accumulated); it is
   // reaped on the next `preflight`. The enforcement check is last.
+  // O_EXCL-style: remove any previous run's dir, then create a fresh one.
+  // Refusing to reuse a pre-existing directory means another uid cannot
+  // pre-create it to force a false FAIL (they own it, so both the removal
+  // and the probe write fail). The name is per-uid already.
   let _ = std::fs::remove_file(&deny);
   let _ = std::fs::remove_dir_all(&scratch);
-  let _ = std::fs::create_dir_all(&scratch);
+  let scratch_ok = std::fs::create_dir(&scratch).is_ok();
+  if !scratch_ok {
+    eprintln!(
+      "castellan: cannot create {} — another process owns it; remove it and retry",
+      scratch.display()
+    );
+    std::process::exit(1);
+  }
   let policy = castellan_policy::Policy::new("preflight-probe", "preflight", scratch.clone());
   let enforced = castellan_envelope::apply_envelope(&policy).is_ok()
     && std::fs::write(&deny, b"x").is_err()
     && std::fs::write(scratch.join("probe"), b"x").is_ok();
+  // Landlock is irreversible, so the scratch dir cannot be removed after
+  // this point. Leave it empty; the next run removes it before creating a
+  // fresh one.
   let _ = std::fs::remove_file(scratch.join("probe"));
   check!("landlock-enforcement", enforced, "scratch write allowed, /tmp write denied");
 

@@ -64,22 +64,27 @@ only, not read or egress blocking.
 
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified
 kernels: 7.0.3, 7.1.8, 7.2.5 and 7.2.11 (x86_64). `preflight` runs 6 checks; all 6 must pass.
-The published tarball's documented install is exercised end to end on each
-release candidate, including inside an Omarchy 4.0.4 VM.
+The published tarball's documented install was exercised end to end on
+v0.5.2, including inside an Omarchy 4.0.4 VM; the steps below are not
+reproducible by a reader, and that run is a one-off observation, not a
+standing guarantee.
 
 Download the tarball for your architecture from the
 [latest release](https://github.com/Reliary/castellan/releases/latest) (MIT).
 It contains both `castellan` and `castellan-daemon`.
 
 ```sh
-tar xzf castellan-v0.5.2-linux-x86_64.tar.gz
-chmod +x castellan-v0.5.2-linux-x86_64 castellan-daemon-v0.5.0-linux-x86_64
-./castellan-v0.5.2-linux-x86_64 preflight        # all 6 checks must pass
+VERSION=0.5.2                              # match the release you downloaded
+tar xzf "castellan-v${VERSION}-linux-x86_64.tar.gz"
+"./castellan-v${VERSION}-linux-x86_64" preflight   # all 6 checks must pass
 ```
 
-The tarball names carry the version; put them on `PATH` under the plain
-names if you prefer the commands below verbatim. Verify the download with
-`SHA256SUMS` and the cosign bundles in the release (instructions there).
+The tarball names carry the version; put the binaries on `PATH` under the
+plain names if you prefer the commands below verbatim. The x86_64 binaries
+are built on Ubuntu 24.04 and need glibc 2.39 or newer. The aarch64 tarball
+is built by the same workflow and has not been executed by us; treat it as
+build-verified only. Verify the download with `SHA256SUMS` and the cosign
+bundles in the release (instructions there).
 
 Or build from source (also builds both binaries):
 
@@ -152,6 +157,7 @@ docs/
   s0-key-extraction-probe.md   what it takes to reach the signing key from a
                                same-uid process, and why memory-only wins
   upstream-strategy.md         internal: where this could be upstreamed
+  RUNNER.md                    the CI battery runner: setup, rebuild, operating
   benchmark-methodology.md     cert-evals interleaved + placebo + SHA-256 cert
   glossary.md                  terms
   components/                  per-component design docs with status

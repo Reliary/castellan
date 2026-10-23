@@ -33,7 +33,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/castellan"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/castellan"
 SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID_}/castellan.sock"
 SLICE="/sys/fs/cgroup/user.slice/user-$UID_.slice/user@$UID_.service/castellan.slice"
-SNAP="${TMPDIR:-/tmp}/castellan-p18-snapshot-$(date +%s).txt"
+SNAP="${TMPDIR:-/tmp}/castellan-p18-snapshot-$(id -u)-$(date +%s).txt"
 W=/tmp/cast-p18-work-$(id -u)
 mkdir -p "$W"
 PASS=0; FAIL=0; NOTE=0

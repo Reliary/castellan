@@ -27,7 +27,7 @@ the last.
 
 | Version | Supported |
 |---------|-----------|
-| v0.1.x on `quattro` | Yes |
+| The latest release on `quattro` (currently `v0.5.2`) | Yes |
 | Anything older | No |
 
 This is a small project maintained by one person. There is no backport queue.

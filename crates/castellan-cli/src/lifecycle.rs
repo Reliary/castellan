@@ -58,59 +58,98 @@ fn unit_path() -> PathBuf {
   unit_dir().join(UNIT_NAME)
 }
 
+/// Parse a release filename (`base-vX.Y.Z-linux-arch`) into (version, arch).
+fn parse_release_name(fname: &str, base: &str) -> Option<(String, String)> {
+  let rest = fname.strip_prefix(base)?.strip_prefix("-v")?;
+  let (ver, arch) = rest.split_once("-linux-")?;
+  if ver.is_empty() || arch.is_empty() || arch.contains('-') {
+    return None;
+  }
+  Some((ver.to_string(), arch.to_string()))
+}
+
+/// Numeric version key for ordering (`0.10.0` must beat `0.9.9`).
+fn version_key(v: &str) -> Vec<u64> {
+  v.split(['.', '-', '+'])
+    .map(|part| part.parse::<u64>().unwrap_or(0))
+    .collect()
+}
+
+/// A candidate is only trusted when it is a real file (not a symlink), owned
+/// by the effective uid, and not group/other-writable. A file the agent can
+/// rewrite is not a trusted daemon, and a symlink is an indirection nobody
+/// needs here.
+fn trusted_binary(path: &std::path::Path) -> bool {
+  use std::os::unix::fs::MetadataExt;
+  let Ok(md) = std::fs::symlink_metadata(path) else {
+    return false;
+  };
+  md.file_type().is_file()
+    && md.uid() == nix::unistd::Uid::effective().as_raw()
+    && md.mode() & 0o022 == 0
+}
+
+/// Resolve a companion binary inside `dir`.
+///
+/// Pure on purpose: the caller supplies the directory, the CLI's file name
+/// and the host architecture, so the selection rules are unit-testable
+/// without mutating the process environment (`set_var("PATH")` in a parallel
+/// test binary is a data race).
+fn select_companion(
+  dir: &std::path::Path,
+  cli_name: &str,
+  name: &str,
+  host_arch: &str,
+) -> Option<PathBuf> {
+  if let Some((ver, arch)) = parse_release_name(cli_name, "castellan") {
+    // The CLI itself is a release build: demand the exact matching daemon.
+    if arch != host_arch {
+      return None;
+    }
+    let exact = dir.join(format!("{name}-v{ver}-linux-{arch}"));
+    return trusted_binary(&exact).then_some(exact);
+  }
+
+  let plain = dir.join(name);
+  if trusted_binary(&plain) {
+    return Some(plain);
+  }
+
+  // Several release builds in one directory (tests, a shared download dir):
+  // same architecture only, highest parsed version wins.
+  let mut best: Option<(Vec<u64>, PathBuf)> = None;
+  for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    let path = entry.path();
+    let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    let Some((ver, arch)) = parse_release_name(fname, name) else {
+      continue;
+    };
+    if arch != host_arch || !trusted_binary(&path) {
+      continue;
+    }
+    let key = version_key(&ver);
+    if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+      best = Some((key, path));
+    }
+  }
+  best.map(|(_, p)| p)
+}
+
 /// Absolute path to a companion binary.
 ///
-/// The daemon normally sits next to the CLI, but current_exe() resolves
-/// symlinks, so a release install that links the versioned file into a
-/// bin directory would otherwise look for the daemon next to the real
-/// binary instead of next to the link. Try the invoked path and PATH
-/// after the resolved directory.
+/// Only the directory of the RESOLVED executable is searched. `current_exe()`
+/// resolves symlinks, so both documented layouts (an extracted release
+/// tarball, or a symlink into `~/bin`) land on the real directory that holds
+/// both binaries. Searching `argv[0]` or `PATH` would let a file in an
+/// agent-writable directory be selected here and then pinned into
+/// `ExecStart=` by `service install`.
 fn sibling_bin(name: &str) -> Option<PathBuf> {
-  let mut dirs: Vec<PathBuf> = Vec::new();
-  if let Ok(exe) = std::env::current_exe() {
-    if let Some(d) = exe.parent() {
-      dirs.push(d.to_path_buf());
-    }
-  }
-  if let Some(arg0) = std::env::args_os().next() {
-    let invoked = PathBuf::from(&arg0);
-    if let Some(d) = invoked.parent() {
-      if !d.as_os_str().is_empty() {
-        dirs.push(d.to_path_buf());
-      }
-    }
-  }
-  if let Some(paths) = std::env::var_os("PATH") {
-    dirs.extend(std::env::split_paths(&paths));
-  }
-  for dir in dirs {
-    let plain = dir.join(name);
-    if plain.is_file() {
-      return Some(plain);
-    }
-    // Release tarballs use versioned filenames (`castellan-daemon-v0.5.0-
-    // linux-x86_64`) so several architectures can share a directory. Accept
-    // the newest such sibling, so extract-and-run works without a rename.
-    let prefix = format!("{name}-v");
-    let mut matches: Vec<PathBuf> = std::fs::read_dir(&dir)
-      .into_iter()
-      .flatten()
-      .flatten()
-      .map(|e| e.path())
-      .filter(|p| {
-        p.is_file()
-          && p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix) && n.contains("-linux-"))
-            .unwrap_or(false)
-      })
-      .collect();
-    matches.sort();
-    if let Some(p) = matches.pop() {
-      return Some(p);
-    }
-  }
-  None
+  let exe = std::env::current_exe().ok()?;
+  let dir = exe.parent()?;
+  let cli_name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+  select_companion(dir, cli_name, name, std::env::consts::ARCH)
 }
 
 fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -497,10 +536,12 @@ fn cmd_service(args: &[String]) -> ! {
         std::thread::sleep(std::time::Duration::from_millis(100));
       }
       if !answering {
-        eprintln!("service install: the unit started but the daemon is not answering");
-        eprintln!("{} after 10s.", sock_path().display());
-        eprintln!("see: journalctl --user -u {UNIT_NAME}");
-        std::process::exit(1);
+        // Same rollback as every earlier failure path: never leave an
+        // enabled unit that cannot serve behind a failed installer.
+        rollback(
+          "the unit started but the daemon never answered on its socket;\n\
+         see `journalctl --user -u castellan.service`. Unit rolled back.",
+        );
       }
       print!("{}", exec_stdout(&["is-active", UNIT_NAME]));
       println!("service installed and answering");
@@ -1000,57 +1041,55 @@ mod tests {
     let _ = std::fs::remove_dir_all(&d);
   }
 
-  // Release tarballs carry versioned filenames (and no plain aliases), so
-  // `service install` must find `castellan-daemon-v0.5.0-linux-x86_64` next
-  // to the CLI. Found live on Omarchy: the documented extract-and-run path
-  // failed with "daemon not found next to this binary".
+  // Selection rules, exercised purely. Release tarballs carry versioned
+  // filenames and no plain aliases; a mixed directory must not pick a
+  // downgrade, a wrong architecture, or a file another uid can rewrite.
   #[test]
-  fn companion_binary_found_through_path() {
-    let d = tmpdir("companion");
-    let bindir = d.join("bin");
-    std::fs::create_dir_all(&bindir).unwrap();
-    let daemon = bindir.join("castellan-daemon");
-    std::fs::write(&daemon, b"x").unwrap();
-    let _guard = EnvPathGuard::prepend(&bindir);
-    let found = sibling_bin("castellan-daemon");
-    assert_eq!(found.as_deref(), Some(daemon.as_path()));
+  fn companion_selection_rules() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("select");
+    let host = "x86_64";
+    let mk = |n: &str, mode: u32| {
+      let p = d.join(n);
+      std::fs::write(&p, b"x").unwrap();
+      std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+      p
+    };
 
-    // Versioned layout, exactly as the release tarball ships it.
-    std::fs::remove_file(&daemon).unwrap();
-    let versioned = bindir.join("castellan-daemon-v0.5.0-linux-x86_64");
-    std::fs::write(&versioned, b"x").unwrap();
-    let found = sibling_bin("castellan-daemon");
-    assert_eq!(found.as_deref(), Some(versioned.as_path()));
+    // Plain-named CLI: plain daemon next to it wins.
+    let plain = mk("castellan-daemon", 0o755);
+    assert_eq!(select_companion(&d, "castellan", "castellan-daemon", host).as_deref(), Some(plain.as_path()));
+
+    // Release-named CLI: exact version + arch only.
+    let v052 = mk("castellan-daemon-v0.5.2-linux-x86_64", 0o755);
+    assert_eq!(
+      select_companion(&d, "castellan-v0.5.2-linux-x86_64", "castellan-daemon", host).as_deref(),
+      Some(v052.as_path())
+    );
+    // A different version is not a match.
+    assert_eq!(select_companion(&d, "castellan-v0.5.9-linux-x86_64", "castellan-daemon", host), None);
+    // Wrong architecture is never a match.
+    mk("castellan-daemon-v0.5.2-linux-aarch64", 0o755);
+    assert_eq!(select_companion(&d, "castellan-v0.5.2-linux-aarch64", "castellan-daemon", host), None);
+
+    // Bare CLI with several release daemons: semver order, not string order,
+    // and only the host architecture.
+    std::fs::remove_file(&plain).unwrap();
+    let v10 = mk("castellan-daemon-v0.10.0-linux-x86_64", 0o755);
+    mk("castellan-daemon-v0.9.9-linux-x86_64", 0o755);
+    mk("castellan-daemon-v0.11.0-linux-aarch64", 0o755);
+    assert_eq!(select_companion(&d, "castellan", "castellan-daemon", host).as_deref(), Some(v10.as_path()));
+
+    // Group/other-writable candidates are refused.
+    let loose = mk("castellan-daemon-v0.12.0-linux-x86_64", 0o777);
+    assert_ne!(select_companion(&d, "castellan", "castellan-daemon", host).as_deref(), Some(loose.as_path()));
+
+    // Symlinks are refused even when they point at a valid file.
+    let link = d.join("castellan-daemon-v0.13.0-linux-x86_64");
+    std::os::unix::fs::symlink(&v10, &link).unwrap();
+    assert_ne!(select_companion(&d, "castellan", "castellan-daemon", host).as_deref(), Some(link.as_path()));
+
     let _ = std::fs::remove_dir_all(&d);
-  }
-
-  struct EnvPathGuard {
-    old: Option<std::ffi::OsString>,
-  }
-
-  impl EnvPathGuard {
-    fn prepend(dir: &std::path::Path) -> Self {
-      // Replace PATH rather than prepend: the host may have its own
-      // castellan-daemon installed, which would satisfy the lookup even
-      // when the versioned-file leg is broken (caught by the negative
-      // control, which passed until this was made hermetic).
-      let old = std::env::var_os("PATH");
-      let joined = std::env::join_paths([dir.to_path_buf()]).unwrap();
-      // Safety: the test binary is single-threaded for this module's
-      // env-touching tests, and Rust 2021 marks set_var unsafe only in
-      // 2024; keep it explicit.
-      std::env::set_var("PATH", joined);
-      Self { old }
-    }
-  }
-
-  impl Drop for EnvPathGuard {
-    fn drop(&mut self) {
-      match self.old.take() {
-        Some(v) => std::env::set_var("PATH", v),
-        None => std::env::remove_var("PATH"),
-      }
-    }
   }
 
   #[test]

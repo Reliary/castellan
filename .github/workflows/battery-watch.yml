@@ -46,17 +46,21 @@ jobs:
         run: |
           set -euo pipefail
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/quattro" --jq .sha)
-          row=$(gh run list -R "$GITHUB_REPOSITORY" --workflow battery.yml \
-                  --branch quattro --limit 1 \
-                  --json headSha,conclusion,createdAt \
-                  --jq '.[0] | "\(.headSha) \(.conclusion // "running") \(.createdAt)"')
-          set -- ${row:-none none none}
-          echo "head=$head battery_sha=$1 conclusion=$2 at=$3"
-          if [ "$1" != "$head" ]; then
-            echo "::error::newest quattro commit $head has no battery run (newest run: $1)"
+          # Tab-separated so an empty field cannot shift the positions, and
+          # read into named variables rather than `set --` (an empty jq
+          # result under `set -u` aborted the step with "$3: unbound").
+          IFS=$'\t' read -r bsha bcon _when < <(
+            gh run list -R "$GITHUB_REPOSITORY" --workflow battery.yml \
+              --branch quattro --limit 1 \
+              --json headSha,conclusion,createdAt \
+              --jq '.[0] | [.headSha, (.conclusion // "running"), .createdAt] | @tsv'
+          )
+          echo "head=$head battery_sha=${bsha:-none} conclusion=${bcon:-none}"
+          if [ "${bsha:-}" != "$head" ]; then
+            echo "::error::newest quattro commit $head has no battery run (newest: ${bsha:-none})"
             exit 1
           fi
-          if [ "$2" != "success" ]; then
-            echo "::error::battery for $head is '$2'"
+          if [ "${bcon:-}" != "success" ]; then
+            echo "::error::battery for $head is '${bcon:-none}'"
             exit 1
           fi

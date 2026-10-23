@@ -60,7 +60,13 @@ jobs:
             echo "::error::newest quattro commit $head has no battery run (newest: ${bsha:-none})"
             exit 1
           fi
-          if [ "${bcon:-}" != "success" ]; then
-            echo "::error::battery for $head is '${bcon:-none}'"
-            exit 1
-          fi
+          case "${bcon:-none}" in
+            success) echo "battery for $head passed" ;;
+            in-flight|running|queued)
+              # A push seconds before the watchdog fires is not a failure;
+              # the stuck-queue step above is what catches a dead runner.
+              echo "battery for $head is still $bcon" ;;
+            *)
+              echo "::error::battery for $head is '${bcon}'"
+              exit 1 ;;
+          esac

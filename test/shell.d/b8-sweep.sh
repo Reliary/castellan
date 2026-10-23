@@ -14,7 +14,7 @@
 # The daemon's sweep interval is dropped to 2s for the test.
 set -u
 cd "$(dirname "$0")/../.."
-BIN="$PWD/target/release"
+BIN="${CASTELLAN_BIN_DIR:-$PWD/target/release}"
 PASS=0 FAIL=0
 ok() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }

@@ -43,7 +43,7 @@
 #    it is NOT an LLM agent driving. The LLM-session gap remains.
 #  - Sessions run headless (script -qec ptys for the tty gate only).
 set -u
-BIN=/home/john/src/castellan/target/release
+BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"
 PASS=0 FAIL=0
 ok() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -144,7 +144,7 @@ EOF
 witness() { # witness -> runs a no-op session in a pty, prints its sid
   script -qec '
     export XDG_STATE_HOME=/tmp/castellan-v3-corpus/state
-    BIN=/home/john/src/castellan/target/release/castellan
+    BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
     OUT=$($BIN launch --project /tmp/castellan-v3-corpus/proj -- true 2>&1)
     echo "$OUT" | grep -oE "s[0-9a-f]{20}" | head -1
   ' /dev/null 2>&1 | grep -oE "s[0-9a-f]{20}" | head -1
@@ -444,7 +444,7 @@ echo "===== K4: memory recall (seeded incident + strict gate) ====="
 # a below-gate recall all fail.
 MOUT=$(script -qec '
   export XDG_STATE_HOME=/tmp/castellan-v3-corpus/state
-  BIN=/home/john/src/castellan/target/release/castellan
+  BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"/castellan
   # seed: run the drill suite once now (deterministic incident writes)
   $BIN drill run > /dev/null 2>&1
   # recall the drill spine itself (drill_* telemetry the drills wrote)

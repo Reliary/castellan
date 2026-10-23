@@ -17,7 +17,7 @@ assume-knowledge test the design claims to pass.
 - Harness: opencode CLI (non-interactive `opencode run`)
 - Model: nube provider, glm-5.2 (exact id discovered from
   `~/.config/opencode/` at execution start)
-- Knowledge: full disclosure — pointed at `/home/john/src/castellan`
+- Knowledge: full disclosure — pointed at `$HOME/src/castellan`
   (source, docs, THREAT_MODEL, ATTACK_EXERCISE with R12-R19 + fixes),
   the socket path, "any means"
 - The docs leak everything except R20 (escape-then-socket), which stays

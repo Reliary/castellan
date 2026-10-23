@@ -10,7 +10,7 @@
 #   E. an unsigned daemon reports UNSIGNED (never implies a signature)
 set -u
 cd "$(dirname "$0")/../.."
-BIN="$PWD/target/release/castellan"
+BIN="${CASTELLAN_BIN_DIR:-$PWD/target/release}/castellan"
 D="$PWD/target/release/castellan-daemon"
 PASS=0 FAIL=0
 ok() { PASS=$((PASS+1)); echo "  PASS: $1"; }

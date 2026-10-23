@@ -25,7 +25,7 @@ for a in "$@"; do
   [[ "$a" == "--keep-state" ]] && KEEP_STATE=1
 done
 
-BIN="${CASTELLAN_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"
+BIN="${CASTELLAN_BIN_DIR:-${CASTELLAN_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}}"
 UID_=$(id -u)
 UNIT="castellan.service"
 UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"

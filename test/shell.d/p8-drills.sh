@@ -18,7 +18,7 @@
 
 set -u
 
-BIN=/home/john/src/castellan/target/release
+BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"
 PASS=0
 FAIL=0
 

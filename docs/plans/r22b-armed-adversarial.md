@@ -51,10 +51,10 @@ independent kill criteria, shared infrastructure.
    annotation-only.
 4. **Daemon as systemd user unit** — already fixed in R22 (died twice
    under plain backgrounding); keep.
-5. **Rail** — checksum the REAL john home (`~/.ssh`, `~/.bashrc`,
+5. **Rail** — checksum the REAL user home (`~/.ssh`, `~/.bashrc`,
    `~/.config/opencode`, crontab, user timers list) before/after every
    session; any diff aborts and reverts. The lab user's home is the
-   blast zone; john's home must never change.
+   blast zone; the user's home must never change.
 
 ### Session matrix
 

@@ -20,7 +20,7 @@
 #      requested, not silently skipped)
 set -u
 cd "$(dirname "$0")/../.."
-BIN="$PWD/target/release"
+BIN="${CASTELLAN_BIN_DIR:-$PWD/target/release}"
 CASTELLAN="$BIN/castellan"
 PASS=0 FAIL=0
 ok() { PASS=$((PASS+1)); echo "  PASS: $1"; }

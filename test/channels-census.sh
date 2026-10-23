@@ -6,8 +6,8 @@
 # A channel that flips OPEN -> DENIED between them is one the destination
 # policy actually closes.
 set -u
-D=/home/john/src/castellan/target/release/castellan-daemon
-BIN=/home/john/src/castellan/target/release/castellan
+D="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target/release}/castellan-daemon"
+BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target/release}/castellan"
 W=$(mktemp -d /tmp/castellan-channels.XXXXXX)
 export XDG_STATE_HOME="$W/state"
 mkdir -p "$XDG_STATE_HOME"

@@ -28,7 +28,7 @@
 #   K9  spine has egress_inject rows and the S1 hash chain verifies
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN_DIR="$REPO/target/release"
+BIN_DIR="${CASTELLAN_BIN_DIR:-$REPO/target/release}"
 BIN="$BIN_DIR/castellan"
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }

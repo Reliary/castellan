@@ -21,8 +21,8 @@
 # Usage: real-corpus.sh [N_TRIALS]
 # Env: CORPUS_MODEL, CORPUS_TIMEOUT
 set -u
-BIN=/home/john/src/castellan/target/release/castellan
-LAB=/home/john/lab-real
+BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}/castellan"
+LAB="${CASTELLAN_LAB_DIR:-$HOME/lab-real}"
 STATE="$LAB/state"
 PROJ="$LAB/corpus/proj"
 BASE="$LAB/corpus/base"

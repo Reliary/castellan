@@ -29,7 +29,7 @@ Conventions for AI agents (and humans) working on castellan.
 - `cargo build --release --workspace` — build all crates
 - `cargo clippy --workspace --all-targets` — must be clean
 - `cargo test --workspace` — unit tests
-- `test/shell.d/p0-freeze.sh`, `test/shell.d/p1-envelope.sh` — acceptance suites (local desktop Linux only; need real user cgroup slices)
+- `test/run-all.sh` — the wired-system battery (acceptance suites). Runs `self-pty`, `wrap-pty` and `bare` suites in the context each needs; `--local` adds machine-local ones. Needs a real user cgroup slice, so it runs on a desktop Linux box, not in CI. See [test/README.md](test/README.md) for the matrix. `CASTELLAN_BIN_DIR` runs it against an extracted release tarball.
 - `test/syscall-drift.sh` — kernel-drift gate for the seccomp denylist: checks the capability-class table and the filter agree in both directions against the running kernel's syscall table. CI job `syscall-drift`.
 - `test/syscall-drift-selftest.sh` — injects each of the four drift failure modes into a copied tree and requires the gate to go red (the gate's own Koch criterion).
 - `python3 test/workload-syscalls.py` — traces 8 representative workloads (incl. a real `rustc -O` compile and `git commit`) with a ptrace probe and fails if any needs a `Hard`-class syscall. CI job `workload-syscalls`.
@@ -43,7 +43,7 @@ Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before touching anything. The 
 
 - Atomic commits: one coherent change per commit.
 - Never commit secrets, API keys, or the CVEfixes DB.
-- The CVEfixes DB (49 GB) lives at `/home/john/data/cvefixes/cvefixes.db` locally and is NEVER shipped, vendored, or committed. relay-vuln integration is strictly local and opt-in.
+- The CVEfixes DB (49 GB) lives at `$HOME/data/cvefixes/cvefixes.db` locally and is NEVER shipped, vendored, or committed. relay-vuln integration is strictly local and opt-in.
 
 ## Threat model
 

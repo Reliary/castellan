@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build, package and sign only; do not create a release'
+        type: boolean
+        default: true
 
 # Top level stays read-only; the writes belong to the release job
 # (Scorecard Token-Permissions #7).
@@ -30,15 +36,32 @@ jobs:
           toolchain: stable
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Resolve workspace version
+        run: |
+          VERSION=$(awk '/^\[workspace.package\]/{f=1} f && /^version/{gsub(/.*= *"|".*/,""); print; exit}' Cargo.toml)
+          if [ -z "$VERSION" ]; then echo "no workspace version in Cargo.toml"; exit 1; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "resolved version: $VERSION"
+      - name: Verify tag matches workspace version
+        if: github.event_name == 'push'
+        run: |
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${VERSION}"
+            exit 1
+          fi
       - name: Install cross linker
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
       - name: Build release binaries (Linux x86_64 + aarch64)
+        env:
+          # A target without a matching linker fails at link time; the CI
+          # cross-arch job only runs `cargo check`, which never links, so
+          # this env is the only thing that makes the release build work.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo build --release -p castellan-cli -p castellan-daemon --target x86_64-unknown-linux-gnu
           cargo build --release -p castellan-cli -p castellan-daemon --target aarch64-unknown-linux-gnu
       - name: Package
         run: |
-          VERSION=$(echo ${{ github.ref_name }} | sed 's/v//')
           mkdir -p dist
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             short=$(echo $target | cut -d- -f1)
@@ -46,6 +69,16 @@ jobs:
             cp target/$target/release/castellan-daemon dist/castellan-daemon-v${VERSION}-linux-${short}
           done
           cd dist && tar -czf castellan-v${VERSION}-linux-x86_64.tar.gz *x86_64* && tar -czf castellan-v${VERSION}-linux-aarch64.tar.gz *aarch64*
+      - name: Verify binaries are the right architecture and version
+        run: |
+          for arch in x86_64 aarch64; do
+            f="dist/castellan-v${VERSION}-linux-${arch}"
+            case "$arch" in
+              x86_64) want="x86-64";;
+              aarch64) want="ARM aarch64";;
+            esac
+            file "$f" | grep -q "$want" || { echo "$f is not $want: $(file -b "$f")"; exit 1; }
+          done
       - name: Compute SHA256 checksums
         run: |
           cd dist
@@ -63,6 +96,7 @@ jobs:
           done
           cosign sign-blob SHA256SUMS --bundle SHA256SUMS.sig --yes
       - name: Create GitHub Release
+        if: github.event_name == 'push' || inputs.dry_run == false
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
@@ -71,6 +105,10 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
           generate_release_notes: true
+          # Draft first: immutable releases cannot be edited once published,
+          # and the v* tag ruleset blocks deleting the tag, so a bad publish
+          # would be permanent. Drafts stay editable.
+          draft: true
           body: |
             ## Verify
 
@@ -88,4 +126,3 @@ jobs:
 
             Each `.tar.gz` also carries its own `.sig` bundle; verify it the
             same way with `--bundle <tarball>.sig` and the tarball as the blob.
-          draft: false

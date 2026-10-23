@@ -5,7 +5,7 @@
 # scan (baseline at spawn, delta at keep) + decoy canaries + trace
 # exposure + policycheck. Every assertion PASS/FAIL with latency.
 set -u
-BIN=/home/john/src/castellan/target/release
+BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"
 PASS=0
 FAIL=0
 ok() { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -29,10 +29,10 @@ printf 'int main(void) { return leaf_fn(1); }\n' > "$PROJ/src/main.c"
 
 # relay-vuln scanner config (native, offline). The session will
 # introduce a NEW vulnerable file -> vuln_introduced at keep.
-printf '[scan]\nscanner = "relay-vuln"\ncmd = "/home/john/src/relay-vuln/target/release/relay-vuln scan --json ."\n' > "$PROJ/.reliary/castellan.toml"
+printf '[scan]\nscanner = "relay-vuln"\ncmd = "%s"\n' "${RELAY_VULN_CMD:-relay-vuln scan --json .}" > "$PROJ/.reliary/castellan.toml"
 
 # stria index for the hub weight (leaf.c is the only hub-ish file)
-/home/john/src/stria/target/release/stria build --repo "$PROJ" >/dev/null 2>&1
+"${STRIA_BIN:-stria}" build --repo "$PROJ" >/dev/null 2>&1
 
 stop_daemon() {
   for p in $(pgrep -f castellan-daemon); do

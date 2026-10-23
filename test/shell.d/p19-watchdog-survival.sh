@@ -18,7 +18,7 @@
 
 set -u
 
-BIN="${CASTELLAN_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}"
+BIN="${CASTELLAN_BIN_DIR:-${CASTELLAN_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}}"
 UID_=$(id -u)
 SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID_}/castellan.sock"
 SLICE="/sys/fs/cgroup/user.slice/user-$UID_.slice/user@$UID_.service/castellan.slice"
@@ -31,7 +31,9 @@ DAPID=""
 cleanup() {
   [[ -n "$DAPID" ]] && kill "$DAPID" 2>/dev/null
   pkill -9 -f "castellan-daemon" 2>/dev/null
-  pkill -9 -f "castellan launch -- sleep" 2>/dev/null
+  pkill -9 -f "castellan launch --project /tmp/cast-p19" 2>/dev/null
+  pkill -9 -f "cast-p19.*time.sleep" 2>/dev/null
+  pkill -9 -f "time.sleep" 2>/dev/null
   rm -f "$SOCK"
 }
 trap cleanup EXIT
@@ -107,7 +109,9 @@ setsid script -qec "$BIN/castellan launch --project /tmp/cast-p19 -- python3 -c 
 sleep 3
 SID_B=$(grep -oE 's[0-9a-f]{16,24}' /tmp/cast-p19/armB.log | head -1)
 AGENT_B=$(pgrep -f 'time.sleep' | tail -1)
-SCRIPT_B=$(pgrep -f 'script -qec' | head -1)
+# Match the pty wrapper for THIS project only: a bare 'script -qec'
+# also matches the suite's own wrapper when nested inside one.
+SCRIPT_B=$(pgrep -f 'script -qec.*cast-p19.*time.sleep' | head -1)
 [[ -n "$SID_B" && -n "$AGENT_B" ]] && ok "launch session active (sid=$SID_B agent=$AGENT_B)" \
   || { bad "could not establish session B"; cat /tmp/cast-p19/armB.log; }
 

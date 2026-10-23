@@ -19,7 +19,7 @@
 #                       broker denies reach the session spine
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN_DIR="$REPO/target/release"
+BIN_DIR="${CASTELLAN_BIN_DIR:-$REPO/target/release}"
 BIN="$BIN_DIR/castellan"
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }

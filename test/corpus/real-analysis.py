@@ -81,7 +81,7 @@ print(f"  rows present for both arms: {rows_ok}")
 print("\n=== K2: radar on real kept sessions (advisory-forever per V3) ===")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import subprocess
-BIN = "/home/john/src/castellan/target/release/castellan"
+BIN = os.environ.get("CASTELLAN_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "target", "release", "castellan"))
 env = dict(os.environ, XDG_STATE_HOME=state)
 fp = 0
 checked = 0

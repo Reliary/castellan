@@ -130,8 +130,8 @@ crates/
   castellan-proxy              per-session credential-injecting proxy (P12)
   castellan-daemon             unix-socket server, session registry, proxy lifecycle
   castellan-cli                castellan status|launch|audit|freeze|thaw|kill|proxy|...
-test/shell.d/                  acceptance suites (run on a real desktop Linux;
-                               need user cgroup slices — not CI-runnable)
+test/run-all.sh                wired-system battery (needs a user cgroup slice)
+test/README.md                 suite matrix: contexts, what each one proves
 docs/
   ARCHITECTURE.md              4 planes, substrate, event spine, 10 commitments
   THREAT_MODEL.md              Threat A/B/C, mitigations, residual risks

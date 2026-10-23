@@ -17,7 +17,7 @@
 # at unit level (broker tests).
 set -u
 cd "$(dirname "$0")/../.."
-BIN="$PWD/target/release"
+BIN="${CASTELLAN_BIN_DIR:-$PWD/target/release}"
 PASS=0 FAIL=0 NOTE=0
 ok()   { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }

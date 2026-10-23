@@ -20,7 +20,7 @@
 # Preconditions: user cgroup slice + pty + systemctl --user on .227.
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN="$REPO/target/release"
+BIN="${CASTELLAN_BIN_DIR:-$REPO/target/release}"
 PASS=0; FAIL=0; NOTE=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }

@@ -5,8 +5,8 @@
 # need the tty, and the R7 exact-match gates need suite tty == launcher
 # tty (no nested-witness pattern — see the keep/discard comments).
 set -u
-BIN=/home/john/src/castellan/target/release/castellan
-DAEMON=/home/john/src/castellan/target/release/castellan-daemon
+BIN="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}/castellan"
+DAEMON="${CASTELLAN_BIN_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/release}/castellan-daemon"
 export XDG_STATE_HOME=/tmp/cast-p2/state
 PASS=0; FAIL=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }

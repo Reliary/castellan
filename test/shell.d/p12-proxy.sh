@@ -53,7 +53,7 @@ hosts = ["api.example.com", "*.example.com"]
 EOF
 KEYRING_SHA=$(python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$XDG_CONFIG_HOME/castellan/keyring.toml")
 
-for p in $(pgrep -f "target/release/castellan-daemon" 2>/dev/null); do
+for p in $(pgrep -f "castellan-daemon" 2>/dev/null); do
   [ "$(stat -c %u /proc/$p 2>/dev/null)" = "$(id -u)" ] && kill -9 "$p" 2>/dev/null
 done
 sleep 0.5

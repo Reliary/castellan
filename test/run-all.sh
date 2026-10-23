@@ -24,6 +24,20 @@
 set -u
 cd "$(dirname "$0")/.."
 REPO=$PWD
+
+# The suites move agent pids into castellan.slice/<session>.scope, which
+# needs the caller to live in the user manager's cgroup tree. An ssh
+# session sits in session-N.scope, where those writes are EPERM ("failed
+# to move pid into scope"). Re-exec inside a transient user scope so the
+# battery behaves the same over ssh as on a desktop terminal.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ "${CASTELLAN_RUN_ALL_IN_SCOPE:-0}" != "1" ] \
+   && ! grep -q "user@$(id -u).service" /proc/self/cgroup 2>/dev/null \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && [ -S "$XDG_RUNTIME_DIR/systemd/private" ]; then
+  export CASTELLAN_RUN_ALL_IN_SCOPE=1
+  exec systemd-run --user --scope --collect --quiet -- "$0" "$@"
+fi
 BIN_DIR="${CASTELLAN_BIN_DIR:-$REPO/target/release}"
 export CASTELLAN_BIN_DIR="$BIN_DIR"
 export SHELL=/bin/sh

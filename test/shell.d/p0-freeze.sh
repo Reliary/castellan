@@ -24,7 +24,7 @@ for p in $(pgrep -f castellan-daemon); do
   exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
   case "$exe" in *castellan-daemon*) kill -9 "$p";; esac
 done
-rm -f /run/user/1000/castellan.sock
+rm -f "/run/user/$(id -u)/castellan.sock"
 SLICE="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/castellan.slice"
 if [[ -d "$SLICE" ]]; then
   for d in "$SLICE"/*.scope; do
@@ -42,7 +42,7 @@ DAPID=$!
 # wait for the socket, not a fixed sleep: startup loads the memory
 # log-replay + trust/canary ledgers and takes >1s on the real state dir
 for _ in $(seq 1 50); do
-  [ -S /run/user/1000/castellan.sock ] && break
+  [ -S "/run/user/$(id -u)/castellan.sock" ] && break
   sleep 0.1
 done
 if kill -0 "$DAPID" 2>/dev/null; then ok "daemon started"; else bad "daemon died at startup"; exit 1; fi

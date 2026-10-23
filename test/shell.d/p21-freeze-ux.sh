@@ -28,7 +28,7 @@ mkdir -p "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/castellan"
 SOCK="/run/user/$(id -u)/castellan.sock"
 
 start_daemon() {
-  for p in $(pgrep -f "target/release/castellan-daemon" 2>/dev/null); do
+  for p in $(pgrep -f "castellan-daemon" 2>/dev/null); do
     [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$BIN/castellan-daemon" ] && kill -9 "$p" 2>/dev/null
   done
   sleep 0.5

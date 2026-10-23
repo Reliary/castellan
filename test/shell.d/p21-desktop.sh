@@ -39,7 +39,7 @@ cleanup() {
   systemctl --user stop castellan-watch.service 2>/dev/null
   systemctl --user stop castellan-freeze.service castellan-thaw.service 2>/dev/null
   "$BIN/castellan" uninstall --yes --keep-config >/dev/null 2>&1
-  for p in $(pgrep -f "target/release/castellan-daemon" 2>/dev/null); do
+  for p in $(pgrep -f "castellan-daemon" 2>/dev/null); do
     [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$BIN/castellan-daemon" ] && kill -9 "$p" 2>/dev/null
   done
 }

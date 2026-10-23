@@ -70,6 +70,7 @@ passing when they are skipped.
 
 ## Last measured
 
-Green bar 23/23 on 2026-10-09, kernel 7.0.3 (dev box), from `target/release`.
-The battery is not yet in CI: it needs a self-hosted runner with a real user
-session.
+Green bar 23/23 on 2026-10-09 on both boxes, from an extracted artifact
+directory with `CASTELLAN_BIN_DIR` (no cargo): kernel 7.0.3 (dev box) and
+7.2.11 (exercise box, over ssh). The battery is not yet in CI: it needs a
+self-hosted runner with a real user session.

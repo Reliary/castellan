@@ -19,7 +19,7 @@ ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2' got '$3')"; fi }
 
-pkill -9 -f 'target/release/castellan-daemon' 2>/dev/null
+pkill -9 -f 'castellan-daemon' 2>/dev/null
 rm -f "$SOCK"
 W=$(mktemp -d /tmp/castellan-p9pc.XXXXXX)
 export XDG_STATE_HOME="$W/state"

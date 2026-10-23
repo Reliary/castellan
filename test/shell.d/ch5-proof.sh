@@ -11,12 +11,12 @@
 set -u
 cd "$(dirname "$0")/../.."
 BIN="${CASTELLAN_BIN_DIR:-$PWD/target/release}/castellan"
-D="$PWD/target/release/castellan-daemon"
+D="${CASTELLAN_BIN_DIR:-$PWD/target/release}/castellan-daemon"
 PASS=0 FAIL=0
 ok() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
-for p in $(pgrep -f "target/release/castellan-daemon" 2>/dev/null); do
+for p in $(pgrep -f "castellan-daemon" 2>/dev/null); do
   [ "$(stat -c %u /proc/$p 2>/dev/null)" = "$(id -u)" ] && kill -9 "$p" 2>/dev/null
 done
 rm -f "/run/user/$(id -u)/castellan.sock"

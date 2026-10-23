@@ -38,7 +38,7 @@ RL='rl(){ local e="$1"; shift; local n=0 o; while :; do o=$(env "$e" "$@" 2>&1);
 export XDG_CONFIG_HOME="$W/config"
 mkdir -p "$XDG_CONFIG_HOME"
 
-for p in $(pgrep -f "target/release/castellan-daemon" 2>/dev/null); do
+for p in $(pgrep -f "castellan-daemon" 2>/dev/null); do
   [ "$(stat -c %u /proc/$p 2>/dev/null)" = "$(id -u)" ] && kill -9 "$p" 2>/dev/null
 done
 sleep 0.5

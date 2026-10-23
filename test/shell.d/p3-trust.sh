@@ -45,9 +45,9 @@ grep -q listening "$WORK/daemon.log" && ok "daemon started" || { bad "daemon fai
 
 rpc() { # rpc <json>
   python3 - "$1" <<'EOF'
-import json, socket, sys
+import json, os, socket, sys
 s = socket.socket(socket.AF_UNIX)
-s.connect("/run/user/1000/castellan.sock")
+s.connect(f"/run/user/{os.getuid()}/castellan.sock")
 s.sendall((sys.argv[1] + "\n").encode())
 s.shutdown(socket.SHUT_WR)
 data = b""
@@ -89,7 +89,7 @@ proj = sys.argv[1]
 
 def rpc(req):
     s = socket.socket(socket.AF_UNIX)
-    s.connect("/run/user/1000/castellan.sock")
+    s.connect(f"/run/user/{os.getuid()}/castellan.sock")
     s.sendall((json.dumps(req) + "\n").encode())
     s.shutdown(socket.SHUT_WR)
     data = b""

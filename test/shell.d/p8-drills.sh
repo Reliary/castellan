@@ -44,7 +44,7 @@ stop_daemon() {
     exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
     case "$exe" in *castellan-daemon*) kill -9 "$p";; esac
   done
-  rm -f /run/user/1000/castellan.sock
+  rm -f /run/user/$(id -u)/castellan.sock
   sleep 0.3
 }
 
@@ -56,7 +56,7 @@ start_daemon() {
   DAPID=$!
   # wait for the socket, not a fixed sleep (bind can exceed 1s)
   for _ in $(seq 1 50); do
-    [ -S /run/user/1000/castellan.sock ] && break
+    [ -S /run/user/$(id -u)/castellan.sock ] && break
     sleep 0.1
   done
   if ! kill -0 "$DAPID" 2>/dev/null; then bad "daemon failed to start"; exit 1; fi

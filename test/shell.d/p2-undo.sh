@@ -24,7 +24,7 @@ echo "== start daemon =="
 DPID=$!
 # wait for the socket, not a fixed sleep (startup >1s on real state dir)
 for _ in $(seq 1 50); do
-  [ -S /run/user/1000/castellan.sock ] && break
+  [ -S /run/user/$(id -u)/castellan.sock ] && break
   sleep 0.1
 done
 "$BIN" status >/dev/null 2>&1 && ok "daemon started" || { bad "daemon not responding"; exit 1; }

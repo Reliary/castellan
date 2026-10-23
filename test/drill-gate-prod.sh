@@ -40,7 +40,7 @@ reap() {
   pkill -9 -x castellan-daemon 2>/dev/null
   pkill -9 -x castellan 2>/dev/null
   for p in $(pgrep -f "castellan-drillgate" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
-  rm -f /run/user/1000/castellan.sock
+  rm -f /run/user/$(id -u)/castellan.sock
   sleep 0.4
 }
 trap 'reap; rm -rf "$WORK"' EXIT

@@ -186,8 +186,11 @@ fn preflight() -> ! {
   let inotify = nix::sys::inotify::Inotify::init(nix::sys::inotify::InitFlags::empty()).is_ok();
   check!("inotify", inotify, "init works");
 
-  let scratch = std::env::temp_dir().join("castellan-preflight");
-  let deny = std::env::temp_dir().join("castellan-preflight-deny");
+  // Per-uid: a fixed /tmp path is shared by every user on the box, and a
+  // directory created by another uid is not writable here, which makes the
+  // enforcement probe fail for the wrong reason (caught by the CI user).
+  let scratch = std::env::temp_dir().join(format!("castellan-preflight-{uid}"));
+  let deny = std::env::temp_dir().join(format!("castellan-preflight-deny-{uid}"));
   // Reap any previous run's leftovers BEFORE applying the envelope. Once
   // Landlock is on this process cannot write /tmp, so it cannot remove its
   // own scratch dir afterwards — cleanup must precede enforcement. Net

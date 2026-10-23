@@ -57,7 +57,7 @@ stop_daemon() {
     exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
     case "$exe" in *castellan-daemon*) kill -9 "$p";; esac
   done
-  rm -f /run/user/1000/castellan.sock
+  rm -f /run/user/$(id -u)/castellan.sock
   sleep 0.3
 }
 start_daemon() {
@@ -68,7 +68,7 @@ start_daemon() {
     "$BIN/castellan-daemon" > "$WORK/daemon.log" 2>&1 &
   fi
   DAPID=$!
-  for _ in $(seq 1 60); do [ -S /run/user/1000/castellan.sock ] && break; sleep 0.1; done
+  for _ in $(seq 1 60); do [ -S /run/user/$(id -u)/castellan.sock ] && break; sleep 0.1; done
   kill -0 "$DAPID" 2>/dev/null || { echo "daemon failed"; exit 1; }
 }
 
@@ -124,7 +124,7 @@ rpc() {
   python3 - "$1" <<'EOF'
 import json, socket, sys
 s = socket.socket(socket.AF_UNIX)
-s.connect("/run/user/1000/castellan.sock")
+s.connect(f"/run/user/{os.getuid()}/castellan.sock")
 s.sendall((sys.argv[1] + "\n").encode())
 s.shutdown(socket.SHUT_WR)
 data = b""
@@ -350,7 +350,7 @@ PY
         python3 - <<PYEOF
 import json, socket, glob
 s = socket.socket(socket.AF_UNIX)
-s.connect("/run/user/1000/castellan.sock")
+s.connect(f"/run/user/{os.getuid()}/castellan.sock")
 s.sendall(b"{\"op\":\"undo_discard\",\"session\":\"forged-target\"}\n")
 s.shutdown(socket.SHUT_WR)
 print(s.recv(65536).decode())

@@ -1,0 +1,69 @@
+name: Battery
+
+# The wired-system suites (test/shell.d) need a real user session, a user
+# cgroup slice, ptys and Landlock/seccomp, so they cannot run on a
+# GitHub-hosted runner. They run on the self-hosted box, against the
+# artifact built on the runner, with CASTELLAN_BIN_DIR pointing at it.
+#
+# Triggers are deliberately push-only plus manual. A self-hosted runner on
+# a public repository must never execute code from a fork PR: fork heads
+# are not trusted. Pull requests get the hosted CI (unit tests, drift
+# gates, doc truth); mainline pushes get the battery.
+on:
+  push:
+    branches: [quattro]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: battery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  battery:
+    runs-on: [self-hosted, linux, x64, battery]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable@2026-10-03
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build release binaries
+        run: cargo build --release --locked -p castellan-cli -p castellan-daemon
+
+      # Artifact semantics: the battery runs from a directory that holds
+      # only the two binaries, the same shape a user gets from a release
+      # tarball. If a suite silently depends on something else in target/,
+      # it fails here rather than in the field.
+      - name: Stage binaries as a user would receive them
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/castellan target/release/castellan-daemon "$RUNNER_TEMP/bin/"
+          chmod +x "$RUNNER_TEMP/bin/"*
+          "$RUNNER_TEMP/bin/castellan" --version
+
+      - name: Run the battery
+        env:
+          CASTELLAN_BIN_DIR: ${{ runner.temp }}/bin
+          SHELL: /bin/sh
+        run: ./test/run-all.sh
+
+      - name: Upload battery logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: battery-logs
+          path: /tmp/castellan-run-all.*
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Clean up session state
+        if: always()
+        run: |
+          # The battery creates scopes and a daemon; leave the runner box
+          # the way we found it even when a suite dies mid-run.
+          pkill -9 -f castellan-daemon 2>/dev/null || true
+          rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/castellan.sock" 2>/dev/null || true

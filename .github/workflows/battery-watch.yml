@@ -23,18 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: The battery runner is online
+      # Listing runners needs admin scope, which GITHUB_TOKEN does not have.
+      # The observable equivalent with a read token: a run that has sat queued
+      # for longer than a job should take means nobody is picking work up.
+      - name: Nothing has been stuck in the queue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          st=$(gh api "repos/$GITHUB_REPOSITORY/actions/runners" \
-               --jq '[.runners[] | select(.name == "cachyos-ci") | .status] | join(",")')
-          echo "cachyos-ci status: ${st:-MISSING}"
-          if [ "$st" != "online" ]; then
-            echo "::error::the battery runner is ${st:-missing}; pushed commits are not being tested"
+          stuck=$(gh run list -R "$GITHUB_REPOSITORY" --workflow battery.yml \
+                    --status queued --limit 10 --json createdAt,databaseId \
+                    --jq '[.[] | select((now - (.createdAt|fromdateiso8601)) > 1800) | .databaseId] | join(",")')
+          if [ -n "$stuck" ]; then
+            echo "::error::battery run(s) queued for over 30 minutes: $stuck — the runner is down or wedged"
             exit 1
           fi
+          echo "no battery run has been queued for more than 30 minutes"
 
       - name: The newest mainline commit has a green battery
         env:

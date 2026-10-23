@@ -70,9 +70,9 @@ Download the tarball for your architecture from the
 It contains both `castellan` and `castellan-daemon`.
 
 ```sh
-tar xzf castellan-v0.5.0-linux-x86_64.tar.gz
-chmod +x castellan-v0.5.0-linux-x86_64 castellan-daemon-v0.5.0-linux-x86_64
-./castellan-v0.5.0-linux-x86_64 preflight        # all 6 checks must pass
+tar xzf castellan-v0.5.1-linux-x86_64.tar.gz
+chmod +x castellan-v0.5.1-linux-x86_64 castellan-daemon-v0.5.0-linux-x86_64
+./castellan-v0.5.1-linux-x86_64 preflight        # all 6 checks must pass
 ```
 
 The tarball names carry the version; put them on `PATH` under the plain

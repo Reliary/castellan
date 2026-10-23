@@ -63,18 +63,23 @@ only, not read or egress blocking.
 ## Install
 
 Requires: systemd with a user session, cgroup v2, Linux 7.0+ (Landlock ABI 4+). Verified
-kernels: 7.0.3 and 7.1.8 (x86_64). `preflight` runs 6 checks; all 6 must pass.
+kernels: 7.0.3, 7.1.8 and 7.2.11 (x86_64). `preflight` runs 6 checks; all 6 must pass.
 
-From the [v0.1.0 release](https://github.com/Reliary/castellan/releases/tag/v0.1.0) (MIT).
-That tag ships **only the CLI** (`castellan`); the daemon binary is not in it. Build from
-source below for a working daemon until the next tag, which bundles both.
+Download the tarball for your architecture from the
+[latest release](https://github.com/Reliary/castellan/releases/latest) (MIT).
+It contains both `castellan` and `castellan-daemon`.
 
 ```sh
-chmod +x castellan
-./castellan preflight                  # all 6 checks must pass
+tar xzf castellan-v0.5.0-linux-x86_64.tar.gz
+chmod +x castellan-v0.5.0-linux-x86_64 castellan-daemon-v0.5.0-linux-x86_64
+./castellan-v0.5.0-linux-x86_64 preflight        # all 6 checks must pass
 ```
 
-Or from source (builds both binaries):
+The tarball names carry the version; put them on `PATH` under the plain
+names if you prefer the commands below verbatim. Verify the download with
+`SHA256SUMS` and the cosign bundles in the release (instructions there).
+
+Or build from source (also builds both binaries):
 
 ```sh
 cargo build --release --workspace

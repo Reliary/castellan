@@ -58,16 +58,59 @@ fn unit_path() -> PathBuf {
   unit_dir().join(UNIT_NAME)
 }
 
-/// Absolute path to a sibling binary (the daemon lives next to the CLI).
+/// Absolute path to a companion binary.
+///
+/// The daemon normally sits next to the CLI, but current_exe() resolves
+/// symlinks, so a release install that links the versioned file into a
+/// bin directory would otherwise look for the daemon next to the real
+/// binary instead of next to the link. Try the invoked path and PATH
+/// after the resolved directory.
 fn sibling_bin(name: &str) -> Option<PathBuf> {
-  let exe = std::env::current_exe().ok()?;
-  let dir = exe.parent()?;
-  let candidate = dir.join(name);
-  if candidate.exists() {
-    Some(candidate)
-  } else {
-    None
+  let mut dirs: Vec<PathBuf> = Vec::new();
+  if let Ok(exe) = std::env::current_exe() {
+    if let Some(d) = exe.parent() {
+      dirs.push(d.to_path_buf());
+    }
   }
+  if let Some(arg0) = std::env::args_os().next() {
+    let invoked = PathBuf::from(&arg0);
+    if let Some(d) = invoked.parent() {
+      if !d.as_os_str().is_empty() {
+        dirs.push(d.to_path_buf());
+      }
+    }
+  }
+  if let Some(paths) = std::env::var_os("PATH") {
+    dirs.extend(std::env::split_paths(&paths));
+  }
+  for dir in dirs {
+    let plain = dir.join(name);
+    if plain.is_file() {
+      return Some(plain);
+    }
+    // Release tarballs use versioned filenames (`castellan-daemon-v0.5.0-
+    // linux-x86_64`) so several architectures can share a directory. Accept
+    // the newest such sibling, so extract-and-run works without a rename.
+    let prefix = format!("{name}-v");
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(&dir)
+      .into_iter()
+      .flatten()
+      .flatten()
+      .map(|e| e.path())
+      .filter(|p| {
+        p.is_file()
+          && p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(&prefix) && n.contains("-linux-"))
+            .unwrap_or(false)
+      })
+      .collect();
+    matches.sort();
+    if let Some(p) = matches.pop() {
+      return Some(p);
+    }
+  }
+  None
 }
 
 fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -937,6 +980,59 @@ mod tests {
     remove_tree(&f).unwrap();
     assert!(!f.exists());
     let _ = std::fs::remove_dir_all(&d);
+  }
+
+  // Release tarballs carry versioned filenames (and no plain aliases), so
+  // `service install` must find `castellan-daemon-v0.5.0-linux-x86_64` next
+  // to the CLI. Found live on Omarchy: the documented extract-and-run path
+  // failed with "daemon not found next to this binary".
+  #[test]
+  fn companion_binary_found_through_path() {
+    let d = tmpdir("companion");
+    let bindir = d.join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let daemon = bindir.join("castellan-daemon");
+    std::fs::write(&daemon, b"x").unwrap();
+    let _guard = EnvPathGuard::prepend(&bindir);
+    let found = sibling_bin("castellan-daemon");
+    assert_eq!(found.as_deref(), Some(daemon.as_path()));
+
+    // Versioned layout, exactly as the release tarball ships it.
+    std::fs::remove_file(&daemon).unwrap();
+    let versioned = bindir.join("castellan-daemon-v0.5.0-linux-x86_64");
+    std::fs::write(&versioned, b"x").unwrap();
+    let found = sibling_bin("castellan-daemon");
+    assert_eq!(found.as_deref(), Some(versioned.as_path()));
+    let _ = std::fs::remove_dir_all(&d);
+  }
+
+  struct EnvPathGuard {
+    old: Option<std::ffi::OsString>,
+  }
+
+  impl EnvPathGuard {
+    fn prepend(dir: &std::path::Path) -> Self {
+      // Replace PATH rather than prepend: the host may have its own
+      // castellan-daemon installed, which would satisfy the lookup even
+      // when the versioned-file leg is broken (caught by the negative
+      // control, which passed until this was made hermetic).
+      let old = std::env::var_os("PATH");
+      let joined = std::env::join_paths([dir.to_path_buf()]).unwrap();
+      // Safety: the test binary is single-threaded for this module's
+      // env-touching tests, and Rust 2021 marks set_var unsafe only in
+      // 2024; keep it explicit.
+      std::env::set_var("PATH", joined);
+      Self { old }
+    }
+  }
+
+  impl Drop for EnvPathGuard {
+    fn drop(&mut self) {
+      match self.old.take() {
+        Some(v) => std::env::set_var("PATH", v),
+        None => std::env::remove_var("PATH"),
+      }
+    }
   }
 
   #[test]

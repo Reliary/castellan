@@ -484,8 +484,26 @@ fn cmd_service(args: &[String]) -> ! {
          `journalctl --user -u castellan.service`). Unit rolled back.",
         );
       }
+      // "Started" from systemd means the process was spawned, not that the
+      // daemon is answering. The next documented command is `castellan
+      // status`; reporting success before the socket exists makes a fresh
+      // install look broken (found on a clean Omarchy VM).
+      let mut answering = false;
+      for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(sock_path()).is_ok() {
+          answering = true;
+          break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+      }
+      if !answering {
+        eprintln!("service install: the unit started but the daemon is not answering");
+        eprintln!("{} after 10s.", sock_path().display());
+        eprintln!("see: journalctl --user -u {UNIT_NAME}");
+        std::process::exit(1);
+      }
       print!("{}", exec_stdout(&["is-active", UNIT_NAME]));
-      println!("service installed and started");
+      println!("service installed and answering");
       println!("next: `castellan init` to scaffold keyring.toml + egress.toml, then `castellan launch -- claude`");
       println!("tips: `castellan watch` follows freeze/expansion events; `castellan bless show` lists pending expansions");
       println!("desktop: SUPER+Escape freeze keybind or a panel button → `systemctl --user start castellan-freeze.service` / `castellan-thaw.service` (see contrib/omarchy/)");

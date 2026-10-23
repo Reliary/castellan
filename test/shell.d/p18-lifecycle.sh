@@ -84,7 +84,12 @@ done
 
 echo
 echo "===== install produces a working unit ====="
-"$BIN/castellan" service install >/dev/null 2>&1 && ok "service install exits 0" || bad "service install nonzero"
+# install must not report success until the daemon answers: the next
+# documented command is `status`, and a fresh Omarchy VM showed "started"
+# while the socket did not exist yet.
+INSTALL_OUT=$("$BIN/castellan" service install 2>&1); INSTALL_RC=$?
+[ "$INSTALL_RC" -eq 0 ] && ok "service install exits 0" || bad "service install nonzero: $INSTALL_OUT"
+grep -q 'answering' <<<"$INSTALL_OUT" && ok "install reports an answering daemon" || bad "install did not confirm readiness: $INSTALL_OUT"
 [[ -f "$UNIT_PATH" ]] && ok "unit written to $UNIT_PATH" || bad "unit not written"
 # P20/C43+F11: the generated unit must carry the fail-closed directives.
 grep -q "ExecStopPost=.*freeze --daemonless" "$UNIT_PATH" \

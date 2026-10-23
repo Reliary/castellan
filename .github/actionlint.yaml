@@ -1,0 +1,6 @@
+# Custom labels used by the self-hosted battery runner. actionlint only
+# knows GitHub's hosted labels; without this it rejects `battery` as an
+# unknown runner label.
+self-hosted-runner:
+  labels:
+    - battery
